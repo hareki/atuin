@@ -97,7 +97,7 @@ impl FilterMode {
             FilterMode::Global => "GLOBAL",
             FilterMode::Host => "HOST",
             FilterMode::Session => "SESSION",
-            FilterMode::Directory => "DIRECTORY",
+            FilterMode::Directory => "FOLDER", // We can't properly center "DIRECTORY" without making the box ridiculously wide
             FilterMode::Workspace => "WORKSPACE",
             FilterMode::SessionPreload => "SESSION+",
         }

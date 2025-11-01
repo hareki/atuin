@@ -13,7 +13,7 @@ use unicode_width::UnicodeWidthStr;
 use super::{
     cursor::Cursor,
     engines::{SearchEngine, SearchState},
-    history_list::{HistoryList, ListState, PREFIX_LENGTH},
+    history_list::{HistoryList, ListState},
 };
 use atuin_client::{
     database::{Database, current_context},
@@ -51,6 +51,7 @@ use ratatui::crossterm::event::{
 };
 
 const TAB_TITLES: [&str; 2] = ["Search", "Inspect"];
+const MODE_BOX_WIDTH: usize = 10;
 
 pub enum InputAction {
     Accept(usize),
@@ -917,6 +918,16 @@ impl State {
         f.render_widget(preview, preview_chunk);
 
         let extra_width = UnicodeWidthStr::width(self.search.input.substring());
+        let prefix = if self.switched_search_mode {
+            (" SRCH:", self.search_mode.as_str())
+        } else {
+            ("", self.search.filter_mode.as_str())
+        };
+        let mut mode_width = MODE_BOX_WIDTH.saturating_sub(prefix.0.len());
+        if mode_width < prefix.1.len() {
+            mode_width = prefix.1.len();
+        }
+        let prefix_width = (1 + 1 + prefix.0.len() + mode_width + 1 + 1) as u16;
 
         let cursor_offset = match compactness {
             Compactness::Full => 1,
@@ -924,7 +935,7 @@ impl State {
         };
         f.set_cursor_position((
             // Put cursor past the end of the input text
-            input_chunk.x + extra_width as u16 + PREFIX_LENGTH + 1 + cursor_offset,
+            input_chunk.x + extra_width as u16 + prefix_width + cursor_offset,
             input_chunk.y + cursor_offset,
         ));
     }
@@ -1048,22 +1059,25 @@ impl State {
     }
 
     fn build_input(&self, style: StyleState, theme: &Theme) -> Paragraph<'_> {
-        /// Max width of the UI box showing current mode
-        const MAX_WIDTH: usize = 14;
+        // Base width of the UI box showing current mode
         let (pref, mode) = if self.switched_search_mode {
             (" SRCH:", self.search_mode.as_str())
         } else {
             ("", self.search.filter_mode.as_str())
         };
-        let mode_width = MAX_WIDTH - pref.len();
-        // sanity check to ensure we don't exceed the layout limits
-        debug_assert!(mode_width >= mode.len(), "mode name '{mode}' is too long!");
-        let input = format!("[{pref}{mode:^mode_width$}] {}", self.search.input.as_str(),);
-        let input = Paragraph::new(input);
+        let mut mode_width = MODE_BOX_WIDTH.saturating_sub(pref.len());
+        if mode_width < mode.len() {
+            mode_width = mode.len();
+        }
+        let input = format!(
+            " [{pref}{mode:^mode_width$}] {}",
+            self.search.input.as_str(),
+        );
+        let mut input = Paragraph::new(input);
         match style.compactness {
             Compactness::Full => {
                 if style.invert {
-                    input.block(
+                    input = input.block(
                         Block::default()
                             .borders(Borders::LEFT | Borders::RIGHT | Borders::TOP)
                             .border_style(theme.as_style(Meaning::Border))
@@ -1073,9 +1087,9 @@ impl State {
                                 style.inner_width.saturating_sub(2),
                                 Some("Atuin"),
                             )),
-                    )
+                    );
                 } else {
-                    input.block(
+                    input = input.block(
                         Block::default()
                             .borders(Borders::LEFT | Borders::RIGHT)
                             .border_style(theme.as_style(Meaning::Border))
@@ -1084,11 +1098,13 @@ impl State {
                                 theme,
                                 style.inner_width.saturating_sub(2),
                             )),
-                    )
+                    );
                 }
             }
-            _ => input,
+            _ => {}
         }
+
+        input
     }
 
     fn build_preview(
