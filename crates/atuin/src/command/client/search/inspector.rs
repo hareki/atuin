@@ -66,6 +66,7 @@ pub fn draw_commands(
         Block::new()
             .borders(Borders::ALL)
             .style(theme.as_style(Meaning::Base))
+            .border_style(theme.as_style(Meaning::Border))
             .title("Command")
             .padding(Padding::horizontal(1))
     });
@@ -84,6 +85,7 @@ pub fn draw_commands(
         Block::new()
             .borders(Borders::ALL)
             .style(theme.as_style(Meaning::Annotation))
+            .border_style(theme.as_style(Meaning::Border))
             .title("Previous command")
             .padding(Padding::horizontal(1))
     });
@@ -106,6 +108,7 @@ pub fn draw_commands(
             .title("Next command")
             .padding(Padding::horizontal(1))
             .style(theme.as_style(Meaning::Annotation))
+            .border_style(theme.as_style(Meaning::Border))
     });
 
     f.render_widget(previous, commands[0]);
@@ -150,6 +153,7 @@ pub fn draw_stats_table(
             .title("Command stats")
             .borders(Borders::ALL)
             .style(theme.as_style(Meaning::Base))
+            .border_style(theme.as_style(Meaning::Border))
             .padding(Padding::vertical(1)),
     );
 
@@ -212,7 +216,8 @@ fn draw_stats_charts(f: &mut Frame<'_>, parent: Rect, stats: &HistoryStats, them
             Block::default()
                 .title("Exit code distribution")
                 .style(theme.as_style(Meaning::Base))
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(theme.as_style(Meaning::Border)),
         )
         .bar_width(3)
         .bar_gap(1)
@@ -236,7 +241,8 @@ fn draw_stats_charts(f: &mut Frame<'_>, parent: Rect, stats: &HistoryStats, them
             Block::default()
                 .title("Runs per day")
                 .style(theme.as_style(Meaning::Base))
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(theme.as_style(Meaning::Border)),
         )
         .bar_width(3)
         .bar_gap(1)
@@ -262,7 +268,8 @@ fn draw_stats_charts(f: &mut Frame<'_>, parent: Rect, stats: &HistoryStats, them
             Block::default()
                 .title("Duration over time")
                 .style(theme.as_style(Meaning::Base))
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(theme.as_style(Meaning::Border)),
         )
         .bar_width(5)
         .bar_gap(1)

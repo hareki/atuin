@@ -837,6 +837,7 @@ impl State {
                                 .title(Title::from(" Info ".to_string()))
                                 .title_alignment(Alignment::Center)
                                 .borders(Borders::ALL)
+                                .border_style(theme.as_style(Meaning::Border))
                                 .padding(Padding::vertical(2)),
                         )
                         .alignment(Alignment::Center);
@@ -884,7 +885,15 @@ impl State {
                 preview_chunk.width.into(),
                 theme,
             );
-            self.draw_preview(f, style, input_chunk, compactness, preview_chunk, preview);
+            self.draw_preview(
+                f,
+                style,
+                input_chunk,
+                compactness,
+                preview_chunk,
+                preview,
+                theme,
+            );
         }
     }
 
@@ -897,8 +906,9 @@ impl State {
         compactness: Compactness,
         preview_chunk: Rect,
         preview: Paragraph,
+        theme: &Theme,
     ) {
-        let input = self.build_input(style);
+        let input = self.build_input(style, theme);
         f.render_widget(input, input_chunk);
 
         f.render_widget(preview, preview_chunk);
@@ -1009,14 +1019,23 @@ impl State {
                     results_list.block(
                         Block::default()
                             .borders(Borders::LEFT | Borders::RIGHT)
+                            .border_style(theme.as_style(Meaning::Border))
                             .border_type(BorderType::Rounded)
-                            .title(format!("{:─>width$}", "", width = style.inner_width - 2)),
+                            .title(Self::border_fill_title(
+                                theme,
+                                style.inner_width.saturating_sub(2),
+                            )),
                     )
                 } else {
                     results_list.block(
                         Block::default()
                             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-                            .border_type(BorderType::Rounded),
+                            .border_style(theme.as_style(Meaning::Border))
+                            .border_type(BorderType::Rounded)
+                            .title(Self::border_fill_title(
+                                theme,
+                                style.inner_width.saturating_sub(2),
+                            )),
                     )
                 }
             }
@@ -1024,7 +1043,7 @@ impl State {
         }
     }
 
-    fn build_input(&self, style: StyleState) -> Paragraph<'_> {
+    fn build_input(&self, style: StyleState, theme: &Theme) -> Paragraph<'_> {
         /// Max width of the UI box showing current mode
         const MAX_WIDTH: usize = 14;
         let (pref, mode) = if self.switched_search_mode {
@@ -1043,14 +1062,23 @@ impl State {
                     input.block(
                         Block::default()
                             .borders(Borders::LEFT | Borders::RIGHT | Borders::TOP)
-                            .border_type(BorderType::Rounded),
+                            .border_style(theme.as_style(Meaning::Border))
+                            .border_type(BorderType::Rounded)
+                            .title(Self::border_fill_title(
+                                theme,
+                                style.inner_width.saturating_sub(2),
+                            )),
                     )
                 } else {
                     input.block(
                         Block::default()
                             .borders(Borders::LEFT | Borders::RIGHT)
+                            .border_style(theme.as_style(Meaning::Border))
                             .border_type(BorderType::Rounded)
-                            .title(format!("{:─>width$}", "", width = style.inner_width - 2)),
+                            .title(Self::border_fill_title(
+                                theme,
+                                style.inner_width.saturating_sub(2),
+                            )),
                     )
                 }
             }
@@ -1088,11 +1116,26 @@ impl State {
             Compactness::Full => Paragraph::new(command).block(
                 Block::default()
                     .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
+                    .border_style(theme.as_style(Meaning::Border))
                     .border_type(BorderType::Rounded)
-                    .title(format!("{:─>width$}", "", width = chunk_width - 2)),
+                    .title(Self::border_fill_title(
+                        theme,
+                        chunk_width.saturating_sub(2),
+                    )),
             ),
             _ => Paragraph::new(command).style(theme.as_style(Meaning::Annotation)),
         }
+    }
+
+    fn border_fill_title(theme: &Theme, width: usize) -> Title<'static> {
+        let fill = if width == 0 {
+            String::new()
+        } else {
+            format!("{:─>width$}", "", width = width)
+        };
+        let border_style: Style = theme.as_style(Meaning::Border).into();
+        let line = Line::from(vec![Span::styled(fill, border_style)]);
+        Title::from(line)
     }
 }
 

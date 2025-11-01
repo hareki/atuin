@@ -27,6 +27,8 @@ pub enum Meaning {
     AlertError,
     Annotation,
     Base,
+    /// Overall border color for container widgets.
+    Border,
     Guidance,
     Important,
     Title,
@@ -254,6 +256,7 @@ lazy_static! {
             (Meaning::Guidance, Meaning::AlertInfo),
             (Meaning::Annotation, Meaning::AlertInfo),
             (Meaning::Title, Meaning::Important),
+            (Meaning::Border, Meaning::Muted),
         ])
     };
     static ref DEFAULT_THEME: Theme = {
@@ -288,6 +291,7 @@ lazy_static! {
                         Attributes::from(Attribute::Bold),
                     ),
                 ),
+                (Meaning::Border, StyleFactory::from_fg_color(Color::White)),
                 (Meaning::Muted, StyleFactory::from_fg_color(Color::Grey)),
                 (Meaning::Base, ContentStyle::default()),
             ]),
@@ -306,6 +310,7 @@ lazy_static! {
                     (Meaning::Guidance, ContentStyle::default()),
                     (Meaning::Important, ContentStyle::default()),
                     (Meaning::Muted, ContentStyle::default()),
+                    (Meaning::Border, ContentStyle::default()),
                     (Meaning::Base, ContentStyle::default()),
                 ]),
             ),
@@ -522,6 +527,16 @@ mod theme_tests {
         assert_eq!(
             theme.as_style(Meaning::AlertError).foreground_color,
             from_string("yellowgreen").ok()
+        );
+    }
+
+    #[test]
+    fn test_default_border_color() {
+        let mut manager = ThemeManager::new(Some(false), Some("".to_string()));
+        let theme = manager.load_theme("default", None);
+        assert_eq!(
+            theme.as_style(Meaning::Border).foreground_color,
+            Some(Color::White)
         );
     }
 
