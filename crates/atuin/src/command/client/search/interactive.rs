@@ -1035,9 +1035,10 @@ impl State {
                             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
                             .border_style(theme.as_style(Meaning::Border))
                             .border_type(BorderType::Rounded)
-                            .title(Self::border_fill_title(
+                            .title(Self::border_title(
                                 theme,
                                 style.inner_width.saturating_sub(2),
+                                Some("Atuin"),
                             )),
                     )
                 }
@@ -1067,9 +1068,10 @@ impl State {
                             .borders(Borders::LEFT | Borders::RIGHT | Borders::TOP)
                             .border_style(theme.as_style(Meaning::Border))
                             .border_type(BorderType::Rounded)
-                            .title(Self::border_fill_title(
+                            .title(Self::border_title(
                                 theme,
                                 style.inner_width.saturating_sub(2),
+                                Some("Atuin"),
                             )),
                     )
                 } else {
@@ -1131,14 +1133,52 @@ impl State {
     }
 
     fn border_fill_title(theme: &Theme, width: usize) -> Title<'static> {
-        let fill = if width == 0 {
-            String::new()
-        } else {
-            format!("{:─>width$}", "", width = width)
-        };
+        Self::border_title(theme, width, None)
+    }
+
+    fn border_title(theme: &Theme, width: usize, label: Option<&str>) -> Title<'static> {
         let border_style: Style = theme.as_style(Meaning::Border).into();
-        let line = Line::from(vec![Span::styled(fill, border_style)]);
-        Title::from(line)
+        let mut spans = Vec::new();
+
+        if let Some(label) = label {
+            let padded_label = format!(" {} ", label);
+            let label_style: Style = theme.as_style(Meaning::Border).into();
+            let label_style = label_style.add_modifier(Modifier::BOLD);
+            let label_width = UnicodeWidthStr::width(padded_label.as_str());
+
+            if width <= label_width {
+                spans.push(Span::styled(padded_label, label_style));
+            } else {
+                let available = width - label_width;
+                let left = available / 2;
+                let right = available - left;
+
+                if left > 0 {
+                    spans.push(Span::styled(
+                        format!("{:─>left$}", "", left = left),
+                        border_style,
+                    ));
+                }
+
+                spans.push(Span::styled(padded_label, label_style));
+
+                if right > 0 {
+                    spans.push(Span::styled(
+                        format!("{:─>right$}", "", right = right),
+                        border_style,
+                    ));
+                }
+            }
+        } else {
+            let fill = if width == 0 {
+                String::new()
+            } else {
+                format!("{:─>width$}", "", width = width)
+            };
+            spans.push(Span::styled(fill, border_style));
+        }
+
+        Title::from(Line::from(spans))
     }
 }
 
