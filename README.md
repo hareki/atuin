@@ -21,17 +21,12 @@
   <a href="https://twitter.com/atuinsh"><img src="https://img.shields.io/twitter/follow/atuinsh?style=social" /></a>
 </p>
 
-
 [English] | [简体中文]
-
 
 Atuin replaces your existing shell history with a SQLite database, and records
 additional context for your commands. Additionally, it provides optional and
 _fully encrypted_ synchronisation of your history between machines, via an Atuin
 server.
-
-
-
 
 <p align="center">
   <img src="demo.gif" alt="animated" width="80%" />
@@ -40,10 +35,6 @@ server.
 <p align="center">
 <em>exit code, duration, time and command shown</em>
 </p>
-
-
-
-
 
 As well as the search UI, it can do things like this:
 
@@ -66,16 +57,15 @@ I wanted to. And I **really** don't want to.
 - calculate statistics such as "most used command"
 - old history file is not replaced
 - quick-jump to previous items with <kbd>Alt-\<num\></kbd>
-- switch filter modes via ctrl-r; search history just from the current session, directory, or globally
+- switch filter modes via Alt+F; search history just from the current session, directory, or globally
 - enter to execute a command, tab to edit
 
 ## Documentation
 
 - [Quickstart](#quickstart)
-- [Install](https://docs.atuin.sh/guide/installation/)
-- [Setting up sync](https://docs.atuin.sh/guide/sync/)
-- [Import history](https://docs.atuin.sh/guide/import/)
-- [Basic usage](https://docs.atuin.sh/guide/basic-usage/)
+- [Security](#security)
+- [Contributors](#contributors)
+
 ## Supported Shells
 
 - zsh
@@ -113,7 +103,7 @@ Then restart your shell!
 > [!NOTE]
 >
 > **For Bash users**: The above sets up `bash-preexec` for necessary hooks, but
-> `bash-preexec` has limitations.  For details, please see the
+> `bash-preexec` has limitations. For details, please see the
 > [Bash](https://docs.atuin.sh/guide/installation/#installing-the-shell-plugin)
 > section of the shell plugin documentation.
 

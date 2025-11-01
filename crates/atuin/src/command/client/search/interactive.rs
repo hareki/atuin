@@ -487,6 +487,9 @@ impl State {
             KeyCode::Char('b') if ctrl => {
                 self.search.input.left();
             }
+            KeyCode::Char('f' | 'F') if alt => {
+                self.search.rotate_filter_mode(settings, 1);
+            }
             KeyCode::Right if ctrl => self
                 .search
                 .input
@@ -548,7 +551,7 @@ impl State {
                 }
             }
             KeyCode::Char('u') if ctrl => self.search.input.clear(),
-            KeyCode::Char('r') if ctrl => self.search.rotate_filter_mode(settings, 1),
+            KeyCode::Char('r') if ctrl => {}
             KeyCode::Char('s') if ctrl => {
                 self.switched_search_mode = true;
                 self.search_mode = self.search_mode.next(settings);

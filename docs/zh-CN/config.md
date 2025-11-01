@@ -54,7 +54,7 @@ sync_address = "https://api.atuin.sh"
 
 多长时间与服务器自动同步一次。这可以用一种"人类可读"的格式给出。例如，`10s`，`20m`，`1h`，等等。默认为 `1h` 。
 
-如果设置为 `0`，Atuin将在每个命令之后进行同步。一些服务器可能有潜在的速率限制，这不会造成任何问题。
+如果设置为 `0`，Atuin 将在每个命令之后进行同步。一些服务器可能有潜在的速率限制，这不会造成任何问题。
 
 ```
 sync_frequency = "1h"
@@ -62,7 +62,7 @@ sync_frequency = "1h"
 
 ### `db_path`
 
-Atuin SQlite数据库的路径。默认为 
+Atuin SQlite 数据库的路径。默认为
 `~/.local/share/atuin/history.db`
 
 ```
@@ -71,7 +71,7 @@ db_path = "~/.history.db"
 
 ### `key_path`
 
-Atuin加密密钥的路径。默认为 
+Atuin 加密密钥的路径。默认为
 `~/.local/share/atuin/key`
 
 ```
@@ -80,8 +80,8 @@ key = "~/.atuin-key"
 
 ### `session_path`
 
-Atuin服务器会话文件的路径。默认为 
-`~/.local/share/atuin/session` 。 这本质上只是一个API令牌
+Atuin 服务器会话文件的路径。默认为
+`~/.local/share/atuin/session` 。 这本质上只是一个 API 令牌
 
 ```
 key = "~/.atuin-session"
@@ -97,15 +97,14 @@ key = "~/.atuin-session"
 
 搜索时要使用的默认过滤器
 
-| 模式   | 描述	|
-|--------------- | --------------- |
-| global (default)   | 从所有主机、所有会话、所有目录中搜索历史记录  |
-| host   | 仅从该主机搜索历史记录   |
-| session   | 仅从当前会话中搜索历史记录   |
-| directory | 仅从当前目录搜索历史记录|
+| 模式             | 描述                                         |
+| ---------------- | -------------------------------------------- |
+| global (default) | 从所有主机、所有会话、所有目录中搜索历史记录 |
+| host             | 仅从该主机搜索历史记录                       |
+| session          | 仅从当前会话中搜索历史记录                   |
+| directory        | 仅从当前目录搜索历史记录                     |
 
-过滤模式仍然可以通过 ctrl-r 来切换
-
+过滤模式可以通过 Alt+F 来切换
 
 ```
 search_mode = "fulltext"
@@ -115,16 +114,15 @@ search_mode = "fulltext"
 
 `fuzzy` 搜索语法的基础是 [fzf 搜索语法](https://github.com/junegunn/fzf#search-syntax) 。
 
-| 内容     | 匹配类型                 | 描述                          |
-| --------- | -------------------------- | ------------------------------------ |
-| `sbtrkt`  | fuzzy-match                | 匹配 `sbtrkt` 的项目           |
-| `'wild`   | exact-match (quoted)       | 包含 `wild` 的项目            |
-| `^music`  | prefix-exact-match         | 以 `music` 开头的项目        |
-| `.mp3$`   | suffix-exact-match         | 以 `.mp3` 结尾的项目           |
-| `!fire`   | inverse-exact-match        | 不包括 `fire` 的项目     |
+| 内容      | 匹配类型                   | 描述                    |
+| --------- | -------------------------- | ----------------------- |
+| `sbtrkt`  | fuzzy-match                | 匹配 `sbtrkt` 的项目    |
+| `'wild`   | exact-match (quoted)       | 包含 `wild` 的项目      |
+| `^music`  | prefix-exact-match         | 以 `music` 开头的项目   |
+| `.mp3$`   | suffix-exact-match         | 以 `.mp3` 结尾的项目    |
+| `!fire`   | inverse-exact-match        | 不包括 `fire` 的项目    |
 | `!^music` | inverse-prefix-exact-match | 不以 `music` 开头的项目 |
-| `!.mp3$`  | inverse-suffix-exact-match | 不以 `.mp3` 结尾的项目    |
-
+| `!.mp3$`  | inverse-suffix-exact-match | 不以 `.mp3` 结尾的项目  |
 
 单个条形字符术语充当 OR 运算符。 例如，以下查询匹配以 `core` 开头并以 `go`、`rb` 或 `py` 结尾的条目。
 

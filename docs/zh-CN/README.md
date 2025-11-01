@@ -21,7 +21,6 @@
   <a href="https://twitter.com/atuinsh"><img src="https://img.shields.io/twitter/follow/atuinsh?style=social" /></a>
 </p>
 
-
 [English] | [简体中文]
 
 Atuin 使用 SQLite 数据库取代了你现有的 shell 历史，并为你的命令记录了额外的内容。此外，它还通过 Atuin 服务器，在机器之间提供可选的、完全加密的历史记录同步功能。
@@ -45,7 +44,7 @@ atuin search --exit 0 --after "yesterday 3pm" make
 
 ## 功能
 
-- 重新绑定 `up` 和 `ctrl-r` 的全屏历史记录搜索UI界面
+- 重新绑定 `up` 和 `ctrl-r` 的全屏历史记录搜索 UI 界面
 - 使用 sqlite 数据库存储 shell 历史记录
 - 备份以及同步已加密的 shell 历史记录
 - 在不同的终端、不同的会话以及不同的机器上都有相同的历史记录
@@ -53,7 +52,7 @@ atuin search --exit 0 --after "yesterday 3pm" make
 - 计算统计数据，如 "最常用的命令"。
 - 不替换旧的历史文件
 - 通过 <kbd>Alt-\<num\></kbd> 快捷键快速跳转到之前的记录
-- 通过 ctrl-r 切换过滤模式;可以仅从当前会话、目录或全局来搜索历史记录
+- 通过 Alt+F 切换过滤模式;可以仅从当前会话、目录或全局来搜索历史记录
 
 ## 文档
 
