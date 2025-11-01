@@ -172,13 +172,13 @@ struct DrawState<'a> {
 
 // longest line prefix I could come up with
 #[allow(clippy::cast_possible_truncation)] // we know that this is <65536 length
-pub const PREFIX_LENGTH: u16 = " > 123ms 59s ago".len() as u16;
-static SPACES: &str = "                ";
+pub const PREFIX_LENGTH: u16 = "  123ms 59s ago".len() as u16;
+static SPACES: &str = "                  ";
 static _ASSERT: () = assert!(SPACES.len() == PREFIX_LENGTH as usize);
 
-// these encode the slices of `" > "`, `" {n} "`, or `"   "` in a compact form.
+// these encode the slices of `"  "`, `" {n} "`, or `"   "` in a compact form.
 // Yes, this is a hack, but it makes me feel happy
-static SLICES: &str = " > 1 2 3 4 5 6 7 8 9   ";
+static SLICES: &str = "  1 2 3 4 5 6 7 8 9   ";
 
 impl DrawState<'_> {
     fn index(&mut self) {
@@ -243,7 +243,7 @@ impl DrawState<'_> {
         {
             row_highlighted = true;
             // if not applying alternative highlighting to the whole row, color the command
-            style = self.theme.as_style(Meaning::AlertError);
+            style = self.theme.as_style(Meaning::Annotation);
             style.attributes.set(style::Attribute::Bold);
         }
 

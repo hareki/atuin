@@ -803,15 +803,15 @@ impl State {
         let indicator: String = match compactness {
             Compactness::Ultracompact => {
                 if self.switched_search_mode {
-                    format!("S{}>", self.search_mode.as_str().chars().next().unwrap())
+                    format!("S{}", self.search_mode.as_str().chars().next().unwrap())
                 } else {
                     format!(
-                        "{}> ",
+                        "{} ",
                         self.search.filter_mode.as_str().chars().next().unwrap()
                     )
                 }
             }
-            _ => " > ".to_string(),
+            _ => "  ".to_string(),
         };
 
         match self.tab_index {
