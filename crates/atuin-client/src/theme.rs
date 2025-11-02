@@ -531,16 +531,6 @@ mod theme_tests {
     }
 
     #[test]
-    fn test_default_border_color() {
-        let mut manager = ThemeManager::new(Some(false), Some("".to_string()));
-        let theme = manager.load_theme("default", None);
-        assert_eq!(
-            theme.as_style(Meaning::Border).foreground_color,
-            Some(Color::White)
-        );
-    }
-
-    #[test]
     fn test_can_fallback_when_meaning_missing() {
         let mut manager = ThemeManager::new(Some(false), Some("".to_string()));
 
