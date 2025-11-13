@@ -143,7 +143,10 @@ impl<'a> HistoryList<'a> {
     fn get_items_bounds(&self, selected: usize, offset: usize, height: usize) -> (usize, usize) {
         let offset = offset.min(self.history.len().saturating_sub(1));
 
-        let max_scroll_space = height.min(10).min(self.history.len() - selected);
+        let scroll_margin = height / 2;
+        let max_scroll_space = height
+            .saturating_sub(scroll_margin)
+            .min(self.history.len() - selected);
         if offset + height < selected + max_scroll_space {
             let end = selected + max_scroll_space;
             (end - height, end)
