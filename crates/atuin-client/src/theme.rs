@@ -33,6 +33,7 @@ pub enum Meaning {
     Important,
     Title,
     Muted,
+    Selection,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -133,12 +134,22 @@ impl Theme {
             .map(|(name, color)| {
                 (
                     *name,
-                    StyleFactory::from_fg_string(color).unwrap_or_else(|err| {
-                        if debug {
-                            log::warn!("Tried to load string as a color unsuccessfully: ({name}={color}) {err}");
-                        }
-                        ContentStyle::default()
-                    }),
+                    // Selection is a background color, not a foreground color
+                    if *name == Meaning::Selection {
+                        StyleFactory::from_bg_string(color).unwrap_or_else(|err| {
+                            if debug {
+                                log::warn!("Tried to load string as a color unsuccessfully: ({name}={color}) {err}");
+                            }
+                            ContentStyle::default()
+                        })
+                    } else {
+                        StyleFactory::from_fg_string(color).unwrap_or_else(|err| {
+                            if debug {
+                                log::warn!("Tried to load string as a color unsuccessfully: ({name}={color}) {err}");
+                            }
+                            ContentStyle::default()
+                        })
+                    },
                 )
             })
             .collect();
@@ -238,6 +249,20 @@ impl StyleFactory {
             ..ContentStyle::default()
         }
     }
+
+    fn from_bg_string(name: &str) -> Result<ContentStyle, String> {
+        match from_string(name) {
+            Ok(color) => Ok(Self::from_bg_color(color)),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn from_bg_color(color: Color) -> ContentStyle {
+        ContentStyle {
+            background_color: Some(color),
+            ..ContentStyle::default()
+        }
+    }
 }
 
 // Built-in themes. Rather than having extra files added before any theming
@@ -257,6 +282,7 @@ lazy_static! {
             (Meaning::Annotation, Meaning::AlertInfo),
             (Meaning::Title, Meaning::Important),
             (Meaning::Border, Meaning::Muted),
+            (Meaning::Selection, Meaning::Base),
         ])
     };
     static ref DEFAULT_THEME: Theme = {
@@ -293,6 +319,17 @@ lazy_static! {
                 ),
                 (Meaning::Border, StyleFactory::from_fg_color(Color::White)),
                 (Meaning::Muted, StyleFactory::from_fg_color(Color::Grey)),
+                (
+                    Meaning::Selection,
+                    ContentStyle {
+                        background_color: Some(Color::Rgb {
+                            r: 0x31,
+                            g: 0x32,
+                            b: 0x44,
+                        }),
+                        ..ContentStyle::default()
+                    },
+                ),
                 (Meaning::Base, ContentStyle::default()),
             ]),
         )

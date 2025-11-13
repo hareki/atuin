@@ -10,9 +10,9 @@ use atuin_common::utils::Escapable as _;
 use itertools::Itertools;
 use ratatui::{
     buffer::Buffer,
-    crossterm::style,
+    crossterm::style::{self, Color as CrosstermColor},
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     widgets::{Block, StatefulWidget, Widget},
 };
 use time::OffsetDateTime;
@@ -98,10 +98,11 @@ impl StatefulWidget for HistoryList<'_> {
         };
 
         for item in self.history.iter().skip(state.offset).take(end - start) {
-            s.index();
+            s.draw(" ", Style::default());
             s.duration(item);
             s.time(item);
             s.command(item);
+            s.fill_row_background();
 
             // reset line
             s.y += 1;
@@ -167,46 +168,21 @@ struct DrawState<'a> {
     inverted: bool,
     alternate_highlight: bool,
     now: &'a dyn Fn() -> OffsetDateTime,
+    #[allow(dead_code)]
     indicator: &'a str,
     theme: &'a Theme,
     history_highlighter: HistoryHighlighter<'a>,
+    #[allow(dead_code)]
     show_numeric_shortcuts: bool,
 }
 
 // longest line prefix I could come up with
 #[allow(clippy::cast_possible_truncation)] // we know that this is <65536 length
-pub const PREFIX_LENGTH: u16 = "  123ms 59s ago".len() as u16;
-static SPACES: &str = "                  ";
+pub const PREFIX_LENGTH: u16 = " 123ms 59s ago".len() as u16;
+static SPACES: &str = "              ";
 static _ASSERT: () = assert!(SPACES.len() == PREFIX_LENGTH as usize);
 
-// these encode the slices of `"  "`, `" {n} "`, or `"   "` in a compact form.
-// Yes, this is a hack, but it makes me feel happy
-static SLICES: &str = "  1 2 3 4 5 6 7 8 9   ";
-
 impl DrawState<'_> {
-    fn index(&mut self) {
-        if !self.show_numeric_shortcuts {
-            let i = self.y as usize + self.state.offset;
-            let is_selected = i == self.state.selected();
-            let prompt: &str = if is_selected { self.indicator } else { "   " };
-            self.draw(prompt, Style::default());
-            return;
-        }
-
-        // these encode the slices of `" > "`, `" {n} "`, or `"   "` in a compact form.
-        // Yes, this is a hack, but it makes me feel happy
-
-        let i = self.y as usize + self.state.offset;
-        let i = i.checked_sub(self.state.selected);
-        let i = i.unwrap_or(10).min(10) * 2;
-        let prompt: &str = if i == 0 {
-            self.indicator
-        } else {
-            &SLICES[i..i + 3]
-        };
-        self.draw(prompt, Style::default());
-    }
-
     fn duration(&mut self, h: &History) {
         let status = self.theme.as_style(if h.success() {
             Meaning::AlertInfo
@@ -219,7 +195,16 @@ impl DrawState<'_> {
 
     #[allow(clippy::cast_possible_truncation)] // we know that time.len() will be <6
     fn time(&mut self, h: &History) {
-        let style = self.theme.as_style(Meaning::Guidance);
+        let mut style = self.theme.as_style(Meaning::Guidance);
+        let is_selected = !self.alternate_highlight
+            && (self.y as usize + self.state.offset == self.state.selected());
+        if is_selected {
+            style.background_color = Some(CrosstermColor::Rgb {
+                r: 0x31,
+                g: 0x32,
+                b: 0x44,
+            });
+        }
 
         // Account for the chance that h.timestamp is "in the future"
         // This would mean that "since" is negative, and the unwrap here
@@ -233,21 +218,23 @@ impl DrawState<'_> {
         // skip padding if for some reason it is already too long to align nicely
         let padding =
             usize::from(PREFIX_LENGTH).saturating_sub(usize::from(self.x) + 4 + time.len());
-        self.draw(&SPACES[..padding], Style::default());
+        let mut padding_style = Style::default();
+        if is_selected {
+            padding_style = padding_style.bg(Color::Rgb(0x31, 0x32, 0x44));
+        }
+        self.draw(&SPACES[..padding], padding_style);
 
         self.draw(&time, style.into());
         self.draw(" ago", style.into());
     }
 
     fn command(&mut self, h: &History) {
-        let mut style = self.theme.as_style(Meaning::Base);
+        let style = self.theme.as_style(Meaning::Base);
         let mut row_highlighted = false;
-        if !self.alternate_highlight && (self.y as usize + self.state.offset == self.state.selected)
+        if !self.alternate_highlight
+            && (self.y as usize + self.state.offset == self.state.selected())
         {
             row_highlighted = true;
-            // if not applying alternative highlighting to the whole row, color the command
-            style = self.theme.as_style(Meaning::Annotation);
-            style.attributes.set(style::Attribute::Bold);
         }
 
         let highlight_indices = self.history_highlighter.get_highlight_indices(
@@ -283,6 +270,25 @@ impl DrawState<'_> {
         }
     }
 
+    fn fill_row_background(&mut self) {
+        if !self.alternate_highlight
+            && (self.y as usize + self.state.offset == self.state.selected())
+        {
+            // Fill the rest of the row with the background color
+            let remaining = (self.list_area.width.saturating_sub(self.x)) as usize;
+            if remaining > 0 {
+                if let Some(bg) = self.theme.as_style(Meaning::Selection).background_color {
+                    let ratatui_color = match bg {
+                        CrosstermColor::Rgb { r, g, b } => Color::Rgb(r, g, b),
+                        _ => Color::Rgb(0x31, 0x32, 0x44), // fallback
+                    };
+                    let style = Style::default().bg(ratatui_color);
+                    self.draw(&" ".repeat(remaining), style);
+                }
+            }
+        }
+    }
+
     fn draw(&mut self, s: &str, mut style: Style) {
         let cx = self.list_area.left() + self.x;
 
@@ -292,7 +298,21 @@ impl DrawState<'_> {
             self.list_area.bottom() - self.y - 1
         };
 
-        if self.alternate_highlight && (self.y as usize + self.state.offset == self.state.selected)
+        // Apply background for selected row (non-alternate highlight mode)
+        if !self.alternate_highlight
+            && (self.y as usize + self.state.offset == self.state.selected())
+        {
+            if let Some(bg) = self.theme.as_style(Meaning::Selection).background_color {
+                let ratatui_color = match bg {
+                    CrosstermColor::Rgb { r, g, b } => Color::Rgb(r, g, b),
+                    _ => Color::Rgb(0x31, 0x32, 0x44), // fallback
+                };
+                style = style.bg(ratatui_color);
+            }
+        }
+
+        if self.alternate_highlight
+            && (self.y as usize + self.state.offset == self.state.selected())
         {
             style = style.add_modifier(Modifier::REVERSED);
         }
