@@ -29,7 +29,7 @@ use crate::{VERSION, command::client::search::engines};
 
 use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
-    backend::CrosstermBackend,
+    backend::{CrosstermBackend, FromCrossterm},
     crossterm::{
         cursor::SetCursorStyle,
         event::{
@@ -42,7 +42,7 @@ use ratatui::{
     prelude::*,
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph, Tabs, block::Title},
+    widgets::{Block, BorderType, Borders, Padding, Paragraph, Tabs},
 };
 
 #[cfg(not(target_os = "windows"))]
@@ -51,7 +51,6 @@ use ratatui::crossterm::event::{
 };
 
 const TAB_TITLES: [&str; 2] = ["Search", "Inspect"];
-const MODE_BOX_WIDTH: usize = 10;
 
 pub enum InputAction {
     Accept(usize),
@@ -306,9 +305,6 @@ impl State {
             KeyCode::Backspace
                 if cursor_at_start_of_line && settings.keys.accept_with_backspace =>
             {
-                Some(InputAction::Accept(self.results_state.selected()))
-            }
-            KeyCode::Left | KeyCode::Backspace if self.search.input.as_str().is_empty() => {
                 Some(InputAction::Accept(self.results_state.selected()))
             }
             KeyCode::Char('o') if ctrl => {
@@ -887,7 +883,7 @@ impl State {
                 .block(Block::default().borders(Borders::NONE))
                 .select(self.tab_index)
                 .style(Style::default())
-                .highlight_style(theme.as_style(Meaning::Important));
+                .highlight_style(Style::from_crossterm(theme.as_style(Meaning::Important)));
 
             f.render_widget(tabs, tabs_chunk);
         }
@@ -958,10 +954,10 @@ impl State {
                     let message = Paragraph::new("Nothing to inspect")
                         .block(
                             Block::new()
-                                .title(Title::from(" Info ".to_string()))
+                                .title(Line::from(" Info ".to_string()))
                                 .title_alignment(Alignment::Center)
                                 .borders(Borders::ALL)
-                                .border_style(theme.as_style(Meaning::Border))
+                                .border_style(Style::from_crossterm(theme.as_style(Meaning::Border)))
                                 .padding(Padding::vertical(2)),
                         )
                         .alignment(Alignment::Center);
@@ -1009,6 +1005,17 @@ impl State {
                 preview_chunk.width.into(),
                 theme,
             );
+            #[allow(clippy::cast_possible_truncation)]
+            let prefix_width = settings
+                .ui
+                .columns
+                .iter()
+                .take_while(|col| !col.expand)
+                .map(|col| col.width + 1)
+                .sum::<u16>()
+                + " > ".len() as u16;
+            #[allow(clippy::cast_possible_truncation)]
+            let min_prefix_width = "[ SRCH: FULLTXT ] ".len() as u16;
             self.draw_preview(
                 f,
                 style,
@@ -1017,11 +1024,12 @@ impl State {
                 preview_chunk,
                 preview,
                 theme,
+                std::cmp::max(prefix_width, min_prefix_width),
             );
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
     fn draw_preview(
         &self,
         f: &mut Frame,
@@ -1031,23 +1039,14 @@ impl State {
         preview_chunk: Rect,
         preview: Paragraph,
         theme: &Theme,
+        prefix_width: u16,
     ) {
-        let input = self.build_input(style, theme);
+        let input = self.build_input(style, theme, prefix_width);
         f.render_widget(input, input_chunk);
 
         f.render_widget(preview, preview_chunk);
 
         let extra_width = UnicodeWidthStr::width(self.search.input.substring());
-        let prefix = if self.switched_search_mode {
-            (" SRCH:", self.search_mode.as_str())
-        } else {
-            ("", self.search.filter_mode.as_str())
-        };
-        let mut mode_width = MODE_BOX_WIDTH.saturating_sub(prefix.0.len());
-        if mode_width < prefix.1.len() {
-            mode_width = prefix.1.len();
-        }
-        let prefix_width = (1 + 1 + prefix.0.len() + mode_width + 1 + 1) as u16;
 
         let cursor_offset = match compactness {
             Compactness::Full => 1,
@@ -1062,13 +1061,13 @@ impl State {
 
     fn build_title(&self, theme: &Theme) -> Paragraph<'_> {
         let title = if self.update_needed.is_some() {
-            let error_style: Style = theme.get_error().into();
+            let error_style: Style = Style::from_crossterm(theme.get_error());
             Paragraph::new(Text::from(Span::styled(
                 format!("Atuin v{VERSION} - UPDATE"),
                 error_style.add_modifier(Modifier::BOLD),
             )))
         } else {
-            let style: Style = theme.as_style(Meaning::Base).into();
+            let style: Style = Style::from_crossterm(theme.as_style(Meaning::Base));
             Paragraph::new(Text::from(Span::styled(
                 format!("Atuin v{VERSION}"),
                 style.add_modifier(Modifier::BOLD),
@@ -1112,7 +1111,7 @@ impl State {
 
             _ => unreachable!("invalid tab index"),
         }
-        .style(theme.as_style(Meaning::Annotation))
+        .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
         .alignment(Alignment::Center)
     }
 
@@ -1121,7 +1120,7 @@ impl State {
             "history count: {}",
             self.history_count,
         ))))
-        .style(theme.as_style(Meaning::Annotation))
+        .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
         .alignment(Alignment::Right)
     }
 
@@ -1155,7 +1154,7 @@ impl State {
                     results_list.block(
                         Block::default()
                             .borders(Borders::LEFT | Borders::RIGHT)
-                            .border_style(theme.as_style(Meaning::Border))
+                            .border_style(Style::from_crossterm(theme.as_style(Meaning::Border)))
                             .border_type(BorderType::Rounded)
                             .title(Self::border_fill_title(
                                 theme,
@@ -1166,7 +1165,7 @@ impl State {
                     results_list.block(
                         Block::default()
                             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-                            .border_style(theme.as_style(Meaning::Border))
+                            .border_style(Style::from_crossterm(theme.as_style(Meaning::Border)))
                             .border_type(BorderType::Rounded)
                             .title(Self::border_title(
                                 theme,
@@ -1180,21 +1179,17 @@ impl State {
         }
     }
 
-    fn build_input(&self, style: StyleState, theme: &Theme) -> Paragraph<'_> {
-        // Base width of the UI box showing current mode
+    fn build_input(&self, style: StyleState, theme: &Theme, prefix_width: u16) -> Paragraph<'_> {
         let (pref, mode) = if self.switched_search_mode {
             (" SRCH:", self.search_mode.as_str())
         } else {
             ("", self.search.filter_mode.as_str())
         };
-        let mut mode_width = MODE_BOX_WIDTH.saturating_sub(pref.len());
-        if mode_width < mode.len() {
-            mode_width = mode.len();
-        }
-        let input = format!(
-            " [{pref}{mode:^mode_width$}] {}",
-            self.search.input.as_str(),
-        );
+        // 3: surrounding "[" "] "
+        let mode_width = usize::from(prefix_width) - pref.len() - 3;
+        // sanity check to ensure we don't exceed the layout limits
+        debug_assert!(mode_width >= mode.len(), "mode name '{mode}' is too long!");
+        let input = format!("[{pref}{mode:^mode_width$}] {}", self.search.input.as_str(),);
         let mut input = Paragraph::new(input);
         match style.compactness {
             Compactness::Full => {
@@ -1202,7 +1197,7 @@ impl State {
                     input = input.block(
                         Block::default()
                             .borders(Borders::LEFT | Borders::RIGHT | Borders::TOP)
-                            .border_style(theme.as_style(Meaning::Border))
+                            .border_style(Style::from_crossterm(theme.as_style(Meaning::Border)))
                             .border_type(BorderType::Rounded)
                             .title(Self::border_title(
                                 theme,
@@ -1214,7 +1209,7 @@ impl State {
                     input = input.block(
                         Block::default()
                             .borders(Borders::LEFT | Borders::RIGHT)
-                            .border_style(theme.as_style(Meaning::Border))
+                            .border_style(Style::from_crossterm(theme.as_style(Meaning::Border)))
                             .border_type(BorderType::Rounded)
                             .title(Self::border_fill_title(
                                 theme,
@@ -1259,28 +1254,29 @@ impl State {
             Compactness::Full => Paragraph::new(command).block(
                 Block::default()
                     .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
-                    .border_style(theme.as_style(Meaning::Border))
+                    .border_style(Style::from_crossterm(theme.as_style(Meaning::Border)))
                     .border_type(BorderType::Rounded)
                     .title(Self::border_fill_title(
                         theme,
                         chunk_width.saturating_sub(2),
                     )),
             ),
-            _ => Paragraph::new(command).style(theme.as_style(Meaning::Annotation)),
+            _ => Paragraph::new(command)
+                .style(Style::from_crossterm(theme.as_style(Meaning::Annotation))),
         }
     }
 
-    fn border_fill_title(theme: &Theme, width: usize) -> Title<'static> {
+    fn border_fill_title(theme: &Theme, width: usize) -> Line<'static> {
         Self::border_title(theme, width, None)
     }
 
-    fn border_title(theme: &Theme, width: usize, label: Option<&str>) -> Title<'static> {
-        let border_style: Style = theme.as_style(Meaning::Border).into();
+    fn border_title(theme: &Theme, width: usize, label: Option<&str>) -> Line<'static> {
+        let border_style: Style = Style::from_crossterm(theme.as_style(Meaning::Border));
         let mut spans = Vec::new();
 
         if let Some(label) = label {
             let padded_label = format!(" {} ", label);
-            let label_style: Style = theme.as_style(Meaning::Border).into();
+            let label_style: Style = Style::from_crossterm(theme.as_style(Meaning::Border));
             let label_style = label_style.add_modifier(Modifier::BOLD);
             let label_width = UnicodeWidthStr::width(padded_label.as_str());
 
@@ -1316,7 +1312,7 @@ impl State {
             spans.push(Span::styled(fill, border_style));
         }
 
-        Title::from(Line::from(spans))
+        Line::from(spans)
     }
 }
 
@@ -1971,62 +1967,42 @@ mod tests {
             "Tab should always accept"
         );
 
-        // Test left arrow with empty search should accept (new default behavior)
-        let left_event = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
-        let result = state.handle_key_input(&settings, &left_event);
-        assert!(
-            matches!(result, super::InputAction::Accept(_)),
-            "Left arrow should accept when search is empty"
-        );
-
-        // Test backspace with empty search should accept (new default behavior)
-        let backspace_event = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
-        let result = state.handle_key_input(&settings, &backspace_event);
-        assert!(
-            matches!(result, super::InputAction::Accept(_)),
-            "Backspace should accept when search is empty"
-        );
-
-        // Test left/backspace with non-empty search at cursor start should NOT accept
-        state.search.input.insert('t');
-        state.search.input.insert('e');
-        state.search.input.insert('s');
-        state.search.input.insert('t');
-        state.search.input.start(); // Move cursor to start of non-empty search
-
+        // Test left arrow with accept_past_line_start disabled (should continue)
         let left_event = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
         let result = state.handle_key_input(&settings, &left_event);
         assert!(
             matches!(result, super::InputAction::Continue),
-            "Left arrow should continue when search is not empty (even at cursor start)"
+            "Left arrow should continue when disabled"
         );
 
-        let backspace_event = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
-        let result = state.handle_key_input(&settings, &backspace_event);
-        assert!(
-            matches!(result, super::InputAction::Continue),
-            "Backspace should continue when search is not empty (even at cursor start)"
-        );
-
-        // Test that accept_past_line_start flag still works with non-empty search at start
+        // Test left arrow with accept_past_line_start enabled (should accept at start of line)
         settings.keys.accept_past_line_start = true;
         let result = state.handle_key_input(&settings, &left_event);
         assert!(
             matches!(result, super::InputAction::Accept(_)),
-            "Left arrow should accept at cursor start when flag enabled (even with non-empty search)"
+            "Left arrow should accept at start of line when enabled"
         );
         settings.keys.accept_past_line_start = false;
 
-        // Test that accept_with_backspace flag still works with non-empty search at start
+        let backspace_event = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        let result = state.handle_key_input(&settings, &backspace_event);
+        assert!(
+            matches!(result, super::InputAction::Continue),
+            "Backspace should continue when disabled"
+        );
+
         settings.keys.accept_with_backspace = true;
         let result = state.handle_key_input(&settings, &backspace_event);
         assert!(
             matches!(result, super::InputAction::Accept(_)),
-            "Backspace should accept at cursor start when flag enabled (even with non-empty search)"
+            "Backspace should accept at start of line when enabled"
         );
-        settings.keys.accept_with_backspace = false;
 
-        state.search.input.end(); // Move cursor back to end for remaining tests
+        state.search.input.insert('t');
+        state.search.input.insert('e');
+        state.search.input.insert('s');
+        state.search.input.insert('t');
+        state.search.input.end();
 
         let right_event = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         let result = state.handle_key_input(&settings, &right_event);

@@ -63,6 +63,10 @@ I wanted to. And I **really** don't want to.
 ## Documentation
 
 - [Quickstart](#quickstart)
+- [Install](https://docs.atuin.sh/guide/installation/)
+- [Setting up sync](https://docs.atuin.sh/guide/sync/)
+- [Import history](https://docs.atuin.sh/guide/import/)
+- [Basic usage](https://docs.atuin.sh/guide/basic-usage/)
 - [Security](#security)
 - [Contributors](#contributors)
 
@@ -73,12 +77,13 @@ I wanted to. And I **really** don't want to.
 - fish
 - nushell
 - xonsh
+- powershell (tier 2 support)
 
 ## Community
 
 ### Forum
 
-Atuin has a community forum, please ask here for help and support: https://forum.atuin.sh/
+Atuin has a community forum, please ask here for help and support: <https://forum.atuin.sh/>
 
 ### Discord
 
@@ -109,7 +114,7 @@ Then restart your shell!
 
 # Security
 
-If you find any security issues, we'd appreciate it if you could alert ellie@atuin.sh
+If you find any security issues, we'd appreciate it if you could alert <ellie@atuin.sh>
 
 # Contributors
 
@@ -120,4 +125,4 @@ If you find any security issues, we'd appreciate it if you could alert ellie@atu
 Made with [contrib.rocks](https://contrib.rocks).
 
 [English]: ./README.md
-[简体中文]: ./docs/zh-CN/README.md
+[简体中文]: ./docs-i18n/zh-CN/README.md

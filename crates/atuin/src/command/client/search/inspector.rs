@@ -7,6 +7,7 @@ use atuin_client::{
 };
 use ratatui::{
     Frame,
+    backend::FromCrossterm,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     layout::Rect,
     prelude::{Constraint, Direction, Layout},
@@ -56,17 +57,17 @@ pub fn draw_commands(
 
     let command = Paragraph::new(Text::from(Span::styled(
         history.command.clone(),
-        theme.as_style(Meaning::Important),
+        Style::from_crossterm(theme.as_style(Meaning::Important)),
     )))
     .block(if compact {
         Block::new()
             .borders(Borders::NONE)
-            .style(theme.as_style(Meaning::Base))
+            .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
     } else {
         Block::new()
             .borders(Borders::ALL)
-            .style(theme.as_style(Meaning::Base))
-            .border_style(theme.as_style(Meaning::Border))
+            .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
+            .border_style(Style::from_crossterm(theme.as_style(Meaning::Border)))
             .title("Command")
             .padding(Padding::horizontal(1))
     });
@@ -80,12 +81,12 @@ pub fn draw_commands(
     .block(if compact {
         Block::new()
             .borders(Borders::NONE)
-            .style(theme.as_style(Meaning::Annotation))
+            .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
     } else {
         Block::new()
             .borders(Borders::ALL)
-            .style(theme.as_style(Meaning::Annotation))
-            .border_style(theme.as_style(Meaning::Border))
+            .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
+            .border_style(Style::from_crossterm(theme.as_style(Meaning::Border)))
             .title("Previous command")
             .padding(Padding::horizontal(1))
     });
@@ -101,14 +102,14 @@ pub fn draw_commands(
     .block(if compact {
         Block::new()
             .borders(Borders::NONE)
-            .style(theme.as_style(Meaning::Annotation))
+            .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
     } else {
         Block::new()
             .borders(Borders::ALL)
             .title("Next command")
             .padding(Padding::horizontal(1))
-            .style(theme.as_style(Meaning::Annotation))
-            .border_style(theme.as_style(Meaning::Border))
+            .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
+            .border_style(Style::from_crossterm(theme.as_style(Meaning::Border)))
     });
 
     f.render_widget(previous, commands[0]);
@@ -152,8 +153,8 @@ pub fn draw_stats_table(
         Block::default()
             .title("Command stats")
             .borders(Borders::ALL)
-            .style(theme.as_style(Meaning::Base))
-            .border_style(theme.as_style(Meaning::Border))
+            .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
+            .border_style(Style::from_crossterm(theme.as_style(Meaning::Border)))
             .padding(Padding::vertical(1)),
     );
 
@@ -206,7 +207,7 @@ fn draw_stats_charts(f: &mut Frame<'_>, parent: Rect, stats: &HistoryStats, them
         .iter()
         .map(|(exit, count)| {
             Bar::default()
-                .label(exit.to_string().into())
+                .label(exit.to_string())
                 .value(u64_or_zero(*count))
         })
         .collect();
@@ -215,9 +216,9 @@ fn draw_stats_charts(f: &mut Frame<'_>, parent: Rect, stats: &HistoryStats, them
         .block(
             Block::default()
                 .title("Exit code distribution")
-                .style(theme.as_style(Meaning::Base))
+                .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
                 .borders(Borders::ALL)
-                .border_style(theme.as_style(Meaning::Border)),
+                .border_style(Style::from_crossterm(theme.as_style(Meaning::Border))),
         )
         .bar_width(3)
         .bar_gap(1)
@@ -231,7 +232,7 @@ fn draw_stats_charts(f: &mut Frame<'_>, parent: Rect, stats: &HistoryStats, them
         .iter()
         .map(|(day, count)| {
             Bar::default()
-                .label(num_to_day(day.as_str()).into())
+                .label(num_to_day(day.as_str()))
                 .value(u64_or_zero(*count))
         })
         .collect();
@@ -240,9 +241,9 @@ fn draw_stats_charts(f: &mut Frame<'_>, parent: Rect, stats: &HistoryStats, them
         .block(
             Block::default()
                 .title("Runs per day")
-                .style(theme.as_style(Meaning::Base))
+                .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
                 .borders(Borders::ALL)
-                .border_style(theme.as_style(Meaning::Border)),
+                .border_style(Style::from_crossterm(theme.as_style(Meaning::Border))),
         )
         .bar_width(3)
         .bar_gap(1)
@@ -257,7 +258,7 @@ fn draw_stats_charts(f: &mut Frame<'_>, parent: Rect, stats: &HistoryStats, them
         .map(|(date, duration)| {
             let d = Duration::from_nanos(u64_or_zero(*duration));
             Bar::default()
-                .label(date.clone().into())
+                .label(date.clone())
                 .value(u64_or_zero(*duration))
                 .text_value(format_duration(d))
         })
@@ -267,9 +268,9 @@ fn draw_stats_charts(f: &mut Frame<'_>, parent: Rect, stats: &HistoryStats, them
         .block(
             Block::default()
                 .title("Duration over time")
-                .style(theme.as_style(Meaning::Base))
+                .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
                 .borders(Borders::ALL)
-                .border_style(theme.as_style(Meaning::Border)),
+                .border_style(Style::from_crossterm(theme.as_style(Meaning::Border))),
         )
         .bar_width(5)
         .bar_gap(1)

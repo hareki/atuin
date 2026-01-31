@@ -10,6 +10,7 @@ use atuin_client::{
 use atuin_common::utils::Escapable as _;
 use itertools::Itertools;
 use ratatui::{
+    backend::FromCrossterm,
     buffer::Buffer,
     crossterm::style::{self, Color as CrosstermColor},
     layout::Rect,
@@ -184,10 +185,6 @@ struct DrawState<'a> {
     columns: &'a [UiColumn],
 }
 
-// Default prefix length for backwards compatibility (used by interactive.rs)
-#[allow(clippy::cast_possible_truncation)] // we know that this is <65536 length
-pub const PREFIX_LENGTH: u16 = " > 123ms 59s ago".len() as u16;
-
 // these encode the slices of `" > "`, `" {n} "`, or `"   "` in a compact form.
 // Yes, this is a hack, but it makes me feel happy
 static SLICES: &str = " >  1  2  3  4  5  6  7  8  9  ";
@@ -212,8 +209,12 @@ impl DrawState<'_> {
             .width
             .saturating_sub(indicator_width + fixed_width);
 
+        let style = self.theme.as_style(Meaning::Base);
         // Render each configured column
-        for column in self.columns {
+        for (idx, column) in self.columns.iter().enumerate() {
+            if idx != 0 {
+                self.draw(" ", Style::from_crossterm(style));
+            }
             let width = if column.expand {
                 expand_width
             } else {
@@ -265,8 +266,8 @@ impl DrawState<'_> {
         let formatted = format_duration(duration);
         let w = width as usize;
         // Right-align duration within its column width, plus trailing space
-        let display = format!("{formatted:>w$} ");
-        self.draw(&display, style.into());
+        let display = format!("{formatted:>w$}");
+        self.draw(&display, Style::from_crossterm(style));
     }
 
     fn time(&mut self, h: &History, width: u16) {
@@ -280,11 +281,12 @@ impl DrawState<'_> {
         let since = (self.now)() - h.timestamp;
         let time = format_duration(since.try_into().unwrap_or_default());
 
-        // Format as "Xs ago" right-aligned within column width, plus trailing space
+        // Format as "Xs ago" right-aligned within column width
         let w = width as usize;
         let time_str = format!("{time} ago");
-        let display = format!("{time_str:>w$} ");
-        self.draw(&display, style.into());
+
+        let display = format!("{time_str:>w$}");
+        self.draw(&display, Style::from_crossterm(style));
     }
 
     fn command(&mut self, h: &History) {
@@ -306,7 +308,9 @@ impl DrawState<'_> {
 
         let mut pos = 0;
         for section in h.command.escape_control().split_ascii_whitespace() {
-            self.draw(" ", style.into());
+            if pos != 0 {
+                self.draw(" ", Style::from_crossterm(style));
+            }
             for ch in section.chars() {
                 if self.x > self.list_area.width {
                     // Avoid attempting to draw a command section beyond the width
@@ -323,7 +327,7 @@ impl DrawState<'_> {
                     style.attributes.set(style::Attribute::Bold);
                 }
                 let s = ch.to_string();
-                self.draw(&s, style.into());
+                self.draw(&s, Style::from_crossterm(style));
                 pos += s.len();
             }
             pos += 1;
@@ -342,8 +346,8 @@ impl DrawState<'_> {
             )
             .unwrap_or_else(|_| "????-??-?? ??:??".to_string());
         let w = width as usize;
-        let display = format!("{formatted:w$} ");
-        self.draw(&display, style.into());
+        let display = format!("{formatted:w$}");
+        self.draw(&display, Style::from_crossterm(style));
     }
 
     /// Render the directory column (working directory, truncated)
@@ -356,11 +360,11 @@ impl DrawState<'_> {
         // Use character count for comparison and skip for UTF-8 safety
         let display = if char_count > w && w >= 4 {
             let truncated: String = cwd.chars().skip(char_count - (w - 3)).collect();
-            format!("...{truncated} ")
+            format!("...{truncated}")
         } else {
-            format!("{cwd:w$} ")
+            format!("{cwd:w$}")
         };
-        self.draw(&display, style.into());
+        self.draw(&display, Style::from_crossterm(style));
     }
 
     /// Render the host column (just the hostname)
@@ -373,11 +377,11 @@ impl DrawState<'_> {
         // Use character count for comparison and take for UTF-8 safety
         let display = if char_count > w && w >= 4 {
             let truncated: String = host.chars().take(w.saturating_sub(4)).collect();
-            format!("{truncated}... ")
+            format!("{truncated}...")
         } else {
-            format!("{host:w$} ")
+            format!("{host:w$}")
         };
-        self.draw(&display, style.into());
+        self.draw(&display, Style::from_crossterm(style));
     }
 
     /// Render the user column
@@ -390,11 +394,11 @@ impl DrawState<'_> {
         // Use character count for comparison and take for UTF-8 safety
         let display = if char_count > w && w >= 4 {
             let truncated: String = user.chars().take(w.saturating_sub(4)).collect();
-            format!("{truncated}... ")
+            format!("{truncated}...")
         } else {
-            format!("{user:w$} ")
+            format!("{user:w$}")
         };
-        self.draw(&display, style.into());
+        self.draw(&display, Style::from_crossterm(style));
     }
 
     /// Render the exit code column
@@ -405,8 +409,8 @@ impl DrawState<'_> {
             self.theme.as_style(Meaning::AlertError)
         };
         let w = width as usize;
-        let display = format!("{:>w$} ", h.exit);
-        self.draw(&display, style.into());
+        let display = format!("{:>w$}", h.exit);
+        self.draw(&display, Style::from_crossterm(style));
     }
 
     fn fill_row_background(&mut self) {
