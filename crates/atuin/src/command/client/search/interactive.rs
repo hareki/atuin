@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    block_ext::themed_block,
+    block_ext::{themed_block, titled_block},
     cursor::Cursor,
     engines::{SearchEngine, SearchState},
     history_list::{HistoryList, ListState},
@@ -1128,7 +1128,7 @@ impl State {
                     )
                 } else {
                     results_list.block(
-                        themed_block(theme).borders(Borders::TOP | Borders::LEFT | Borders::RIGHT),
+                        titled_block(theme).borders(Borders::TOP | Borders::LEFT | Borders::RIGHT),
                     )
                 }
             }
@@ -1152,7 +1152,7 @@ impl State {
             Compactness::Full => {
                 if style.invert {
                     input.block(
-                        themed_block(theme).borders(Borders::LEFT | Borders::RIGHT | Borders::TOP),
+                        titled_block(theme).borders(Borders::LEFT | Borders::RIGHT | Borders::TOP),
                     )
                 } else {
                     input.block(
