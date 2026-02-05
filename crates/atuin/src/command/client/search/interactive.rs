@@ -607,7 +607,7 @@ impl State {
                 .search
                 .input
                 .next_word(&settings.word_chars, settings.word_jump_mode),
-            KeyCode::Char('f') if alt => self
+            KeyCode::Char('r') if ctrl => self
                 .search
                 .input
                 .next_word(&settings.word_chars, settings.word_jump_mode),
@@ -664,7 +664,7 @@ impl State {
                 }
             }
             KeyCode::Char('u') if ctrl => self.search.input.clear(),
-            KeyCode::Char('r') if ctrl => self.search.rotate_filter_mode(settings, 1),
+            KeyCode::Char('f') if alt => self.search.rotate_filter_mode(settings, 1),
             KeyCode::Char('s') if ctrl => {
                 self.switched_search_mode = true;
                 self.search_mode = self.search_mode.next(settings);
