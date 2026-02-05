@@ -32,6 +32,7 @@ pub enum Meaning {
     Important,
     Title,
     Muted,
+    Selection,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -87,6 +88,10 @@ impl Theme {
         self.as_style(Meaning::Border)
     }
 
+    pub fn get_selection(&self) -> ContentStyle {
+        self.as_style(Meaning::Selection)
+    }
+
     // The alert meanings may be chosen by the Level enum, rather than the methods above
     // or the full Meaning enum, to simplify programmatic selection of a log-level.
     pub fn get_alert(&self, severity: log::Level) -> ContentStyle {
@@ -133,12 +138,18 @@ impl Theme {
     ) -> Theme {
         let styles: HashMap<Meaning, ContentStyle> = foreground_colors
             .iter()
-            .map(|(name, color)| {
+            .map(|(meaning, color)| {
+                // Selection is special: parse as background color, not foreground
+                let result = if *meaning == Meaning::Selection {
+                    StyleFactory::from_bg_string(color)
+                } else {
+                    StyleFactory::from_fg_string(color)
+                };
                 (
-                    *name,
-                    StyleFactory::from_fg_string(color).unwrap_or_else(|err| {
+                    *meaning,
+                    result.unwrap_or_else(|err| {
                         if debug {
-                            log::warn!("Tried to load string as a color unsuccessfully: ({name}={color}) {err}");
+                            log::warn!("Tried to load string as a color unsuccessfully: ({meaning}={color}) {err}");
                         }
                         ContentStyle::default()
                     }),
@@ -241,6 +252,20 @@ impl StyleFactory {
             ..ContentStyle::default()
         }
     }
+
+    fn from_bg_color(color: Color) -> ContentStyle {
+        ContentStyle {
+            background_color: Some(color),
+            ..ContentStyle::default()
+        }
+    }
+
+    fn from_bg_string(name: &str) -> Result<ContentStyle, String> {
+        match from_string(name) {
+            Ok(color) => Ok(Self::from_bg_color(color)),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 // Built-in themes. Rather than having extra files added before any theming
@@ -260,6 +285,7 @@ static MEANING_FALLBACKS: LazyLock<HashMap<Meaning, Meaning>> = LazyLock::new(||
         (Meaning::Guidance, Meaning::AlertInfo),
         (Meaning::Annotation, Meaning::AlertInfo),
         (Meaning::Title, Meaning::Important),
+        (Meaning::Selection, Meaning::Base),
     ])
 });
 
@@ -298,6 +324,15 @@ static DEFAULT_THEME: LazyLock<Theme> = LazyLock::new(|| {
             (Meaning::Muted, StyleFactory::from_fg_color(Color::Grey)),
             (Meaning::Border, StyleFactory::from_fg_color(Color::White)),
             (Meaning::Base, ContentStyle::default()),
+            // #313244 - Catppuccin surface0
+            (
+                Meaning::Selection,
+                StyleFactory::from_bg_color(Color::Rgb {
+                    r: 49,
+                    g: 50,
+                    b: 68,
+                }),
+            ),
         ]),
     )
 });
@@ -317,6 +352,7 @@ static BUILTIN_THEMES: LazyLock<HashMap<&'static str, Theme>> = LazyLock::new(||
                 (Meaning::Important, ContentStyle::default()),
                 (Meaning::Muted, ContentStyle::default()),
                 (Meaning::Base, ContentStyle::default()),
+                (Meaning::Selection, ContentStyle::default()),
             ]),
         ),
         (

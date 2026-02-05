@@ -604,11 +604,7 @@ impl State {
             KeyCode::Char('b') if ctrl => {
                 self.search.input.left();
             }
-            KeyCode::Right if ctrl => self
-                .search
-                .input
-                .next_word(&settings.word_chars, settings.word_jump_mode),
-            KeyCode::Char('r') if ctrl => self
+            KeyCode::Right | KeyCode::Char('r') if ctrl => self
                 .search
                 .input
                 .next_word(&settings.word_chars, settings.word_jump_mode),
@@ -913,20 +909,6 @@ impl State {
         let stats_tab = self.build_stats(theme);
         f.render_widget(stats_tab, header_chunks[2]);
 
-        let indicator: String = match compactness {
-            Compactness::Ultracompact => {
-                if self.switched_search_mode {
-                    format!("S{}>", self.search_mode.as_str().chars().next().unwrap())
-                } else {
-                    format!(
-                        "{}> ",
-                        self.search.filter_mode.as_str().chars().next().unwrap()
-                    )
-                }
-            }
-            _ => " > ".to_string(),
-        };
-
         match self.tab_index {
             0 => {
                 let history_highlighter = HistoryHighlighter {
@@ -936,12 +918,9 @@ impl State {
                 let results_list = Self::build_results_list(
                     style,
                     results,
-                    self.keymap_mode,
                     &self.now,
-                    indicator.as_str(),
                     theme,
                     history_highlighter,
-                    settings.show_numeric_shortcuts,
                     &settings.ui.columns,
                 );
                 f.render_stateful_widget(results_list, results_list_chunk, &mut self.results_state);
@@ -1010,7 +989,7 @@ impl State {
                 .take_while(|col| !col.expand)
                 .map(|col| col.width + 1)
                 .sum::<u16>()
-                + " > ".len() as u16;
+                + 1; // 1 space left padding
             #[allow(clippy::cast_possible_truncation)]
             let min_prefix_width = "[ SRCH: FULLTXT ] ".len() as u16;
             self.draw_preview(
@@ -1125,23 +1104,17 @@ impl State {
     fn build_results_list<'a>(
         style: StyleState,
         results: &'a [History],
-        keymap_mode: KeymapMode,
         now: &'a dyn Fn() -> OffsetDateTime,
-        indicator: &'a str,
         theme: &'a Theme,
         history_highlighter: HistoryHighlighter<'a>,
-        show_numeric_shortcuts: bool,
         columns: &'a [UiColumn],
     ) -> HistoryList<'a> {
         let results_list = HistoryList::new(
             results,
             style.invert,
-            keymap_mode == KeymapMode::VimNormal,
             now,
-            indicator,
             theme,
             history_highlighter,
-            show_numeric_shortcuts,
             columns,
         );
 
@@ -1179,8 +1152,7 @@ impl State {
             Compactness::Full => {
                 if style.invert {
                     input.block(
-                        themed_block(theme)
-                            .borders(Borders::LEFT | Borders::RIGHT | Borders::TOP),
+                        themed_block(theme).borders(Borders::LEFT | Borders::RIGHT | Borders::TOP),
                     )
                 } else {
                     input.block(
