@@ -38,7 +38,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
 
-use super::block_ext::themed_block;
+use super::block_ext::{themed_block, titled_block};
 use super::cursor::Cursor;
 use super::engines::{AnySearchEngine, SearchEngine, SearchState};
 use super::history_list::{HistoryList, ListState};
@@ -1136,22 +1136,6 @@ impl State {
             f.render_widget(warnings, warning_chunk);
         }
 
-        let indicator: String = match compactness {
-            Compactness::Ultracompact => {
-                if self.switched_search_mode {
-                    format!(
-                        "S{}>",
-                        self.search_mode_state.raw_mode().as_str().chars().next().unwrap()
-                    )
-                } else if self.search.custom_context.is_some() {
-                    format!("C{}>", self.search.filter_mode.as_str().chars().next().unwrap())
-                } else {
-                    format!("{}> ", self.search.filter_mode.as_str().chars().next().unwrap())
-                }
-            }
-            _ => " > ".to_string(),
-        };
-
         match self.tab_index {
             0 => {
                 let history_highlighter = HistoryHighlighter {
@@ -1162,13 +1146,10 @@ impl State {
                 let results_list = Self::build_results_list(
                     style,
                     results,
-                    self.keymap_mode,
                     &self.now,
                     &tz,
-                    indicator.as_str(),
                     theme,
                     history_highlighter,
-                    settings.show_numeric_shortcuts,
                     settings.ui.syntax_highlight,
                     &settings.ui.columns,
                 );
@@ -1241,7 +1222,7 @@ impl State {
                 .take_while(|col| !col.expand)
                 .map(|col| col.width + 1)
                 .sum::<u16>()
-                + u16::conv(" > ".len());
+                + 1; // 1 space left padding
             let min_prefix_width = u16::conv("[ SRCH: FULLTXT ] ".len());
             self.draw_preview(
                 f,
@@ -1406,26 +1387,20 @@ impl State {
     fn build_results_list<'a>(
         style: StyleState,
         results: &'a [History],
-        keymap_mode: KeymapMode,
         now: &'a dyn Fn() -> Timestamp,
         tz: &'a TimeZone,
-        indicator: &'a str,
         theme: &'a Theme,
         history_highlighter: HistoryHighlighter<'a>,
-        show_numeric_shortcuts: bool,
         syntax_highlight: bool,
         columns: &'a [UiColumn],
     ) -> HistoryList<'a> {
         let results_list = HistoryList::new(
             results,
             style.invert,
-            keymap_mode == KeymapMode::VimNormal,
             now,
             tz,
-            indicator,
             theme,
             history_highlighter,
-            show_numeric_shortcuts,
             syntax_highlight,
             columns,
         );
@@ -1434,13 +1409,15 @@ impl State {
             Compactness::Full => {
                 if style.invert {
                     results_list.block(
-                        themed_block(theme)
-                            .borders(Borders::LEFT | Borders::RIGHT)
-                            .title(format!("{:─>width$}", "", width = style.inner_width - 2)),
+                        themed_block(theme).borders(Borders::LEFT | Borders::RIGHT).title(format!(
+                            "{:─>width$}",
+                            "",
+                            width = style.inner_width - 2
+                        )),
                     )
                 } else {
                     results_list.block(
-                        themed_block(theme).borders(Borders::TOP | Borders::LEFT | Borders::RIGHT),
+                        titled_block(theme).borders(Borders::TOP | Borders::LEFT | Borders::RIGHT),
                     )
                 }
             }
@@ -1468,14 +1445,15 @@ impl State {
             Compactness::Full => {
                 if style.invert {
                     input.block(
-                        themed_block(theme)
-                            .borders(Borders::LEFT | Borders::RIGHT | Borders::TOP),
+                        titled_block(theme).borders(Borders::LEFT | Borders::RIGHT | Borders::TOP),
                     )
                 } else {
                     input.block(
-                        themed_block(theme)
-                            .borders(Borders::LEFT | Borders::RIGHT)
-                            .title(format!("{:─>width$}", "", width = style.inner_width - 2)),
+                        themed_block(theme).borders(Borders::LEFT | Borders::RIGHT).title(format!(
+                            "{:─>width$}",
+                            "",
+                            width = style.inner_width - 2
+                        )),
                     )
                 }
             }

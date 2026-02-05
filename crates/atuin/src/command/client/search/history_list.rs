@@ -15,10 +15,11 @@ use ratatui::backend::FromCrossterm;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::style;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::widgets::{Block, StatefulWidget, Widget};
 
 use super::engines::{AnySearchEngine, SearchEngine};
+use super::selection_ext::get_selection_style;
 use super::syntax;
 
 pub struct HistoryHighlighter<'a> {
@@ -37,17 +38,13 @@ pub struct HistoryList<'a> {
     history: &'a [History],
     block: Option<Block<'a>>,
     inverted: bool,
-    /// Apply an alternative highlighting to the selected row
-    alternate_highlight: bool,
     now: &'a dyn Fn() -> Timestamp,
     /// Time zone absolute timestamps are rendered in
     tz: &'a TimeZone,
-    indicator: &'a str,
     theme: &'a Theme,
     history_highlighter: HistoryHighlighter<'a>,
-    show_numeric_shortcuts: bool,
     syntax_highlight: bool,
-    /// Columns to display (in order, after the indicator)
+    /// Columns to display (in order, after the left padding)
     columns: &'a [UiColumn],
 }
 
@@ -102,13 +99,10 @@ impl StatefulWidget for HistoryList<'_> {
             y: 0,
             state,
             inverted: self.inverted,
-            alternate_highlight: self.alternate_highlight,
             now: &self.now,
             tz: self.tz,
-            indicator: self.indicator,
             theme: self.theme,
             history_highlighter: self.history_highlighter,
-            show_numeric_shortcuts: self.show_numeric_shortcuts,
             syntax_highlight: self.syntax_highlight,
             columns: self.columns,
         };
@@ -124,17 +118,14 @@ impl StatefulWidget for HistoryList<'_> {
 }
 
 impl<'a> HistoryList<'a> {
-    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         history: &'a [History],
         inverted: bool,
-        alternate_highlight: bool,
         now: &'a dyn Fn() -> Timestamp,
         tz: &'a TimeZone,
-        indicator: &'a str,
         theme: &'a Theme,
         history_highlighter: HistoryHighlighter<'a>,
-        show_numeric_shortcuts: bool,
         syntax_highlight: bool,
         columns: &'a [UiColumn],
     ) -> Self {
@@ -142,13 +133,10 @@ impl<'a> HistoryList<'a> {
             history,
             block: None,
             inverted,
-            alternate_highlight,
             now,
             tz,
-            indicator,
             theme,
             history_highlighter,
-            show_numeric_shortcuts,
             syntax_highlight,
             columns,
         }
@@ -182,33 +170,31 @@ struct DrawState<'a> {
     y: u16,
     state: &'a ListState,
     inverted: bool,
-    alternate_highlight: bool,
     now: &'a dyn Fn() -> Timestamp,
     /// Time zone absolute timestamps are rendered in
     tz: &'a TimeZone,
-    indicator: &'a str,
     theme: &'a Theme,
     history_highlighter: HistoryHighlighter<'a>,
-    show_numeric_shortcuts: bool,
     syntax_highlight: bool,
     columns: &'a [UiColumn],
 }
 
-// these encode the slices of `" > "`, `" {n} "`, or `"   "` in a compact form.
-// Yes, this is a hack, but it makes me feel happy
-static SLICES: &str = " > 1 2 3 4 5 6 7 8 9   ";
-
 impl DrawState<'_> {
+    /// Check if current row is selected
+    fn is_selected(&self) -> bool {
+        self.y as usize + self.state.offset == self.state.selected()
+    }
+
     /// Render a complete row for a history item based on configured columns.
     fn render_row(&mut self, h: &History) {
-        // Always render the indicator first (width 3)
-        self.index();
+        // Draw left padding (1 space)
+        self.left_padding();
 
         // Calculate the width for the expanding column
         // Fixed columns use their configured width + 1 (trailing space)
-        let indicator_width: u16 = 3;
+        let padding_width: u16 = 1;
         let fixed_width: u16 = self.columns.iter().filter(|c| !c.expand).map(|c| c.width + 1).sum();
-        let expand_width = self.list_area.width.saturating_sub(indicator_width + fixed_width);
+        let expand_width = self.list_area.width.saturating_sub(padding_width + fixed_width);
 
         let style = self.theme.as_style(Meaning::Base);
         // Render each configured column
@@ -232,33 +218,28 @@ impl DrawState<'_> {
                 UiColumnType::Command => self.command(h, width),
             }
         }
+
+        // Fill remaining row width with selection background if selected
+        self.fill_row_remainder();
     }
 
-    fn index(&mut self) {
-        if !self.show_numeric_shortcuts {
-            let i = usize::conv(self.y) + self.state.offset;
-            let is_selected = i == self.state.selected();
-            let prompt: &str = if is_selected {
-                self.indicator
-            } else {
-                "   "
-            };
-            self.draw(prompt, Style::default());
+    /// Draw 1 space left padding
+    fn left_padding(&mut self) {
+        self.draw(" ", Style::default());
+    }
+
+    /// Fill remaining row width with selection background (for selected rows)
+    fn fill_row_remainder(&mut self) {
+        if !self.is_selected() {
             return;
         }
 
-        // these encode the slices of `" > "`, `" {n} "`, or `"   "` in a compact form.
-        // Yes, this is a hack, but it makes me feel happy
-
-        let i = usize::conv(self.y) + self.state.offset;
-        let i = i.checked_sub(self.state.selected);
-        let i = i.unwrap_or(10).min(10) * 2;
-        let prompt: &str = if i == 0 {
-            self.indicator
-        } else {
-            &SLICES[i..i + 3]
-        };
-        self.draw(prompt, Style::default());
+        let selection_style = get_selection_style(self.theme);
+        let remaining = self.list_area.width.saturating_sub(self.x);
+        if remaining > 0 {
+            let spaces = " ".repeat(remaining as usize);
+            self.draw(&spaces, selection_style);
+        }
     }
 
     fn duration(&mut self, h: &History, width: u16) {
@@ -299,16 +280,7 @@ impl DrawState<'_> {
     }
 
     fn command(&mut self, h: &History, _width: u16) {
-        let mut style = self.theme.as_style(Meaning::Base);
-        let mut row_highlighted = false;
-        if !self.alternate_highlight
-            && (usize::conv(self.y) + self.state.offset == self.state.selected)
-        {
-            row_highlighted = true;
-            // if not applying alternative highlighting to the whole row, color the command
-            style = self.theme.as_style(Meaning::AlertError);
-            style.attributes.set(style::Attribute::Bold);
-        }
+        let style = self.theme.as_style(Meaning::Base);
 
         // Build the normalized command string (whitespace-collapsed, control chars escaped)
         let normalized: String =
@@ -316,8 +288,7 @@ impl DrawState<'_> {
 
         let highlight_indices = self.history_highlighter.get_highlight_indices(&normalized);
 
-        // The selected row keeps its single highlight color.
-        let syntax = if self.syntax_highlight && !row_highlighted {
+        let syntax = if self.syntax_highlight {
             syntax::classify(&normalized, h.shell.as_deref())
         } else {
             Vec::new()
@@ -346,9 +317,6 @@ impl DrawState<'_> {
                 .and_then(|b| syntax.get(b))
                 .map_or(style, |&meaning| self.theme.as_style(meaning));
             if highlighted {
-                if row_highlighted {
-                    char_style = self.theme.as_style(Meaning::AlertWarn);
-                }
                 char_style.attributes.set(style::Attribute::Bold);
             }
 
@@ -430,10 +398,12 @@ impl DrawState<'_> {
             self.list_area.bottom() - self.y - 1
         };
 
-        if self.alternate_highlight
-            && (usize::conv(self.y) + self.state.offset == self.state.selected)
-        {
-            style = style.add_modifier(Modifier::REVERSED);
+        // Apply selection background color to selected row
+        if self.is_selected() {
+            let selection_style = get_selection_style(self.theme);
+            if let Some(bg) = selection_style.bg {
+                style = style.bg(bg);
+            }
         }
 
         let w = usize::conv(self.list_area.width - self.x);
