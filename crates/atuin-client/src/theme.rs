@@ -23,6 +23,7 @@ pub enum Meaning {
     AlertError,
     Annotation,
     Base,
+    Border,
     Guidance,
     Important,
     Title,
@@ -92,6 +93,10 @@ impl Theme {
     #[must_use]
     pub fn get_error(&self) -> ContentStyle {
         self.get_alert(tracing::Level::ERROR)
+    }
+
+    pub fn get_border(&self) -> ContentStyle {
+        self.as_style(Meaning::Border)
     }
 
     // The alert meanings may be chosen by the Level enum, rather than the methods above
@@ -267,6 +272,7 @@ static ALERT_TYPES: LazyLock<HashMap<tracing::Level, Meaning>> = LazyLock::new(|
 
 static MEANING_FALLBACKS: LazyLock<HashMap<Meaning, Meaning>> = LazyLock::new(|| {
     HashMap::from([
+        (Meaning::Border, Meaning::Muted),
         (Meaning::Guidance, Meaning::AlertInfo),
         (Meaning::Annotation, Meaning::AlertInfo),
         (Meaning::Title, Meaning::Important),
@@ -292,6 +298,7 @@ static DEFAULT_THEME: LazyLock<Theme> = LazyLock::new(|| {
                 ),
             ),
             (Meaning::Muted, StyleFactory::from_fg_color(Color::Grey)),
+            (Meaning::Border, StyleFactory::from_fg_color(Color::White)),
             (Meaning::Base, ContentStyle::default()),
             // Syntax highlighting uses ANSI palette colors, so they follow
             // the user's terminal color scheme out of the box.

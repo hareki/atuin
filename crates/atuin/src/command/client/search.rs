@@ -20,6 +20,7 @@ use tracing::instrument;
 
 use super::history::ListMode;
 
+mod block_ext;
 mod engines;
 mod history_list;
 mod inspector;

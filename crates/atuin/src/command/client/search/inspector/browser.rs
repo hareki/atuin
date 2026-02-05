@@ -388,6 +388,7 @@ struct Styles {
     command: Style,
     key: Style,
     failure: Style,
+    border: Style,
 }
 
 impl Styles {
@@ -400,6 +401,7 @@ impl Styles {
             command: style(Meaning::Important).add_modifier(Modifier::BOLD),
             key: style(Meaning::Guidance).add_modifier(Modifier::BOLD),
             failure: style(Meaning::AlertError),
+            border: style(Meaning::Border),
         }
     }
 }
@@ -408,7 +410,7 @@ fn panel<'a>(title: impl Into<Line<'a>>, styles: Styles) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(styles.muted)
+        .border_style(styles.border)
         .title(title)
         .title_style(styles.label)
         .padding(Padding::horizontal(1))
