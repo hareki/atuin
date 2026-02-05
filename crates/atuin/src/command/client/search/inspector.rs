@@ -16,6 +16,7 @@ use ratatui::{
     widgets::{Bar, BarChart, BarGroup, Block, Borders, Padding, Paragraph, Row, Table},
 };
 
+use super::block_ext::themed_block;
 use super::duration::format_duration;
 
 use super::super::theme::{Meaning, Theme};
@@ -64,7 +65,7 @@ pub fn draw_commands(
             .borders(Borders::NONE)
             .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
     } else {
-        Block::new()
+        themed_block(theme)
             .borders(Borders::ALL)
             .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
             .title("Command")
@@ -82,7 +83,7 @@ pub fn draw_commands(
             .borders(Borders::NONE)
             .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
     } else {
-        Block::new()
+        themed_block(theme)
             .borders(Borders::ALL)
             .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
             .title("Previous command")
@@ -102,7 +103,7 @@ pub fn draw_commands(
             .borders(Borders::NONE)
             .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
     } else {
-        Block::new()
+        themed_block(theme)
             .borders(Borders::ALL)
             .title("Next command")
             .padding(Padding::horizontal(1))
@@ -147,7 +148,7 @@ pub fn draw_stats_table(
     let widths = [Constraint::Ratio(1, 5), Constraint::Ratio(4, 5)];
 
     let table = Table::new(rows, widths).column_spacing(1).block(
-        Block::default()
+        themed_block(theme)
             .title("Command stats")
             .borders(Borders::ALL)
             .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
@@ -210,7 +211,7 @@ fn draw_stats_charts(f: &mut Frame<'_>, parent: Rect, stats: &HistoryStats, them
 
     let exits = BarChart::default()
         .block(
-            Block::default()
+            themed_block(theme)
                 .title("Exit code distribution")
                 .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
                 .borders(Borders::ALL),
@@ -234,7 +235,7 @@ fn draw_stats_charts(f: &mut Frame<'_>, parent: Rect, stats: &HistoryStats, them
 
     let day_of_week = BarChart::default()
         .block(
-            Block::default()
+            themed_block(theme)
                 .title("Runs per day")
                 .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
                 .borders(Borders::ALL),
@@ -260,7 +261,7 @@ fn draw_stats_charts(f: &mut Frame<'_>, parent: Rect, stats: &HistoryStats, them
 
     let duration_over_time = BarChart::default()
         .block(
-            Block::default()
+            themed_block(theme)
                 .title("Duration over time")
                 .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
                 .borders(Borders::ALL),
