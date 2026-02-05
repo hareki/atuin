@@ -27,6 +27,7 @@ pub enum Meaning {
     AlertError,
     Annotation,
     Base,
+    Border,
     Guidance,
     Important,
     Title,
@@ -80,6 +81,10 @@ impl Theme {
 
     pub fn get_error(&self) -> ContentStyle {
         self.get_alert(log::Level::Error)
+    }
+
+    pub fn get_border(&self) -> ContentStyle {
+        self.as_style(Meaning::Border)
     }
 
     // The alert meanings may be chosen by the Level enum, rather than the methods above
@@ -251,6 +256,7 @@ static ALERT_TYPES: LazyLock<HashMap<log::Level, Meaning>> = LazyLock::new(|| {
 
 static MEANING_FALLBACKS: LazyLock<HashMap<Meaning, Meaning>> = LazyLock::new(|| {
     HashMap::from([
+        (Meaning::Border, Meaning::Muted),
         (Meaning::Guidance, Meaning::AlertInfo),
         (Meaning::Annotation, Meaning::AlertInfo),
         (Meaning::Title, Meaning::Important),
@@ -290,6 +296,7 @@ static DEFAULT_THEME: LazyLock<Theme> = LazyLock::new(|| {
                 ),
             ),
             (Meaning::Muted, StyleFactory::from_fg_color(Color::Grey)),
+            (Meaning::Border, StyleFactory::from_fg_color(Color::White)),
             (Meaning::Base, ContentStyle::default()),
         ]),
     )
@@ -305,6 +312,7 @@ static BUILTIN_THEMES: LazyLock<HashMap<&'static str, Theme>> = LazyLock::new(||
                 (Meaning::AlertWarn, ContentStyle::default()),
                 (Meaning::AlertInfo, ContentStyle::default()),
                 (Meaning::Annotation, ContentStyle::default()),
+                (Meaning::Border, ContentStyle::default()),
                 (Meaning::Guidance, ContentStyle::default()),
                 (Meaning::Important, ContentStyle::default()),
                 (Meaning::Muted, ContentStyle::default()),
