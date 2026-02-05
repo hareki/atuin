@@ -1,5 +1,7 @@
 use ratatui::backend::FromCrossterm;
+use ratatui::layout::Alignment;
 use ratatui::style::Style;
+use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType};
 
 use crate::command::client::theme::Theme;
@@ -12,4 +14,11 @@ pub fn themed_block(theme: &Theme) -> Block<'static> {
         .border_style(border_style)
         .title_style(border_style)
         .border_type(BorderType::Rounded)
+}
+
+/// Creates a themed block with " Atuin " centered title for the main TUI container.
+pub fn titled_block(theme: &Theme) -> Block<'static> {
+    themed_block(theme)
+        .title(Line::from(" Atuin "))
+        .title_alignment(Alignment::Center)
 }
