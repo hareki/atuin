@@ -29,7 +29,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::prelude::*;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Tabs};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use semver::Version;
 use time::{OffsetDateTime, UtcOffset};
@@ -37,6 +37,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
 
+use super::block_ext::themed_block;
 use super::cursor::Cursor;
 use super::engines::{AnySearchEngine, SearchEngine, SearchState};
 use super::history_list::{HistoryList, ListState};
@@ -1176,7 +1177,7 @@ impl State {
                 if results.is_empty() && inspecting.is_none() {
                     let message = Paragraph::new("Nothing to inspect")
                         .block(
-                            Block::new()
+                            themed_block(theme)
                                 .title(Line::from(" Info ".to_string()))
                                 .title_alignment(Alignment::Center)
                                 .borders(Borders::ALL)
@@ -1248,6 +1249,7 @@ impl State {
                 preview_chunk,
                 preview,
                 std::cmp::max(prefix_width, min_prefix_width),
+                theme,
             );
         }
     }
@@ -1262,8 +1264,9 @@ impl State {
         preview_chunk: Rect,
         preview: Paragraph,
         prefix_width: u16,
+        theme: &Theme,
     ) {
-        let input = self.build_input(style, prefix_width);
+        let input = self.build_input(style, prefix_width, theme);
         f.render_widget(input, input_chunk);
 
         f.render_widget(preview, preview_chunk);
@@ -1429,16 +1432,13 @@ impl State {
             Compactness::Full => {
                 if style.invert {
                     results_list.block(
-                        Block::default()
+                        themed_block(theme)
                             .borders(Borders::LEFT | Borders::RIGHT)
-                            .border_type(BorderType::Rounded)
                             .title(format!("{:─>width$}", "", width = style.inner_width - 2)),
                     )
                 } else {
                     results_list.block(
-                        Block::default()
-                            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-                            .border_type(BorderType::Rounded),
+                        themed_block(theme).borders(Borders::TOP | Borders::LEFT | Borders::RIGHT),
                     )
                 }
             }
@@ -1446,7 +1446,7 @@ impl State {
         }
     }
 
-    fn build_input(&self, style: StyleState, prefix_width: u16) -> Paragraph<'_> {
+    fn build_input(&self, style: StyleState, prefix_width: u16, theme: &Theme) -> Paragraph<'_> {
         let (pref, mode) = if self.prefix {
             ("", "PREFIX")
         } else if self.switched_search_mode {
@@ -1466,15 +1466,13 @@ impl State {
             Compactness::Full => {
                 if style.invert {
                     input.block(
-                        Block::default()
-                            .borders(Borders::LEFT | Borders::RIGHT | Borders::TOP)
-                            .border_type(BorderType::Rounded),
+                        themed_block(theme)
+                            .borders(Borders::LEFT | Borders::RIGHT | Borders::TOP),
                     )
                 } else {
                     input.block(
-                        Block::default()
+                        themed_block(theme)
                             .borders(Borders::LEFT | Borders::RIGHT)
-                            .border_type(BorderType::Rounded)
                             .title(format!("{:─>width$}", "", width = style.inner_width - 2)),
                     )
                 }
@@ -1520,9 +1518,8 @@ impl State {
 
         match compactness {
             Compactness::Full => Paragraph::new(command).block(
-                Block::default()
+                themed_block(theme)
                     .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
-                    .border_type(BorderType::Rounded)
                     .title(format!("{:─>width$}", "", width = chunk_width - 2)),
             ),
             _ => Paragraph::new(command)

@@ -21,13 +21,14 @@ struct Styles {
     base: Style,
     muted: Style,
     important: Style,
+    border: Style,
 }
 
 fn panel(title: impl Into<Line<'static>>, styles: Styles) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(styles.muted)
+        .border_style(styles.border)
         .title_style(styles.important)
         .title(title)
 }
@@ -154,6 +155,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, stats: &Stats, theme: &Theme) {
         muted: Style::from_crossterm(theme.as_style(Meaning::Annotation)),
         important: Style::from_crossterm(theme.as_style(Meaning::Important))
             .add_modifier(Modifier::BOLD),
+        border: Style::from_crossterm(theme.get_border()),
     };
     let compact = area.height < 16 || area.width < 50;
     let areas = Layout::vertical([
