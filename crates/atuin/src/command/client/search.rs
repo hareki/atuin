@@ -17,6 +17,7 @@ use atuin_client::{
 
 use super::history::ListMode;
 
+mod block_ext;
 mod cursor;
 mod duration;
 mod engines;

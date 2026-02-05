@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
+    block_ext::themed_block,
     cursor::Cursor,
     engines::{SearchEngine, SearchState},
     history_list::{HistoryList, ListState},
@@ -41,7 +42,7 @@ use ratatui::{
     prelude::*,
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph, Tabs},
+    widgets::{Block, Borders, Padding, Paragraph, Tabs},
 };
 
 #[cfg(not(target_os = "windows"))]
@@ -962,7 +963,7 @@ impl State {
                 if results.is_empty() {
                     let message = Paragraph::new("Nothing to inspect")
                         .block(
-                            Block::new()
+                            themed_block(theme)
                                 .title(Line::from(" Info ".to_string()))
                                 .title_alignment(Alignment::Center)
                                 .borders(Borders::ALL)
@@ -1032,6 +1033,7 @@ impl State {
                 preview_chunk,
                 preview,
                 std::cmp::max(prefix_width, min_prefix_width),
+                theme,
             );
         }
     }
@@ -1046,8 +1048,9 @@ impl State {
         preview_chunk: Rect,
         preview: Paragraph,
         prefix_width: u16,
+        theme: &Theme,
     ) {
-        let input = self.build_input(style, prefix_width);
+        let input = self.build_input(style, prefix_width, theme);
         f.render_widget(input, input_chunk);
 
         f.render_widget(preview, preview_chunk);
@@ -1158,16 +1161,13 @@ impl State {
             Compactness::Full => {
                 if style.invert {
                     results_list.block(
-                        Block::default()
+                        themed_block(theme)
                             .borders(Borders::LEFT | Borders::RIGHT)
-                            .border_type(BorderType::Rounded)
                             .title(format!("{:─>width$}", "", width = style.inner_width - 2)),
                     )
                 } else {
                     results_list.block(
-                        Block::default()
-                            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-                            .border_type(BorderType::Rounded),
+                        themed_block(theme).borders(Borders::TOP | Borders::LEFT | Borders::RIGHT),
                     )
                 }
             }
@@ -1175,7 +1175,7 @@ impl State {
         }
     }
 
-    fn build_input(&self, style: StyleState, prefix_width: u16) -> Paragraph<'_> {
+    fn build_input(&self, style: StyleState, prefix_width: u16, theme: &Theme) -> Paragraph<'_> {
         let (pref, mode) = if self.switched_search_mode {
             (" SRCH:", self.search_mode.as_str())
         } else if self.search.custom_context.is_some() {
@@ -1193,15 +1193,13 @@ impl State {
             Compactness::Full => {
                 if style.invert {
                     input.block(
-                        Block::default()
-                            .borders(Borders::LEFT | Borders::RIGHT | Borders::TOP)
-                            .border_type(BorderType::Rounded),
+                        themed_block(theme)
+                            .borders(Borders::LEFT | Borders::RIGHT | Borders::TOP),
                     )
                 } else {
                     input.block(
-                        Block::default()
+                        themed_block(theme)
                             .borders(Borders::LEFT | Borders::RIGHT)
-                            .border_type(BorderType::Rounded)
                             .title(format!("{:─>width$}", "", width = style.inner_width - 2)),
                     )
                 }
@@ -1238,9 +1236,8 @@ impl State {
 
         match compactness {
             Compactness::Full => Paragraph::new(command).block(
-                Block::default()
+                themed_block(theme)
                     .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
-                    .border_type(BorderType::Rounded)
                     .title(format!("{:─>width$}", "", width = chunk_width - 2)),
             ),
             _ => Paragraph::new(command)
