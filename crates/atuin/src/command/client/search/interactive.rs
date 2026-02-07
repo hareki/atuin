@@ -305,7 +305,9 @@ impl State {
         };
 
         // Convert KeyEvent to SingleKey
-        let single = SingleKey::from_event(input);
+        let Some(single) = SingleKey::from_event(input) else {
+            return InputAction::Continue;
+        };
 
         // --- Phase 1: Resolve (take pending key first, then immutable borrows) ---
 
@@ -481,6 +483,14 @@ impl State {
             }
             Action::ClearLine => {
                 self.search.input.clear();
+                InputAction::Continue
+            }
+            Action::ClearToStart => {
+                self.search.input.clear_to_start();
+                InputAction::Continue
+            }
+            Action::ClearToEnd => {
+                self.search.input.clear_to_end();
                 InputAction::Continue
             }
 
