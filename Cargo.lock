@@ -211,7 +211,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "atuin"
-version = "18.12.0-beta.4"
+version = "18.12.0"
 dependencies = [
  "arboard",
  "async-trait",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "atuin-client"
-version = "18.12.0-beta.4"
+version = "18.12.0"
 dependencies = [
  "async-trait",
  "atuin-common",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "atuin-common"
-version = "18.12.0-beta.4"
+version = "18.12.0"
 dependencies = [
  "base64",
  "directories",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "atuin-daemon"
-version = "18.12.0-beta.4"
+version = "18.12.0"
 dependencies = [
  "atuin-client",
  "atuin-dotfiles",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "atuin-dotfiles"
-version = "18.12.0-beta.4"
+version = "18.12.0"
 dependencies = [
  "atuin-client",
  "atuin-common",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "atuin-history"
-version = "18.12.0-beta.4"
+version = "18.12.0"
 dependencies = [
  "atuin-client",
  "crossterm",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "atuin-kv"
-version = "18.12.0-beta.4"
+version = "18.12.0"
 dependencies = [
  "atuin-client",
  "atuin-common",
@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "atuin-scripts"
-version = "18.12.0-beta.4"
+version = "18.12.0"
 dependencies = [
  "atuin-client",
  "atuin-common",
@@ -428,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "atuin-server"
-version = "18.12.0-beta.4"
+version = "18.12.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "atuin-server-database"
-version = "18.12.0-beta.4"
+version = "18.12.0"
 dependencies = [
  "async-trait",
  "atuin-common",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "atuin-server-postgres"
-version = "18.12.0-beta.4"
+version = "18.12.0"
 dependencies = [
  "async-trait",
  "atuin-common",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "atuin-server-sqlite"
-version = "18.12.0-beta.4"
+version = "18.12.0"
 dependencies = [
  "async-trait",
  "atuin-common",
@@ -2957,11 +2957,12 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "pbkdf2"
-version = "0.11.0"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83a0692ec44e4cf1ef28ca317f14f8f07da2d95ec3fa01f86e4467b725e60917"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest",
+ "hmac",
 ]
 
 [[package]]
@@ -4803,12 +4804,10 @@ dependencies = [
 
 [[package]]
 name = "tiny-bip39"
-version = "1.0.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62cc94d358b5a1e84a5cb9109f559aa3c4d634d2b1b4de3d0fa4adc7c78e2861"
+checksum = "a30fd743a02bf35236f6faf99adb03089bb77e91c998dac2c2ad76bb424f668c"
 dependencies = [
- "anyhow",
- "hmac",
  "once_cell",
  "pbkdf2",
  "rand 0.8.5",
