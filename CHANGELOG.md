@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### Bug Fixes
+
+- *(deps)* Add use-dev-tty to crossterm in atuin-ai ([#3185](https://github.com/atuinsh/atuin/issues/3185))
+- *(docs)* Update Postgres volume path in Docker as required by pg18 ([#3174](https://github.com/atuinsh/atuin/issues/3174))
+- Systemd Exec for separate server binary ([#3176](https://github.com/atuinsh/atuin/issues/3176))
+- Multiline commands with fish ([#3179](https://github.com/atuinsh/atuin/issues/3179))
+
+
+### Features
+
+- *(docs)* Add Shell Integration and Interoperability docs ([#3163](https://github.com/atuinsh/atuin/issues/3163))
+- `switch-context` ([#3149](https://github.com/atuinsh/atuin/issues/3149))
+- Add Hub authentication for future sync + extra features ([#3010](https://github.com/atuinsh/atuin/issues/3010))
+- Add Atuin AI inline CLI MVP ([#3178](https://github.com/atuinsh/atuin/issues/3178))
+- Add autostart and pid management to daemon ([#3180](https://github.com/atuinsh/atuin/issues/3180))
+
+
+### Miscellaneous Tasks
+
+- Update changelog
+
+
+## [18.12.1] - 2026-02-11
+
+### Bug Fixes
+
+- *(shell)* Fix ATUIN_SESSION errors in tmux popup ([#3170](https://github.com/atuinsh/atuin/issues/3170))
+- *(tui)* Enter in vim normal mode, shift-tab keybind ([#3158](https://github.com/atuinsh/atuin/issues/3158))
+- Server start commands for Docker. ([#3160](https://github.com/atuinsh/atuin/issues/3160))
+
+
+### Features
+
+- Expand keybinding system with vim motions, media keys, and inspector improvements ([#3161](https://github.com/atuinsh/atuin/issues/3161))
+- Add original-input-empty keybind condition ([#3171](https://github.com/atuinsh/atuin/issues/3171))
+
+
+### Miscellaneous Tasks
+
+- Update changelog
+
+
 ## [18.12.0] - 2026-02-09
 
 ### Bug Fixes

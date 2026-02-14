@@ -13,13 +13,14 @@ repository = { workspace = true }
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["sync", "daemon"]
+default = ["sync", "hub", "daemon"]
 sync = ["urlencoding", "reqwest", "sha2", "hex"]
+hub = ["reqwest"]
 daemon = []
 check-update = []
 
 [dependencies]
-atuin-common = { path = "../atuin-common", version = "18.12.0" }
+atuin-common = { path = "../atuin-common", version = "18.13.0-beta.1" }
 
 log = { workspace = true }
 base64 = { workspace = true }
@@ -68,7 +69,7 @@ indicatif = "0.18.0"
 tiny-bip39 = "2.0.0"
 
 # theme
-crossterm = { version = "0.29.0", features = ["serde"] }
+crossterm = { workspace = true, features = ["serde"] }
 palette = { version = "0.7.5", features = ["serializing"] }
 strum_macros = "0.27"
 strum = { version = "0.27", features = ["strum_macros"] }
