@@ -13,7 +13,6 @@ use itertools::Itertools;
 use ratatui::{
     backend::FromCrossterm,
     buffer::Buffer,
-    crossterm::style,
     layout::Rect,
     style::Style,
     widgets::{Block, StatefulWidget, Widget},
@@ -293,10 +292,11 @@ impl DrawState<'_> {
                     // of the list
                     return;
                 }
-                let mut style = style;
-                if highlight_indices.contains(&pos) {
-                    style.attributes.set(style::Attribute::Bold);
-                }
+                let style = if highlight_indices.contains(&pos) {
+                    self.theme.as_style(Meaning::Highlight)
+                } else {
+                    style
+                };
                 let s = ch.to_string();
                 self.draw(&s, Style::from_crossterm(style));
                 pos += s.len();
