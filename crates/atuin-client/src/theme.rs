@@ -31,6 +31,7 @@ pub enum Meaning {
     Important,
     Title,
     Muted,
+    Highlight,
     Selection,
     SyntaxCommand,
     SyntaxFlag,
@@ -304,6 +305,7 @@ static MEANING_FALLBACKS: LazyLock<HashMap<Meaning, Meaning>> = LazyLock::new(||
         (Meaning::Guidance, Meaning::AlertInfo),
         (Meaning::Annotation, Meaning::AlertInfo),
         (Meaning::Title, Meaning::Important),
+        (Meaning::Highlight, Meaning::Base),
         (Meaning::Selection, Meaning::Base),
         (Meaning::SyntaxComment, Meaning::Annotation),
     ])
@@ -329,6 +331,7 @@ static DEFAULT_THEME: LazyLock<Theme> = LazyLock::new(|| {
             (Meaning::Muted, StyleFactory::from_fg_color(Color::Grey)),
             (Meaning::Border, StyleFactory::from_fg_color(Color::White)),
             (Meaning::Base, ContentStyle::default()),
+            (Meaning::Highlight, StyleFactory::from_fg_color(Color::Blue)),
             // #313244 - Catppuccin surface0
             (
                 Meaning::Selection,

@@ -11,7 +11,6 @@ use easy_cast::Conv;
 use itertools::Itertools;
 use ratatui::backend::FromCrossterm;
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::style;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::widgets::{Block, StatefulWidget, Widget};
@@ -312,15 +311,18 @@ impl DrawState<'_> {
             }
             // Map each output cell back to its source byte and test the existing
             // highlight set; a cell on the spliced ellipsis maps to None and is
-            // never highlighted (this is why the "…" is never bolded).
+            // never highlighted (this is why the "…" never gets the highlight style).
             let source_byte = ellipsized.source_index(i);
             let highlighted = source_byte.is_some_and(|b| highlight_indices.contains(&b));
-            let mut char_style = source_byte
-                .and_then(|b| syntax.get(b))
-                .map_or(style, |&meaning| self.theme.as_style(meaning));
-            if highlighted {
-                char_style.attributes.set(style::Attribute::Bold);
-            }
+            // Search matches take precedence and use the dedicated Highlight
+            // color; otherwise fall back to this byte's syntax color, or Base.
+            let char_style = if highlighted {
+                self.theme.as_style(Meaning::Highlight)
+            } else {
+                source_byte
+                    .and_then(|b| syntax.get(b))
+                    .map_or(style, |&meaning| self.theme.as_style(meaning))
+            };
 
             let mut ch_buf = [0u8; 4];
             self.draw(ch.encode_utf8(&mut ch_buf), Style::from_crossterm(char_style));
