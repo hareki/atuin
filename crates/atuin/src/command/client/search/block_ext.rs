@@ -1,7 +1,7 @@
 use ratatui::{
     backend::FromCrossterm,
     layout::Alignment,
-    style::Style,
+    style::{Modifier, Style},
     text::Line,
     widgets::{Block, BorderType},
 };
@@ -21,6 +21,6 @@ pub fn themed_block(theme: &Theme) -> Block<'static> {
 /// Creates a themed block with " Atuin " centered title for the main TUI container.
 pub fn titled_block(theme: &Theme) -> Block<'static> {
     themed_block(theme)
-        .title(Line::from(" Atuin "))
+        .title(Line::from(" Atuin ").style(Style::new().add_modifier(Modifier::BOLD)))
         .title_alignment(Alignment::Center)
 }
