@@ -1262,7 +1262,7 @@ impl State {
         };
         f.set_cursor_position((
             // Put cursor past the end of the input text
-            input_chunk.x + u16::conv(extra_width) + prefix_width + cursor_offset,
+            input_chunk.x + u16::conv(extra_width) + prefix_width + cursor_offset + 1,
             input_chunk.y + cursor_offset,
         ));
     }
@@ -1439,7 +1439,7 @@ impl State {
         let mode_width = usize::from(prefix_width) - pref.len() - 3;
         // sanity check to ensure we don't exceed the layout limits
         debug_assert!(mode_width >= mode.len(), "mode name '{mode}' is too long!");
-        let input = format!("[{pref}{mode:^mode_width$}] {}", self.search.input.as_str());
+        let input = format!(" [{pref}{mode:^mode_width$}] {}", self.search.input.as_str());
         let input = Paragraph::new(input);
         match style.compactness {
             Compactness::Full => {
