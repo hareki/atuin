@@ -589,7 +589,7 @@ Special values:
 | `$all-user` | Commands from any author that is **not** a known AI agent |
 | `$all-agent` | Commands from any known AI agent |
 
-You can also use literal author names like `"claude-code"` or `"codex"`.
+You can also use literal author names like `"claude-code"`, `"codex"`, or `"pi"`.
 
 ```toml
 [search]
