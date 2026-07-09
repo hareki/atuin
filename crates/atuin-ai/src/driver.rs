@@ -43,6 +43,9 @@ pub(crate) enum DriverEvent {
     Tui(AiTuiEvent),
     /// Internal FSM event (from spawned stream/tool tasks)
     Fsm(Event),
+    /// Fresh credit-usage snapshot (from the done event or a background
+    /// fetch). Handled by the driver directly — the FSM never sees it.
+    Usage(crate::usage::UsageSnapshot),
 }
 
 // ============================================================================
@@ -87,6 +90,9 @@ pub(crate) struct ViewState {
     pub model_picker: Option<crate::fsm::ModelPicker>,
     /// Model alias currently in effect (`None` = server default).
     pub model: Option<String>,
+    /// Latest known credit usage: cached at startup, refreshed from the
+    /// done event and background fetches.
+    pub usage: Option<crate::usage::UsageSnapshot>,
 
     // ─── Pre-computed for rendering ────────────────────────────
     pub turns: Vec<turn::UiTurn>,
@@ -186,6 +192,10 @@ pub(crate) fn run_driver(
             DriverEvent::Tui(tui_event) => {
                 tracing::trace!(?tui_event, state = ?fsm.state, "TUI event");
                 translate_tui_event(tui_event, &handle, &io)
+            }
+            DriverEvent::Usage(snapshot) => {
+                update_usage(&handle, &io, snapshot);
+                None
             }
         };
 
@@ -364,7 +374,7 @@ fn resolve_skill_name(input: &str, handle: &Handle<ViewState>) -> Option<(String
     let is_skill = handle
         .fetch({
             let cmd_name = cmd_name.clone();
-            move |vs| vs.skill_names.contains(&cmd_name) && !vs.slash_registry.contains(&cmd_name)
+            move |vs| is_skill_command(&cmd_name, &vs.skill_names, &vs.slash_registry)
         })
         .blocking_recv()
         .unwrap_or(false);
@@ -380,6 +390,16 @@ fn resolve_skill_name(input: &str, handle: &Handle<ViewState>) -> Option<(String
         .map(|s| s.to_string());
 
     Some((cmd_name, args))
+}
+
+/// Skills are registered in `slash_registry` too (for autocomplete and
+/// `/help`), so precedence is decided by the builtin flag, not membership.
+fn is_skill_command(
+    cmd_name: &str,
+    skill_names: &std::collections::HashSet<String>,
+    slash_registry: &crate::tui::slash::SlashCommandRegistry,
+) -> bool {
+    skill_names.contains(cmd_name) && !slash_registry.contains_builtin(cmd_name)
 }
 
 fn resolve_slash_command(command: &str, handle: &Handle<ViewState>, io: &IoContext) -> String {
@@ -929,6 +949,21 @@ fn execute_effect(effect: &Effect, ctx: DriverContext) {
 // Persistence
 // ============================================================================
 
+/// Apply a fresh usage snapshot: sync it to the view and write it to the
+/// local cache so the next TUI open can render it immediately.
+fn update_usage(handle: &Handle<ViewState>, io: &IoContext, snapshot: crate::usage::UsageSnapshot) {
+    handle.update({
+        let snapshot = snapshot.clone();
+        move |vs| vs.usage = Some(snapshot)
+    });
+
+    let key = crate::usage::cache_key(&io.app_ctx.token);
+    let rt = tokio::runtime::Handle::current();
+    if let Err(e) = rt.block_on(io.session_mgr.set_cached_usage(&key, &snapshot)) {
+        tracing::warn!("Failed to persist usage cache: {e}");
+    }
+}
+
 fn persist(fsm: &AgentFsm, io: &mut IoContext) {
     let start = std::time::Instant::now();
     let rt = tokio::runtime::Handle::current();
@@ -1063,7 +1098,15 @@ async fn run_stream_bridge(
             },
             Ok(StreamFrame::Control(control)) => match control {
                 StreamControl::StatusChanged(status) => Some(Event::StreamStatusChanged(status)),
-                StreamControl::Done { session_id } => Some(Event::StreamDone { session_id }),
+                StreamControl::Done {
+                    session_id,
+                    credits,
+                } => {
+                    if let Some(snapshot) = credits {
+                        let _ = tx.send(DriverEvent::Usage(snapshot));
+                    }
+                    Some(Event::StreamDone { session_id })
+                }
                 StreamControl::Error(msg) => Some(Event::StreamError(msg)),
             },
             Ok(StreamFrame::SessionIdentity(session_id)) => {
@@ -1084,5 +1127,41 @@ async fn run_stream_bridge(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_skill_command;
+    use crate::tui::slash::{SlashCommand, SlashCommandRegistry};
+
+    /// Regression test: skills are registered into the slash registry so they
+    /// appear in autocomplete, which must not stop them dispatching as skills.
+    #[test]
+    fn skill_dispatches_even_when_registered_for_autocomplete() {
+        let mut registry = SlashCommandRegistry::default();
+        let mut skill_names = std::collections::HashSet::new();
+        registry.register(SlashCommand::new("release", "Cut a release"));
+        skill_names.insert("release".to_string());
+
+        assert!(is_skill_command("release", &skill_names, &registry));
+    }
+
+    #[test]
+    fn builtin_takes_precedence_over_skill_with_same_name() {
+        let mut registry = SlashCommandRegistry::default();
+        let mut skill_names = std::collections::HashSet::new();
+        registry.register(SlashCommand::new("reload", "A skill shadowing /reload"));
+        skill_names.insert("reload".to_string());
+
+        assert!(!is_skill_command("reload", &skill_names, &registry));
+    }
+
+    #[test]
+    fn unregistered_name_is_not_a_skill() {
+        let registry = SlashCommandRegistry::default();
+        let skill_names = std::collections::HashSet::new();
+
+        assert!(!is_skill_command("release", &skill_names, &registry));
     }
 }
