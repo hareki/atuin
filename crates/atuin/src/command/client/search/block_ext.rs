@@ -18,9 +18,9 @@ pub fn themed_block(theme: &Theme) -> Block<'static> {
         .border_type(BorderType::Rounded)
 }
 
-/// Creates a themed block with " Atuin " centered title for the main TUI container.
+/// Creates a themed block with " History " centered title for the main TUI container.
 pub fn titled_block(theme: &Theme) -> Block<'static> {
     themed_block(theme)
-        .title(Line::from(" Atuin ").style(Style::new().add_modifier(Modifier::BOLD)))
+        .title(Line::from(" History ").style(Style::new().add_modifier(Modifier::BOLD)))
         .title_alignment(Alignment::Center)
 }
