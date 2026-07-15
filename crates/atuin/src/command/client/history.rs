@@ -6,7 +6,7 @@ use std::{
 };
 
 use atuin_common::logs::LogConfig;
-use atuin_common::utils::{self, Escapable as _};
+use atuin_common::{string::EscapeNonPrintablePosixExt as _, utils};
 use clap::Subcommand;
 use eyre::{Context, Result, bail};
 use runtime_format::{FormatKey, FormatKeyError, ParseSegment, ParsedFmt};
@@ -33,7 +33,7 @@ use atuin_client::{
 };
 
 #[cfg(feature = "sync")]
-use atuin_client::{record, sync};
+use atuin_client::record;
 
 use time::{OffsetDateTime, macros::format_description};
 use tracing::{debug, warn};
@@ -321,7 +321,9 @@ impl FormatKey for FmtHistory<'_> {
         match key {
             "command" => match self.cmd_format {
                 CmdFormat::Literal => f.write_str(self.history.command.trim()),
-                CmdFormat::Escaped => f.write_str(&self.history.command.trim().escape_control()),
+                CmdFormat::Escaped => {
+                    f.write_str(&self.history.command.trim().escape_non_printable())
+                }
             }?,
             "directory" => f.write_str(self.history.cwd.trim())?,
             "exit" => f.write_str(&self.history.exit.to_string())?,
@@ -541,16 +543,11 @@ async fn handle_end(
     if settings.should_sync().await? {
         #[cfg(feature = "sync")]
         {
-            if settings.sync.records {
-                let (_, downloaded) =
-                    record::sync::sync(settings, &store, &history_store.encryption_key).await?;
-                Settings::save_sync_time().await?;
+            let (_, downloaded) =
+                record::sync::sync(settings, &store, &history_store.encryption_key).await?;
+            Settings::save_sync_time().await?;
 
-                crate::sync::build(settings, &store, db, Some(&downloaded)).await?;
-            } else {
-                debug!("running periodic background sync");
-                sync::sync(settings, false, db).await?;
-            }
+            crate::sync::build(settings, &store, db, Some(&downloaded)).await?;
         }
         #[cfg(not(feature = "sync"))]
         debug!("not compiled with sync support");
@@ -754,7 +751,7 @@ impl TailEvent {
         out.push('\n');
 
         let command = self.history.command.trim();
-        let escaped_command = command.escape_control();
+        let escaped_command = command.escape_non_printable();
         let mut command_lines = escaped_command.lines();
         let header = format!(
             "{} {}",
@@ -1032,12 +1029,8 @@ impl Cmd {
 
             for entry in matches {
                 eprintln!("deleting {}", entry.id);
-                if settings.sync.records {
-                    let (id, _) = history_store.delete(entry.id.clone()).await?;
-                    history_store.incremental_build(db, &[id]).await?;
-                } else {
-                    db.delete(entry.clone()).await?;
-                }
+                let (id, _) = history_store.delete(entry.id.clone()).await?;
+                history_store.incremental_build(db, &[id]).await?;
             }
 
             #[cfg(feature = "daemon")]
@@ -1093,12 +1086,8 @@ impl Cmd {
 
             for entry in matches {
                 eprintln!("deleting {}", entry.id);
-                if settings.sync.records {
-                    let (id, _) = history_store.delete(entry.id).await?;
-                    history_store.incremental_build(db, &[id]).await?;
-                } else {
-                    db.delete(entry).await?;
-                }
+                let (id, _) = history_store.delete(entry.id).await?;
+                history_store.incremental_build(db, &[id]).await?;
             }
 
             #[cfg(feature = "daemon")]
