@@ -60,6 +60,7 @@ pub struct OptFilters {
     pub include_duplicates: bool,
     /// Author filter. Supports special values `$all-user` and `$all-agent`.
     pub authors: Vec<String>,
+    pub shells: Vec<String>,
 }
 
 /// Build a query [`Context`] without requiring a live shell session.
@@ -137,6 +138,31 @@ fn apply_author_filter(sql: &mut SqlBuilder, authors: &[String]) {
     }
 }
 
+fn apply_shell_filter<S>(sql: &mut SqlBuilder, shells: S)
+where
+    S: IntoIterator,
+    S::Item: AsRef<str>,
+{
+    let mut include_null = false;
+    let nonempty_shells = shells.into_iter().filter(|s| {
+        let is_empty = s.as_ref().is_empty();
+        if is_empty {
+            include_null = true;
+        }
+        !is_empty
+    });
+
+    let shell_list = nonempty_shells.map(|s| quote(s.as_ref())).join(", ");
+    let mut cond = (!shell_list.is_empty()).then(|| format!("shell in ({shell_list})"));
+
+    if include_null {
+        cond = Some(cond.map_or_else(String::new, |s| s + " OR ") + "shell IS NULL");
+    }
+    if let Some(cond) = cond {
+        sql.and_where(cond);
+    }
+}
+
 fn get_session_start_time(session_id: &str) -> Option<i64> {
     if let Ok(uuid) = Uuid::parse_str(session_id)
         && let Some(timestamp) = uuid.get_timestamp()
@@ -153,6 +179,14 @@ pub trait Database: Send + Sync + 'static {
     async fn save_bulk(&self, h: &[History]) -> Result<()>;
 
     async fn load(&self, id: &str) -> Result<Option<History>>;
+
+    /// Load the *active* (not soft-deleted) entries for the given IDs.
+    ///
+    /// Unlike [`load`](Self::load), this filters out soft-deleted rows -- an ID whose
+    /// row exists but is deleted is omitted, exactly like an ID that isn't present at
+    /// all. Ordering is unspecified. Prefer this over calling `load` in a loop: it
+    /// chunks into a handful of queries rather than one round trip per ID.
+    async fn load_active(&self, ids: &[HistoryId]) -> Result<Vec<History>>;
     async fn list(
         &self,
         filters: &[FilterMode],
@@ -359,6 +393,33 @@ impl Database for Sqlite {
             .await?;
 
         Ok(res)
+    }
+
+    async fn load_active(&self, ids: &[HistoryId]) -> Result<Vec<History>> {
+        // sqlite caps bound parameters per statement (SQLITE_MAX_VARIABLE_NUMBER, as low as 999).
+        // Chunk well under that.
+        const CHUNK: usize = 500;
+
+        debug!("loading {} history items", ids.len());
+
+        let mut out = Vec::with_capacity(ids.len());
+
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = ["?"].repeat(chunk.len()).join(",");
+            let sql = format!(
+                "select * from history where id in ({placeholders}) and deleted_at is null"
+            );
+
+            let mut query = sqlx::query(sql.as_str());
+            for id in chunk {
+                query = query.bind(id.0.as_str());
+            }
+
+            let rows = query.map(Self::query_history).fetch_all(&self.pool).await?;
+            out.extend(rows);
+        }
+
+        Ok(out)
     }
 
     async fn update(&self, h: &History) -> Result<()> {
@@ -635,6 +696,7 @@ impl Database for Sqlite {
         if !filter_options.authors.is_empty() {
             apply_author_filter(&mut sql, &filter_options.authors);
         }
+        apply_shell_filter(&mut sql, &filter_options.shells);
 
         sql.and_where_is_null("deleted_at");
 
@@ -1170,6 +1232,111 @@ mod test {
         captured.hostname = "booop".to_string();
 
         db.save(&captured).await
+    }
+
+    async fn save_history_item(db: &impl Database, cmd: &str) -> History {
+        let mut captured: History = History::capture()
+            .timestamp(OffsetDateTime::now_utc())
+            .command(cmd)
+            .cwd("/home/ellie")
+            .build()
+            .into();
+
+        captured.exit = 0;
+        captured.duration = 1;
+        captured.session = "beep boop".to_string();
+        captured.hostname = "booop".to_string();
+
+        db.save(&captured).await.unwrap();
+        captured
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_active_returns_only_requested_rows() {
+        let db = Sqlite::new("sqlite::memory:", test_local_timeout())
+            .await
+            .unwrap();
+        let alpha = save_history_item(&db, "echo alpha").await;
+        let bravo = save_history_item(&db, "echo bravo").await;
+        let _charlie = save_history_item(&db, "echo charlie").await;
+
+        let loaded = db
+            .load_active(&[alpha.id.clone(), bravo.id.clone()])
+            .await
+            .unwrap();
+
+        let mut commands: Vec<String> = loaded.into_iter().map(|h| h.command).collect();
+        commands.sort();
+        assert_eq!(commands, vec!["echo alpha", "echo bravo"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_active_empty_never_reaches_sqlite() {
+        let db = Sqlite::new("sqlite::memory:", test_local_timeout())
+            .await
+            .unwrap();
+        save_history_item(&db, "echo alpha").await;
+
+        // `select ... where id in ()` is a syntax error, so the empty case must
+        // short-circuit rather than build a query.
+        let loaded = db.load_active(&[]).await.unwrap();
+
+        assert!(loaded.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_active_skips_soft_deleted() {
+        let db = Sqlite::new("sqlite::memory:", test_local_timeout())
+            .await
+            .unwrap();
+        let mut alpha = save_history_item(&db, "echo alpha").await;
+        let bravo = save_history_item(&db, "echo bravo").await;
+
+        alpha.deleted_at = Some(OffsetDateTime::now_utc());
+        alpha.command = String::new();
+        db.update(&alpha).await.unwrap();
+
+        let loaded = db
+            .load_active(&[alpha.id.clone(), bravo.id.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].command, "echo bravo");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_active_missing_ids_are_omitted() {
+        let db = Sqlite::new("sqlite::memory:", test_local_timeout())
+            .await
+            .unwrap();
+        let alpha = save_history_item(&db, "echo alpha").await;
+
+        let loaded = db
+            .load_active(&[alpha.id.clone(), HistoryId("does-not-exist".to_string())])
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].command, "echo alpha");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_active_chunks_past_sqlite_param_limit() {
+        let db = Sqlite::new("sqlite::memory:", test_local_timeout())
+            .await
+            .unwrap();
+
+        // Comfortably over SQLITE_MAX_VARIABLE_NUMBER's 999 floor: a single
+        // `in (...)` with one placeholder per id would fail here.
+        let mut ids = Vec::new();
+        for i in 0..1200 {
+            ids.push(save_history_item(&db, &format!("echo {i}")).await.id);
+        }
+
+        let loaded = db.load_active(&ids).await.unwrap();
+
+        assert_eq!(loaded.len(), 1200);
     }
 
     #[tokio::test(flavor = "multi_thread")]
