@@ -194,6 +194,7 @@ pub trait Database: Send + Sync + 'static {
         max: Option<usize>,
         unique: bool,
         include_deleted: bool,
+        range: Option<(OffsetDateTime, OffsetDateTime)>,
     ) -> Result<Vec<History>>;
     async fn range(&self, from: OffsetDateTime, to: OffsetDateTime) -> Result<Vec<History>>;
 
@@ -410,7 +411,7 @@ impl Database for Sqlite {
                 "select * from history where id in ({placeholders}) and deleted_at is null"
             );
 
-            let mut query = sqlx::query(sql.as_str());
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(id.0.as_str());
             }
@@ -455,6 +456,7 @@ impl Database for Sqlite {
         max: Option<usize>,
         unique: bool,
         include_deleted: bool,
+        range: Option<(OffsetDateTime, OffsetDateTime)>,
     ) -> Result<Vec<History>> {
         debug!("listing history");
 
@@ -497,9 +499,16 @@ impl Database for Sqlite {
             query.limit(max);
         }
 
+        // Inclusive on both ends, matching `range()`. `stats` relies on this to count a
+        // command recorded exactly on a period boundary (e.g. at midnight).
+        if let Some((from, to)) = range {
+            query.and_where_ge("timestamp", from.unix_timestamp_nanos() as i64);
+            query.and_where_le("timestamp", to.unix_timestamp_nanos() as i64);
+        }
+
         let query = query.sql().expect("bug in list query. please report");
 
-        let res = sqlx::query(&query)
+        let res = sqlx::query(sqlx::AssertSqlSafe(query))
             .map(Self::query_history)
             .fetch_all(&self.pool)
             .await?;
@@ -740,7 +749,7 @@ impl Database for Sqlite {
             )
         };
 
-        let res = sqlx::query(&query)
+        let res = sqlx::query(sqlx::AssertSqlSafe(query))
             .map(Self::query_history)
             .fetch_all(&self.pool)
             .await?;
@@ -749,7 +758,7 @@ impl Database for Sqlite {
     }
 
     async fn query_history(&self, query: &str) -> Result<Vec<History>> {
-        let res = sqlx::query(query)
+        let res = sqlx::query(sqlx::AssertSqlSafe(query))
             .map(Self::query_history)
             .fetch_all(&self.pool)
             .await?;
@@ -784,7 +793,7 @@ impl Database for Sqlite {
 
         let query = query.sql().expect("bug in list query. please report");
 
-        let res = sqlx::query(&query)
+        let res = sqlx::query(sqlx::AssertSqlSafe(query))
             .map(|row: SqliteRow| {
                 let count: i32 = row.get("count");
                 (Self::query_history(row), count)
@@ -889,44 +898,45 @@ impl Database for Sqlite {
             .sql()
             .expect("issue in stats duration over time query");
 
-        let prev = sqlx::query(&prev)
+        let prev = sqlx::query(sqlx::AssertSqlSafe(prev))
             .bind(h.timestamp.unix_timestamp_nanos() as i64)
             .bind(&h.session)
             .map(Self::query_history)
             .fetch_optional(&self.pool)
             .await?;
 
-        let next = sqlx::query(&next)
+        let next = sqlx::query(sqlx::AssertSqlSafe(next))
             .bind(h.timestamp.unix_timestamp_nanos() as i64)
             .bind(&h.session)
             .map(Self::query_history)
             .fetch_optional(&self.pool)
             .await?;
 
-        let total: (i64,) = sqlx::query_as(&total)
+        let total: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(total))
             .bind(&h.command)
             .fetch_one(&self.pool)
             .await?;
 
-        let average: (f64,) = sqlx::query_as(&average)
+        let average: (f64,) = sqlx::query_as(sqlx::AssertSqlSafe(average))
             .bind(&h.command)
             .fetch_one(&self.pool)
             .await?;
 
-        let exits: Vec<(i64, i64)> = sqlx::query_as(&exits)
+        let exits: Vec<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(exits))
             .bind(&h.command)
             .fetch_all(&self.pool)
             .await?;
 
-        let day_of_week: Vec<(String, i64)> = sqlx::query_as(&day_of_week)
+        let day_of_week: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(day_of_week))
             .bind(&h.command)
             .fetch_all(&self.pool)
             .await?;
 
-        let duration_over_time: Vec<(String, f64)> = sqlx::query_as(&duration_over_time)
-            .bind(&h.command)
-            .fetch_all(&self.pool)
-            .await?;
+        let duration_over_time: Vec<(String, f64)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(duration_over_time))
+                .bind(&h.command)
+                .fetch_all(&self.pool)
+                .await?;
 
         let duration_over_time = duration_over_time
             .iter()
@@ -1249,6 +1259,52 @@ mod test {
 
         db.save(&captured).await.unwrap();
         captured
+    }
+
+    // `stats --filter-mode` scopes over a period by handing `list` an inclusive
+    // `(from, to)` range. The bounds must be inclusive on both ends so a command
+    // recorded exactly on a period boundary (e.g. at midnight) is still counted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_list_range_is_inclusive() {
+        let db = Sqlite::new("sqlite::memory:", test_local_timeout())
+            .await
+            .unwrap();
+        let context = Context {
+            hostname: "booop".to_string(),
+            session: "beep boop".to_string(),
+            cwd: "/home/ellie".to_string(),
+            host_id: "test-host".to_string(),
+            git_root: None,
+        };
+
+        // One item at a fixed instant, one at `now` (far outside the window below).
+        let at = OffsetDateTime::from_unix_timestamp(1_708_330_400).unwrap();
+        let mut past: History = History::capture()
+            .timestamp(at)
+            .command("ls /home/ellie")
+            .cwd("/home/ellie")
+            .build()
+            .into();
+        past.session = "beep boop".to_string();
+        past.hostname = "booop".to_string();
+        db.save(&past).await.unwrap();
+        save_history_item(&db, "ls /home/frank").await;
+
+        // No range -> everything.
+        let all = db
+            .list(&[], &context, None, false, false, None)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+
+        // A zero-width window on the item's exact timestamp matches it, because the
+        // bounds are inclusive (`timestamp >= from AND timestamp <= to`).
+        let hits = db
+            .list(&[], &context, None, false, false, Some((at, at)))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].command, "ls /home/ellie");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1672,6 +1728,7 @@ mod test {
                 None,
                 false,
                 false,
+                None,
             )
             .await
             .unwrap();
