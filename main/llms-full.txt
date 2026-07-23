@@ -254,24 +254,30 @@ With ble.sh (>= 0.4) installed and loaded in `~/.bashrc`, just add atuin to your
 echo 'eval "$(atuin init bash)"' >> ~/.bashrc
 ```
 
-[Bash-preexec](https://github.com/rcaloras/bash-preexec) can also be used, but you may experience some minor problems with the recorded duration and exit status of some commands.
+[bash-preexec](https://github.com/rcaloras/bash-preexec) can also be used, but you may experience some minor problems with the recorded duration and exit status of some commands.
 
 Please note
 
-bash-preexec currently has an issue where it will stop honoring `ignorespace`. While Atuin will ignore commands prefixed with whitespace, they may still end up in your bash history. Please check your configuration! All other shells do not have this issue.
+bash-preexec currently has [an issue](https://github.com/rcaloras/bash-preexec/issues/115) where it will stop honoring `ignorespace`. While Atuin will ignore commands prefixed with whitespace, they may still end up in your bash history. Please check your configuration! All other shells do not have this issue.
 
 To use `atuin < 18.10.0` in `bash < 4` with bash-preexec, the option `enter_accept` needs to be turned on (which is so by default). There is no restriction in the latest version of Atuin (>= 18.10.0).
 
 bash-preexec cannot properly invoke the `preexec` hook for subshell commands `(...)`, function definitions `func() { ...; }`, empty for-in-statements `for i in; do ...; done`, etc., so those commands and duration may not be recorded in the Atuin's history correctly.
 
-To use bash-preexec, download and initialize it
+As of Atuin 18.18.0, `atuin init bash` will automatically load bash-preexec if no other preexec backend has been loaded (ble.sh or an external copy of bash-preexec). To disable this behavior, pass `ATUIN_NO_BUILTIN_PREEXEC=1` to `atuin init`, e.g.:
+
+```
+eval "$(ATUIN_NO_BUILTIN_PREEXEC=1 atuin init bash)"
+```
+
+If you prefer, you can also download and install bash-preexec separately:
 
 ```
 curl https://raw.githubusercontent.com/rcaloras/bash-preexec/master/bash-preexec.sh -o ~/.bash-preexec.sh
 echo '[[ -f ~/.bash-preexec.sh ]] && source ~/.bash-preexec.sh' >> ~/.bashrc
 ```
 
-Then set up Atuin
+Then set up Atuin:
 
 ```
 echo 'eval "$(atuin init bash)"' >> ~/.bashrc
@@ -1304,6 +1310,12 @@ Themes are maps from *Meanings*, describing the developer's intentions, to (at p
 - `Important`: drawing the user's attention to information
 - `Title`: titling a section or view
 - `Muted`: anodyne, usually grey, foreground for contrast with other colors. Normally equivalent to the base color, but allows themes to change the base color, with less risk of breaking intentional color contrasts (e.g. stacked bar charts)
+- `SyntaxCommand`: the command word when syntax highlighting shell commands (`git` in `git status`)
+- `SyntaxFlag`: a `-f`/`--flag` argument
+- `SyntaxString`: a quoted string
+- `SyntaxVariable`: `$VAR`, `${VAR}` or a `FOO=bar` assignment
+- `SyntaxOperator`: operators such as `|`, `&&`, `;`, `>`
+- `SyntaxComment`: a `# comment`
 
 These may expand over time as they are added to Atuin's codebase, but Atuin should have fallbacks added for any new *Meanings* so that, whether themes limit to the present list or take advantage of new *Meanings* in future, they should keep working sensibly.
 
@@ -2499,6 +2511,20 @@ columns = ["exit", "duration", "command"]
 
 # Make directory expand instead of command
 columns = ["duration", "time", { type = "directory", expand = true }, { type = "command", expand = false }]
+```
+
+### `syntax_highlight`
+
+Default: `true`
+
+Syntax highlight commands in the search results, parsed with the grammar for the shell that ran them: bash/zsh/sh use the bash grammar, fish uses the fish grammar, and shells without a grammar (nu, xonsh, powershell) are shown unhighlighted. The selected row keeps its usual single highlight color.
+
+The default colors are ANSI palette colors, so they automatically match your terminal's color scheme. They can also be customized via the `Syntax*` keys in a [theme](https://docs.atuin.sh/guide/theming/index.md).
+
+Not available on platforms where tree-sitter doesn't build (e.g. Windows); commands are shown unhighlighted there.
+
+```
+syntax_highlight = false
 ```
 
 ## ai
@@ -5219,7 +5245,7 @@ EG:
 eval "$(atuin init zsh --disable-up-arrow)"
 ```
 
-See [key binding](https://docs.atuin.sh/configuration/key-binding.md) for more
+See [key binding](https://docs.atuin.sh/configuration/key-binding/index.md) for more
 
 ## How do I remove the default question mark binding for Atuin AI?
 
