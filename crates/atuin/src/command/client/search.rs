@@ -26,6 +26,7 @@ mod inspector;
 mod interactive;
 pub mod keybindings;
 mod selection_ext;
+mod syntax;
 
 pub use duration::format_duration_into;
 

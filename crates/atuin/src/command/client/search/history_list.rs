@@ -3,6 +3,7 @@ use std::time::Duration;
 use super::duration::format_duration;
 use super::engines::SearchEngine;
 use super::selection_ext::get_selection_style;
+use super::syntax;
 use atuin_client::{
     history::History,
     settings::{UiColumn, UiColumnType},
@@ -35,6 +36,7 @@ impl HistoryHighlighter<'_> {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct HistoryList<'a> {
     history: &'a [History],
     block: Option<Block<'a>>,
@@ -42,6 +44,7 @@ pub struct HistoryList<'a> {
     now: &'a dyn Fn() -> OffsetDateTime,
     theme: &'a Theme,
     history_highlighter: HistoryHighlighter<'a>,
+    syntax_highlight: bool,
     /// Columns to display (in order, after the left padding)
     columns: &'a [UiColumn],
 }
@@ -100,6 +103,7 @@ impl StatefulWidget for HistoryList<'_> {
             now: &self.now,
             theme: self.theme,
             history_highlighter: self.history_highlighter,
+            syntax_highlight: self.syntax_highlight,
             columns: self.columns,
         };
 
@@ -114,12 +118,14 @@ impl StatefulWidget for HistoryList<'_> {
 }
 
 impl<'a> HistoryList<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         history: &'a [History],
         inverted: bool,
         now: &'a dyn Fn() -> OffsetDateTime,
         theme: &'a Theme,
         history_highlighter: HistoryHighlighter<'a>,
+        syntax_highlight: bool,
         columns: &'a [UiColumn],
     ) -> Self {
         Self {
@@ -129,6 +135,7 @@ impl<'a> HistoryList<'a> {
             now,
             theme,
             history_highlighter,
+            syntax_highlight,
             columns,
         }
     }
@@ -157,6 +164,7 @@ impl<'a> HistoryList<'a> {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct DrawState<'a> {
     buf: &'a mut Buffer,
     list_area: Rect,
@@ -167,6 +175,7 @@ struct DrawState<'a> {
     now: &'a dyn Fn() -> OffsetDateTime,
     theme: &'a Theme,
     history_highlighter: HistoryHighlighter<'a>,
+    syntax_highlight: bool,
     columns: &'a [UiColumn],
 }
 
@@ -296,6 +305,12 @@ impl DrawState<'_> {
 
         let highlight_indices = self.history_highlighter.get_highlight_indices(&normalized);
 
+        let syntax = if self.syntax_highlight {
+            syntax::classify(&normalized, h.shell.as_deref())
+        } else {
+            Vec::new()
+        };
+
         // Calculate the available width for the command text.
         // `self.x` is already past the indicator and any preceding columns,
         // so the remaining width is how far we can draw.
@@ -313,13 +328,16 @@ impl DrawState<'_> {
             // Map each output cell back to its source byte and test the existing
             // highlight set; a cell on the spliced ellipsis maps to None and is
             // never highlighted (this is why the "…" never gets the highlight style).
-            let highlighted = ellipsized
-                .source_index(i)
-                .is_some_and(|b| highlight_indices.contains(&b));
+            let source_byte = ellipsized.source_index(i);
+            let highlighted = source_byte.is_some_and(|b| highlight_indices.contains(&b));
+            // Search matches take precedence and use the dedicated Highlight
+            // color; otherwise fall back to this byte's syntax color, or Base.
             let char_style = if highlighted {
                 self.theme.as_style(Meaning::Highlight)
             } else {
-                style
+                source_byte
+                    .and_then(|b| syntax.get(b))
+                    .map_or(style, |&meaning| self.theme.as_style(meaning))
             };
             self.draw(&ch.to_string(), Style::from_crossterm(char_style));
         }

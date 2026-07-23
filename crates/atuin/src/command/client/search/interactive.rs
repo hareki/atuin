@@ -956,6 +956,7 @@ impl State {
                     &self.now,
                     theme,
                     history_highlighter,
+                    settings.ui.syntax_highlight,
                     &settings.ui.columns,
                 );
                 f.render_stateful_widget(results_list, results_list_chunk, &mut self.results_state);
@@ -1142,6 +1143,7 @@ impl State {
         now: &'a dyn Fn() -> OffsetDateTime,
         theme: &'a Theme,
         history_highlighter: HistoryHighlighter<'a>,
+        syntax_highlight: bool,
         columns: &'a [UiColumn],
     ) -> HistoryList<'a> {
         let results_list = HistoryList::new(
@@ -1150,6 +1152,7 @@ impl State {
             now,
             theme,
             history_highlighter,
+            syntax_highlight,
             columns,
         );
 
