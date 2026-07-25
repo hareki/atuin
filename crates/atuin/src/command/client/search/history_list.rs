@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use super::duration::format_duration;
 use super::engines::SearchEngine;
 use super::selection_ext::get_selection_style;
 use super::syntax;
@@ -14,6 +13,7 @@ use atuin_common::string::EscapeNonPrintablePosixExt as _;
 use atuin_common::string::Measure;
 use atuin_common::string::align::Alignment;
 use atuin_common::string::ellipsis::{Indicator, Pos};
+use atuin_common::time::{DurationExt, OffsetDateTimeExt};
 use itertools::Itertools;
 use ratatui::{
     backend::FromCrossterm,
@@ -22,7 +22,7 @@ use ratatui::{
     style::Style,
     widgets::{Block, StatefulWidget, Widget},
 };
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 
 pub struct HistoryHighlighter<'a> {
     pub engine: &'a dyn SearchEngine,
@@ -42,6 +42,8 @@ pub struct HistoryList<'a> {
     block: Option<Block<'a>>,
     inverted: bool,
     now: &'a dyn Fn() -> OffsetDateTime,
+    /// Offset absolute timestamps are rendered in
+    tz: UtcOffset,
     theme: &'a Theme,
     history_highlighter: HistoryHighlighter<'a>,
     syntax_highlight: bool,
@@ -101,6 +103,7 @@ impl StatefulWidget for HistoryList<'_> {
             state,
             inverted: self.inverted,
             now: &self.now,
+            tz: self.tz,
             theme: self.theme,
             history_highlighter: self.history_highlighter,
             syntax_highlight: self.syntax_highlight,
@@ -123,6 +126,7 @@ impl<'a> HistoryList<'a> {
         history: &'a [History],
         inverted: bool,
         now: &'a dyn Fn() -> OffsetDateTime,
+        tz: UtcOffset,
         theme: &'a Theme,
         history_highlighter: HistoryHighlighter<'a>,
         syntax_highlight: bool,
@@ -133,6 +137,7 @@ impl<'a> HistoryList<'a> {
             block: None,
             inverted,
             now,
+            tz,
             theme,
             history_highlighter,
             syntax_highlight,
@@ -173,6 +178,8 @@ struct DrawState<'a> {
     state: &'a ListState,
     inverted: bool,
     now: &'a dyn Fn() -> OffsetDateTime,
+    /// Offset absolute timestamps are rendered in
+    tz: UtcOffset,
     theme: &'a Theme,
     history_highlighter: HistoryHighlighter<'a>,
     syntax_highlight: bool,
@@ -256,8 +263,8 @@ impl DrawState<'_> {
         } else {
             Meaning::AlertError
         });
-        let duration = Duration::from_nanos(u64::try_from(h.duration).unwrap_or(0));
-        let formatted = format_duration(duration);
+        let duration = Duration::saturating_from_nanos_i64(h.duration);
+        let formatted = duration.display().largest_unit().to_string();
         let w = width as usize;
         // Right-align within the column, ellipsizing if it somehow overflows.
         let display = formatted.pad_ellipsize(
@@ -272,13 +279,10 @@ impl DrawState<'_> {
     fn time(&mut self, h: &History, width: u16) {
         let style = self.theme.as_style(Meaning::Guidance);
 
-        // Account for the chance that h.timestamp is "in the future"
-        // This would mean that "since" is negative, and the unwrap here
-        // would fail.
-        // If the timestamp would otherwise be in the future, display
-        // the time since as 0.
-        let since = (self.now)() - h.timestamp;
-        let time = format_duration(since.try_into().unwrap_or_default());
+        let time = (self.now)()
+            .saturating_duration_since(h.timestamp)
+            .display()
+            .largest_unit();
 
         // Format as "Xs ago" right-aligned within column width
         let w = width as usize;
@@ -346,16 +350,12 @@ impl DrawState<'_> {
     /// Render the absolute datetime column (e.g., "2025-01-22 14:35")
     fn datetime(&mut self, h: &History, width: u16) {
         let style = self.theme.as_style(Meaning::Annotation);
-        // Format: YYYY-MM-DD HH:MM
         let formatted = h
             .timestamp
-            .format(
-                &time::format_description::parse_borrowed::<1>(
-                    "[year]-[month]-[day] [hour]:[minute]",
-                )
-                .expect("valid format"),
-            )
-            .unwrap_or_else(|_| "????-??-?? ??:??".to_string());
+            .to_offset(self.tz)
+            .display()
+            .ymd_hm()
+            .to_string();
         let w = width as usize;
         let display = formatted.pad_ellipsize(
             Measure::Columns(w),

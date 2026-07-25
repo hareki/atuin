@@ -11,7 +11,7 @@ use atuin_client::{
     encryption,
     history::{History, store::HistoryStore},
     record::sqlite_store::SqliteStore,
-    settings::{FilterMode, KeymapMode, SearchMode, Settings, Timezone},
+    settings::{FilterMode, KeymapMode, SearchMode, Settings},
     theme::Theme,
 };
 
@@ -19,7 +19,6 @@ use super::history::ListMode;
 
 mod block_ext;
 mod cursor;
-mod duration;
 mod engines;
 mod history_list;
 mod inspector;
@@ -28,7 +27,7 @@ pub mod keybindings;
 mod selection_ext;
 mod syntax;
 
-pub use duration::format_duration_into;
+use atuin_common::time::UtcOffsetSpec;
 
 #[allow(clippy::struct_excessive_bools, clippy::struct_field_names)]
 #[derive(Parser, Debug)]
@@ -124,7 +123,7 @@ pub struct Cmd {
     // `Option<Option<T>>` field type), so let's keep supporting it to avoid breaking existing
     // scripts.
     #[arg(allow_hyphen_values = true, num_args = 0..=1)]
-    timezone: Option<Timezone>,
+    timezone: Option<UtcOffsetSpec>,
 
     /// Available variables: {command}, {directory}, {duration}, {user}, {host}, {time}, {exit} and
     /// {relativetime}.
@@ -263,20 +262,19 @@ impl Cmd {
                 exit: self.exit,
                 exclude_exit: self.exclude_exit,
                 only_failed: false,
-                cwd: self.cwd,
-                exclude_cwd: self.exclude_cwd,
-                before: self.before,
-                after: self.after,
+                cwd: self.cwd.as_deref(),
+                exclude_cwd: self.exclude_cwd.as_deref(),
+                before: self.before.as_deref(),
+                after: self.after.as_deref(),
                 limit: self.limit,
                 offset: self.offset,
                 reverse: self.reverse,
                 include_duplicates: self.include_duplicates,
-                authors: self.author,
-                shells: self.shell,
+                authors: &self.author,
+                shells: &self.shell,
             };
 
-            let mut entries =
-                run_non_interactive(settings, opt_filter.clone(), &query, &db).await?;
+            let mut entries = run_non_interactive(settings, opt_filter, &query, &db).await?;
 
             if entries.is_empty() {
                 std::process::exit(1)
@@ -295,8 +293,7 @@ impl Cmd {
                     let ids = history_store.delete_entries(entries).await?;
                     history_store.build_all(&db, &ids).await?;
 
-                    entries =
-                        run_non_interactive(settings, opt_filter.clone(), &query, &db).await?;
+                    entries = run_non_interactive(settings, opt_filter, &query, &db).await?;
                 }
             } else {
                 let format = self
@@ -323,12 +320,14 @@ impl Cmd {
 // it is going to have a lot of args
 async fn run_non_interactive(
     settings: &Settings,
-    filter_options: OptFilters,
+    filter_options: OptFilters<'_>,
     query: &[String],
     db: &impl Database,
 ) -> Result<Vec<History>> {
-    let dir = if filter_options.cwd.as_deref() == Some(".") {
-        Some(utils::get_current_dir())
+    let current_dir;
+    let dir = if filter_options.cwd == Some(".") {
+        current_dir = utils::get_current_dir();
+        Some(current_dir.as_str())
     } else {
         filter_options.cwd
     };
@@ -336,7 +335,7 @@ async fn run_non_interactive(
     let context = current_context().await?;
 
     let opt_filter = OptFilters {
-        cwd: dir.clone(),
+        cwd: dir,
         ..filter_options
     };
 

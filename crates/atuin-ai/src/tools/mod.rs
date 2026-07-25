@@ -6,6 +6,7 @@ use std::{
 };
 
 use atuin_common::ansi;
+use atuin_common::time::UtcOffsetExt;
 use eyre::Result;
 use uuid::Uuid;
 
@@ -1154,7 +1155,7 @@ impl AtuinHistoryToolCall {
         let filter_options = OptFilters {
             limit: Some(self.limit),
             only_failed: self.only_failed,
-            authors: self.authors.clone(),
+            authors: &self.authors,
             ..Default::default()
         };
 
@@ -1176,7 +1177,7 @@ impl AtuinHistoryToolCall {
             return ToolOutcome::Success("No matching history entries found.".to_string());
         }
 
-        let local_offset = crate::history_format::current_local_offset();
+        let local_offset = time::UtcOffset::local_or_utc();
 
         let formatted: Vec<String> = results
             .iter()
