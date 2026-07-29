@@ -222,6 +222,7 @@ dependencies = [
  "atuin-client",
  "atuin-common",
  "atuin-daemon",
+ "atuin-domain",
  "atuin-dotfiles",
  "atuin-history",
  "atuin-kv",
@@ -341,6 +342,7 @@ version = "18.18.1"
 dependencies = [
  "async-trait",
  "atuin-common",
+ "atuin-domain",
  "base64",
  "clap",
  "codspeed-divan-compat",
@@ -400,21 +402,19 @@ dependencies = [
  "directories",
  "eyre",
  "getrandom 0.4.3",
+ "itertools",
  "pretty_assertions",
  "proptest",
  "rstest",
  "rustls",
- "semver",
  "serde",
  "serde_json",
  "serde_with",
- "sqlx",
  "sysinfo",
  "thiserror 2.0.18",
  "time",
  "tracing",
  "tracing-subscriber",
- "typed-builder",
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "url",
@@ -459,11 +459,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "atuin-domain"
+version = "18.18.1"
+dependencies = [
+ "derive_more",
+ "eyre",
+ "pretty_assertions",
+ "semver",
+ "serde",
+ "sqlx",
+ "time",
+ "typed-builder",
+ "uuid",
+]
+
+[[package]]
 name = "atuin-dotfiles"
 version = "18.18.1"
 dependencies = [
  "atuin-client",
  "atuin-common",
+ "atuin-domain",
  "crypto_secretbox",
  "derive_more",
  "eyre",
@@ -495,6 +511,7 @@ version = "18.18.1"
 dependencies = [
  "atuin-client",
  "atuin-common",
+ "atuin-domain",
  "derive_more",
  "eyre",
  "pretty_assertions",
@@ -513,16 +530,6 @@ dependencies = [
  "atuin-nucleo-matcher",
  "parking_lot",
  "rayon",
-]
-
-[[package]]
-name = "atuin-nucleo-bench"
-version = "0.1.0"
-dependencies = [
- "atuin-nucleo",
- "brunch",
- "fuzzy-matcher",
- "walkdir",
 ]
 
 [[package]]
@@ -554,6 +561,7 @@ version = "18.18.1"
 dependencies = [
  "atuin-client",
  "atuin-common",
+ "atuin-domain",
  "derive_more",
  "eyre",
  "minijinja",
@@ -572,11 +580,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "atuin-search-bench"
+version = "0.1.0"
+dependencies = [
+ "atuin-client",
+ "atuin-common",
+ "atuin-daemon",
+ "codspeed-divan-compat",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "atuin-server"
 version = "18.18.1"
 dependencies = [
  "argon2",
  "atuin-common",
+ "atuin-domain",
  "atuin-server-database",
  "atuin-server-postgres",
  "atuin-server-sqlite",
@@ -604,6 +625,7 @@ version = "18.18.1"
 dependencies = [
  "async-trait",
  "atuin-common",
+ "atuin-domain",
  "derive_more",
  "eyre",
  "rstest",
@@ -619,6 +641,7 @@ version = "18.18.1"
 dependencies = [
  "async-trait",
  "atuin-common",
+ "atuin-domain",
  "atuin-server-database",
  "derive_more",
  "eyre",
@@ -637,6 +660,7 @@ version = "18.18.1"
 dependencies = [
  "async-trait",
  "atuin-common",
+ "atuin-domain",
  "atuin-server-database",
  "derive_more",
  "eyre",
@@ -794,16 +818,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
-]
-
-[[package]]
-name = "brunch"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3932d710d985d35c7b08e7e439a6ac8607aa8f619d373eb1f808578cd3cd56e5"
-dependencies = [
- "dactyl",
- "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -1378,12 +1392,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
-
-[[package]]
-name = "dactyl"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ecad1ab94b1336be6cff409436ad9ceedb0afd52a85d54132189c2c3babb049"
 
 [[package]]
 name = "daemonize"
@@ -5317,6 +5325,7 @@ version = "18.18.1"
 dependencies = [
  "async-trait",
  "atuin-common",
+ "atuin-domain",
  "atuin-server-database",
  "atuin-server-postgres",
  "atuin-server-sqlite",
