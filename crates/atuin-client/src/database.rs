@@ -214,13 +214,13 @@ impl From<DbSearchMode> for SearchMode {
 impl SearchMode {
     /// Get the [`DbSearchMode`] that most closely matches this [`SearchMode`].
     ///
-    /// This maps [`SearchMode::Skim`] and [`SearchMode::DaemonFuzzy`], which are interactive-only,
-    /// to [`DbSearchMode::Fuzzy`].
+    /// This maps [`SearchMode::DaemonFuzzy`], which is interactive-only, to
+    /// [`DbSearchMode::Fuzzy`].
     pub fn closest_db_mode(self) -> DbSearchMode {
         match self {
             SearchMode::Prefix => DbSearchMode::Prefix,
             SearchMode::FullText => DbSearchMode::FullText,
-            SearchMode::Fuzzy | SearchMode::Skim | SearchMode::DaemonFuzzy => DbSearchMode::Fuzzy,
+            SearchMode::Fuzzy | SearchMode::DaemonFuzzy => DbSearchMode::Fuzzy,
         }
     }
 }
@@ -806,7 +806,18 @@ impl Database for Sqlite {
             .fetch_all(&self.pool)
             .await?;
 
-        Ok(ordering::reorder_fuzzy(search_mode, orig_query, res))
+        // Rank against the same characters SQL matched: drop spaces, operators and negated terms.
+        let reorder_query: String = QueryTokenizer::new(orig_query)
+            .filter(|token| !token.is_inverse())
+            .filter_map(|token| match token {
+                QueryToken::Match(term, _)
+                | QueryToken::MatchStart(term, _)
+                | QueryToken::MatchEnd(term, _)
+                | QueryToken::MatchFull(term, _) => Some(term),
+                QueryToken::Or | QueryToken::Regex(_) => None,
+            })
+            .collect();
+        Ok(ordering::reorder_fuzzy(search_mode, &reorder_query, res))
     }
 
     async fn query_history(&self, query: &str) -> Result<Vec<History>> {
@@ -1730,11 +1741,9 @@ mod test {
     #[case::prefix(SearchMode::Prefix, DbSearchMode::Prefix)]
     #[case::full_text(SearchMode::FullText, DbSearchMode::FullText)]
     #[case::fuzzy(SearchMode::Fuzzy, DbSearchMode::Fuzzy)]
-    // `Skim` and `DaemonFuzzy` never reach the database in the interactive path:
-    // `engines::engine` routes them to the skim matcher and the daemon index. When they do
-    // arrive via `atuin search --search-mode ...`, the closest database behaviour is a plain
-    // fuzzy query. See issue #3670.
-    #[case::skim_degrades_to_fuzzy(SearchMode::Skim, DbSearchMode::Fuzzy)]
+    // `DaemonFuzzy` never reaches the database in the interactive path: `engines::engine` routes it
+    // to the daemon index. When it does arrive via `atuin search --search-mode daemon-fuzzy`, the
+    // closest database behaviour is a plain fuzzy query. See issue #3670.
     #[case::daemon_fuzzy_degrades_to_fuzzy(SearchMode::DaemonFuzzy, DbSearchMode::Fuzzy)]
     fn closest_db_mode_maps_every_search_mode(
         #[case] mode: SearchMode,
@@ -1751,14 +1760,13 @@ mod test {
         assert_eq!(SearchMode::from(mode).closest_db_mode(), mode);
     }
 
-    /// Issue #3670: `atuin search --search-mode daemon-fuzzy` reached the database as
-    /// an unrecognised mode. It took the fuzzy SQL path but skipped the fuzzy relevance
-    /// reordering, so results came back in raw timestamp order while plain `--search-mode
-    /// fuzzy` ranked them by minimum matching span. Both interactive-only modes must now
-    /// behave exactly like `fuzzy` once they reach the database.
+    /// Issue #3670: `atuin search --search-mode daemon-fuzzy` reached the database as an
+    /// unrecognised mode. It took the fuzzy SQL path but skipped the fuzzy relevance reordering, so
+    /// results came back in raw timestamp order while plain `--search-mode fuzzy` ranked them by
+    /// minimum matching span. `daemon-fuzzy` must behave exactly like `fuzzy` once it reaches the
+    /// database.
     #[rstest]
     #[case::daemon_fuzzy(SearchMode::DaemonFuzzy)]
-    #[case::skim(SearchMode::Skim)]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_search_interactive_only_modes_rank_like_fuzzy(#[case] mode: SearchMode) {
         let mut db = Sqlite::new("sqlite::memory:", test_local_timeout())
@@ -1781,6 +1789,106 @@ mod test {
             FilterMode::Global,
             "curl",
             vec!["curl", "corburl"],
+        )
+        .await;
+    }
+
+    // Reproduces the trailing-space ranking bug (atuinsh/atuin#3603): "screen" ranked the results
+    // containing `screen` first, but "screen " prioritized an unrelated `ls` command.
+    #[rstest]
+    #[case::no_trailing_space("screen")]
+    #[case::trailing_space("screen ")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_search_fuzzy_trailing_space(#[case] query: &str) {
+        let mut db = Sqlite::new("sqlite::memory:", test_local_timeout())
+            .await
+            .unwrap();
+
+        let now = OffsetDateTime::now_utc();
+        let irssi = "screen irssi";
+        let ls_l = "ls -l secrets/rendered";
+        let ls_ld = "ls -ld secrets/rendered";
+        let screen_r = "screen -r";
+
+        new_history_item_at(&mut db, irssi, Some(now - time::Duration::days(5)))
+            .await
+            .unwrap();
+        new_history_item_at(&mut db, ls_l, Some(now - time::Duration::days(4)))
+            .await
+            .unwrap();
+        new_history_item_at(
+            &mut db,
+            ls_ld,
+            Some(now - time::Duration::days(4) + time::Duration::seconds(1)),
+        )
+        .await
+        .unwrap();
+        new_history_item_at(&mut db, screen_r, Some(now - time::Duration::hours(1)))
+            .await
+            .unwrap();
+
+        let results = assert_search_eq(&db, DbSearchMode::Fuzzy, FilterMode::Global, query, 4)
+            .await
+            .unwrap();
+        assert_eq!(
+            results[0].command,
+            screen_r,
+            "\"{query}\" should rank the screen command first, got: {:?}",
+            results.iter().map(|h| &h.command).collect::<Vec<_>>()
+        );
+    }
+
+    // Make sure fuzzy search prioritizes results that contain the query as a contiguous substring,
+    // but ignoring query operators, inverse terms, and whitespace. Each test case has a "close"
+    // result that should rank higher by fuzzy score but is less recent, and a "far" result that is
+    // more recent.
+    #[rstest]
+    #[case::plain_single_term("screen", "screen", "search green")]
+    #[case::plain_two_terms("foo bar", "foo bar", "foo qux bar")]
+    #[case::trailing_space("screen ", "screen", "search green")]
+    #[case::extra_middle_space("foo   bar", "foo bar", "foo qux bar")]
+    #[case::end_anchor("foo screen$", "foo screen", "foo x screen")]
+    #[case::negated_term("foo screen !zzz", "foo screen", "foo x screen")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_search_fuzzy_prioritizes_contiguous_match(
+        #[case] query: &str,
+        #[case] close: &str,
+        #[case] far: &str,
+    ) {
+        let mut db = Sqlite::new("sqlite::memory:", test_local_timeout())
+            .await
+            .unwrap();
+
+        let now = OffsetDateTime::now_utc();
+        new_history_item_at(&mut db, close, Some(now - time::Duration::days(5)))
+            .await
+            .unwrap();
+        new_history_item_at(&mut db, far, Some(now - time::Duration::hours(1)))
+            .await
+            .unwrap();
+
+        assert_search_commands(
+            &db,
+            DbSearchMode::Fuzzy,
+            FilterMode::Global,
+            query,
+            vec![close, far],
+        )
+        .await;
+    }
+
+    // SQL operators are stripped when performing fuzzy reordering, but this must not affect the
+    // initial SQL matching.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_search_fuzzy_operator() {
+        let db = db_with(&["use screen", "screenshot tool"]).await;
+
+        assert_search_commands(
+            &db,
+            DbSearchMode::Fuzzy,
+            FilterMode::Global,
+            "screen$",
+            vec!["use screen"],
         )
         .await;
     }

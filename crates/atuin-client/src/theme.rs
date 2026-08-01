@@ -332,10 +332,7 @@ static DEFAULT_THEME: LazyLock<Theme> = LazyLock::new(|| {
             (Meaning::Muted, StyleFactory::from_fg_color(Color::Grey)),
             (Meaning::Border, StyleFactory::from_fg_color(Color::White)),
             (Meaning::Base, ContentStyle::default()),
-            (
-                Meaning::Highlight,
-                StyleFactory::from_fg_color(Color::Blue),
-            ),
+            (Meaning::Highlight, StyleFactory::from_fg_color(Color::Blue)),
             // #313244 - Catppuccin surface0
             (
                 Meaning::Selection,

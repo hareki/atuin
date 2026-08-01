@@ -16,15 +16,15 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::{
     block_ext::{themed_block, titled_block},
     cursor::Cursor,
-    engines::{SearchEngine, SearchState},
+    engines::{AnySearchEngine, SearchEngine, SearchState},
     history_list::{HistoryList, ListState},
 };
 use atuin_client::{
     database::{Context, Database, current_context},
     history::{History, HistoryId, HistoryStats, store::HistoryStore},
     settings::{
-        CursorStyle, ExitMode, FilterMode, KeymapMode, PreviewStrategy, SearchMode, Settings,
-        UiColumn,
+        CursorStyle, ExitMode, FilterMode, KeymapMode, PreviewStrategy, RequestedSearchMode,
+        SearchMode, Settings, UiColumn,
     },
 };
 
@@ -136,11 +136,11 @@ pub struct State {
 
     keymaps: KeymapSet,
     search: SearchState,
-    engine: Box<dyn SearchEngine>,
+    engine: AnySearchEngine,
     now: Box<dyn Fn() -> OffsetDateTime + Send>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Compactness {
     Ultracompact,
     Compact,
@@ -857,8 +857,11 @@ impl State {
             border_size,
             preview_width,
         );
-        let show_help =
-            settings.show_help && (matches!(compactness, Compactness::Full) || area.height > 1);
+
+        let show_help = settings.show_help && (compactness == Compactness::Full || area.height > 1);
+        let warnings = Self::build_warnings(settings, theme);
+        let warning_height = u16::try_from(warnings.height()).unwrap_or(u16::MAX);
+
         // This is an OR, as it seems more likely for someone to wish to override
         // tabs unexpectedly being missed, than unexpectedly present.
         let show_tabs = settings.show_tabs && !matches!(compactness, Compactness::Ultracompact);
@@ -874,6 +877,7 @@ impl State {
                         Constraint::Length(preview_height),                // preview
                         Constraint::Length(if show_tabs { 1 } else { 0 }), // tabs
                         Constraint::Length(if show_help { 1 } else { 0 }), // header (sic)
+                        Constraint::Length(warning_height),                // skim warning
                     ]
                 } else {
                     match compactness {
@@ -881,8 +885,9 @@ impl State {
                             Constraint::Length(if show_help { 1 } else { 0 }), // header
                             Constraint::Length(0),                             // tabs
                             Constraint::Min(1),                                // results list
-                            Constraint::Length(0),
-                            Constraint::Length(0),
+                            Constraint::Length(0),                             // no input
+                            Constraint::Length(0),                             // no preview
+                            Constraint::Length(warning_height),                // skim warning
                         ],
                         _ => [
                             Constraint::Length(if show_help { 1 } else { 0 }), // header
@@ -890,6 +895,7 @@ impl State {
                             Constraint::Min(1),                                // results list
                             Constraint::Length(1 + border_size),               // input
                             Constraint::Length(preview_height),                // preview
+                            Constraint::Length(warning_height),                // skim warning
                         ],
                     }
                 }
@@ -902,6 +908,8 @@ impl State {
         let preview_chunk = if invert { chunks[2] } else { chunks[4] };
         let tabs_chunk = if invert { chunks[3] } else { chunks[1] };
         let header_chunk = if invert { chunks[4] } else { chunks[0] };
+        // Always last, so it is the bottom row whichever way the layout is stacked.
+        let warning_chunk = chunks[5];
 
         // TODO: this should be split so that we have one interactive search container that is
         // EITHER a search box or an inspector. But I'm not doing that now, way too much atm.
@@ -945,10 +953,14 @@ impl State {
         let stats_tab = self.build_stats(theme);
         f.render_widget(stats_tab, header_chunks[2]);
 
+        if warning_height > 0 {
+            f.render_widget(warnings, warning_chunk);
+        }
+
         match self.tab_index {
             0 => {
                 let history_highlighter = HistoryHighlighter {
-                    engine: self.engine.as_ref(),
+                    engine: &self.engine,
                     search_input: self.search.input.as_str(),
                 };
                 let results_list = Self::build_results_list(
@@ -1129,6 +1141,32 @@ impl State {
         .alignment(Alignment::Center)
     }
 
+    fn build_warnings(settings: &Settings, theme: &Theme) -> Text<'static> {
+        if settings.requested_search_mode != RequestedSearchMode::Skim {
+            return Text::default();
+        }
+
+        let style =
+            Style::from_crossterm(theme.as_style(Meaning::AlertWarn)).add_modifier(Modifier::BOLD);
+        let code_style = Style::from_crossterm(theme.as_style(Meaning::SyntaxCommand))
+            .add_modifier(Modifier::BOLD);
+
+        Text::from(vec![
+            Span::styled(
+                "Warning: \"skim\" mode was removed; falling back to \"fuzzy\"",
+                style,
+            )
+            .into(),
+            vec![
+                Span::styled("Set ", style),
+                Span::styled("search_mode = \"daemon-fuzzy\"", code_style),
+                Span::styled(" for a similar experience", style),
+            ]
+            .into(),
+        ])
+        .left_aligned()
+    }
+
     fn build_stats(&self, theme: &Theme) -> Paragraph<'_> {
         Paragraph::new(Text::from(Span::raw(
             self.history_count
@@ -1192,7 +1230,10 @@ impl State {
         let mode_width = usize::from(prefix_width) - pref.len() - 3;
         // sanity check to ensure we don't exceed the layout limits
         debug_assert!(mode_width >= mode.len(), "mode name '{mode}' is too long!");
-        let input = format!(" [{pref}{mode:^mode_width$}] {}", self.search.input.as_str());
+        let input = format!(
+            " [{pref}{mode:^mode_width$}] {}",
+            self.search.input.as_str()
+        );
         let input = Paragraph::new(input);
         match style.compactness {
             Compactness::Full => {
@@ -1740,10 +1781,10 @@ pub async fn history(
 
     let search_mode = if settings.shell_up_key_binding {
         settings
-            .search_mode_shell_up_key_binding
-            .unwrap_or(settings.search_mode)
+            .search_mode_shell_up_key_binding()
+            .unwrap_or_else(|| settings.search_mode())
     } else {
-        settings.search_mode
+        settings.search_mode()
     };
     let default_filter_mode = settings
         .filter_mode_shell_up_key_binding

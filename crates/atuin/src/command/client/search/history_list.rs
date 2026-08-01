@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use super::engines::SearchEngine;
+use super::engines::{AnySearchEngine, SearchEngine};
 use super::selection_ext::get_selection_style;
 use super::syntax;
 use atuin_client::{
@@ -25,7 +25,7 @@ use ratatui::{
 use time::{OffsetDateTime, UtcOffset};
 
 pub struct HistoryHighlighter<'a> {
-    pub engine: &'a dyn SearchEngine,
+    pub engine: &'a AnySearchEngine,
     pub search_input: &'a str,
 }
 
