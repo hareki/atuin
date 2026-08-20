@@ -6,11 +6,12 @@ use atuin_common::encryption::paseto_v4;
 use atuin_common::rmp::decode::{self, Bytes, DecodeError, RmpRead};
 use atuin_common::rmp::encode::{self, ByteBuf, EncodeError, RmpWrite, TryEncodeError};
 use atuin_domain::record::{
-    DecryptedData, EncryptedData, Host, HostId, Record, RecordId, RecordIdx, RecordTag,
-    RecordVersion,
+    DecryptedData, EncryptedData, Host, HostId, Record, RecordId, RecordIdx, RecordSeriesKey,
+    RecordTag, RecordVersion,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::instrument;
 use uuid::Uuid;
 
 use crate::record::sqlite_store::SqliteStore;
@@ -107,6 +108,7 @@ pub enum PackManifestData {
 }
 
 impl PackManifestData {
+    #[instrument(level = "trace", skip_all, fields(id = ?record.id, tag = ?record.tag), err)]
     pub fn parse(record: &Record<EncryptedData>) -> Result<Self, ParsingError> {
         if record.tag != RecordTag::Packfile {
             return Err(ParsingError::WrongTag(record.tag.clone()));
@@ -167,6 +169,7 @@ impl PackManifestDataV1 {
             .map(|c| c + 1)
     }
 
+    #[instrument(level = "trace", skip_all, fields(host = ?self.host, tag = ?self.tag), err)]
     pub fn encode(&self) -> Result<EncryptedData, Box<dyn std::error::Error + Send + Sync>> {
         let mut buf: Vec<u8> = Vec::new();
         buf.extend_from_slice(b"001");
@@ -278,6 +281,7 @@ impl<'a> PackManifestRecordView<'a> {
         self.manifest.range()
     }
 
+    #[instrument(level = "trace", skip_all, fields(id = ?self.record.id), err)]
     pub async fn load_encrypted_packed_records(
         &self,
         store: &SqliteStore,
@@ -286,7 +290,11 @@ impl<'a> PackManifestRecordView<'a> {
         let count = range.end - range.start;
 
         let run = store
-            .next(self.record.host.id, &RecordTag::History, range.start, count)
+            .next(
+                &RecordSeriesKey::new(self.record.host.id, RecordTag::History),
+                range.start,
+                count,
+            )
             .await
             .map_err(RecordLoadingError::StoreError)?;
 
@@ -294,6 +302,7 @@ impl<'a> PackManifestRecordView<'a> {
     }
 
     /// Asynchronously pack the records enclosed by this manifest.
+    #[instrument(level = "trace", skip_all, fields(id = ?self.record.id), err)]
     pub async fn pack_records(
         &self,
         store: &SqliteStore,
@@ -342,6 +351,7 @@ impl<'a> PackManifestRecordView<'a> {
         .map_err(PackingError::Pack)
     }
 
+    #[instrument(level = "trace", skip_all, fields(id = ?self.record.id), err)]
     pub async fn unpack_records(
         &self,
         packed_bytes: impl AsRef<[u8]> + Send + 'static,
