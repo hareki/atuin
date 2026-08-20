@@ -1,6 +1,8 @@
-use crate::shell::{Alias, Var};
-use crate::store::{AliasStore, var::VarStore};
 use std::path::PathBuf;
+
+use crate::shell::{Alias, Var};
+use crate::store::AliasStore;
+use crate::store::var::VarStore;
 
 async fn cached_aliases(path: PathBuf, store: &AliasStore) -> String {
     match tokio::fs::read_to_string(path).await {
@@ -10,7 +12,7 @@ async fn cached_aliases(path: PathBuf, store: &AliasStore) -> String {
             // fallback to generating new aliases on the fly
 
             store.powershell().await.unwrap_or_else(|e| {
-                format!("echo 'Atuin: failed to read and generate aliases: \n{r}\n{e}'",)
+                format!("echo 'Atuin: failed to read and generate aliases: \n{r}\n{e}'")
             })
         }
     }
@@ -24,7 +26,7 @@ async fn cached_vars(path: PathBuf, store: &VarStore) -> String {
             // fallback to generating new vars on the fly
 
             store.powershell().await.unwrap_or_else(|e| {
-                format!("echo 'Atuin: failed to read and generate vars: \n{r}\n{e}'",)
+                format!("echo 'Atuin: failed to read and generate vars: \n{r}\n{e}'")
             })
         }
     }
@@ -90,25 +92,27 @@ pub fn format_alias(alias: &Alias) -> String {
 pub fn format_var(var: &Var) -> String {
     secure_command(&format!(
         "${}{} = '{}'",
-        if var.export { "env:" } else { "" },
+        if var.export {
+            "env:"
+        } else {
+            ""
+        },
         var.name,
-        var.value.replace("'", "''")
+        var.value.replace('\'', "''")
     ))
 }
 
 /// Wraps the given command in an Invoke-Expression to ensure the outer script is not halted
 /// if the inner command contains a syntax error.
 fn secure_command(command: &str) -> String {
-    format!(
-        "Invoke-Expression -ErrorAction Continue -Command '{}'\n",
-        command.replace("'", "''")
-    )
+    format!("Invoke-Expression -ErrorAction Continue -Command '{}'\n", command.replace('\'', "''"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rstest::rstest;
+
+    use super::*;
 
     #[rstest]
     #[case::simple("gp", "git push", "function gp {\n    git push @args\n}")]

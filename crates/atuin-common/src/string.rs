@@ -12,7 +12,6 @@ pub use align::{AlignExt, Alignment};
 pub use ellipsis::EllipsizeExt;
 pub use escape_non_printable_posix_ext::EscapeNonPrintablePosixExt;
 pub use non_nul_str::{ContainsNul, NonNulStr};
-
 #[cfg(feature = "unicode")]
 use unicode_width::UnicodeWidthStr;
 
@@ -32,15 +31,15 @@ impl Measure {
     /// The numeric limit, in this budget's own unit.
     pub(crate) fn amount(self) -> usize {
         match self {
-            Measure::Bytes(n) | Measure::Columns(n) => n,
+            Self::Bytes(n) | Self::Columns(n) => n,
         }
     }
 
     /// Total cost of `s` in this budget's unit.
     pub(crate) fn cost(self, s: &str) -> usize {
         match self {
-            Measure::Bytes(_) => s.len(),
-            Measure::Columns(_) => s.width(),
+            Self::Bytes(_) => s.len(),
+            Self::Columns(_) => s.width(),
         }
     }
 }

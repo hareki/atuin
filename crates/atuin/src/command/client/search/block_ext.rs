@@ -1,10 +1,8 @@
-use ratatui::{
-    backend::FromCrossterm,
-    layout::Alignment,
-    style::{Modifier, Style},
-    text::Line,
-    widgets::{Block, BorderType},
-};
+use ratatui::backend::FromCrossterm;
+use ratatui::layout::Alignment;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, BorderType};
 
 use crate::command::client::theme::Theme;
 

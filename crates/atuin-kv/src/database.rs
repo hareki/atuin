@@ -1,13 +1,13 @@
-use std::{path::Path, str::FromStr, time::Duration};
+use std::path::Path;
+use std::str::FromStr;
+use std::time::Duration;
 
 use atuin_common::utils;
-use sqlx::{
-    Result, Row,
-    sqlite::{
-        SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
-        SqliteSynchronous,
-    },
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
+    SqliteSynchronous,
 };
+use sqlx::{Result, Row};
 use tokio::fs;
 use tracing::debug;
 
@@ -25,7 +25,8 @@ impl Database {
 
         if utils::broken_symlink(path) {
             eprintln!(
-                "Atuin: KV sqlite db path ({path:?}) is a broken symlink. Unable to read or create replacement."
+                "Atuin: KV sqlite db path ({path:?}) is a broken symlink. Unable to read or \
+                 create replacement."
             );
             std::process::exit(1);
         }
@@ -56,9 +57,7 @@ impl Database {
     }
 
     pub async fn sqlite_version(&self) -> Result<String> {
-        sqlx::query_scalar("SELECT sqlite_version()")
-            .fetch_one(&self.pool)
-            .await
+        sqlx::query_scalar("SELECT sqlite_version()").fetch_one(&self.pool).await
     }
 
     async fn setup_db(pool: &SqlitePool) -> Result<()> {
@@ -119,16 +118,12 @@ impl Database {
         Ok(())
     }
 
-    fn query_kv_entry(row: SqliteRow) -> KvEntry {
+    fn query_kv_entry(row: &SqliteRow) -> KvEntry {
         let namespace = row.get("namespace");
         let key = row.get("key");
         let value = row.get("value");
 
-        KvEntry::builder()
-            .namespace(namespace)
-            .key(key)
-            .value(value)
-            .build()
+        KvEntry::builder().namespace(namespace).key(key).value(value).build()
     }
 
     pub async fn load(&self, namespace: &str, key: &str) -> Result<Option<KvEntry>> {
@@ -137,7 +132,7 @@ impl Database {
         let res = sqlx::query("select * from kv where namespace = ?1 and key = ?2")
             .bind(namespace)
             .bind(key)
-            .map(Self::query_kv_entry)
+            .map(|row| Self::query_kv_entry(&row))
             .fetch_optional(&self.pool)
             .await?;
 
@@ -150,12 +145,12 @@ impl Database {
         let res = if let Some(namespace) = namespace {
             sqlx::query("select * from kv where namespace = ?1 order by key asc")
                 .bind(namespace)
-                .map(Self::query_kv_entry)
+                .map(|row| Self::query_kv_entry(&row))
                 .fetch_all(&self.pool)
                 .await?
         } else {
             sqlx::query("select * from kv order by namespace, key asc")
-                .map(Self::query_kv_entry)
+                .map(|row| Self::query_kv_entry(&row))
                 .fetch_all(&self.pool)
                 .await?
         };
@@ -166,8 +161,9 @@ impl Database {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use rstest::*;
+
+    use super::*;
 
     #[fixture]
     async fn db() -> Database {
@@ -207,11 +203,7 @@ mod test {
 
         db.save(&entry).await.unwrap();
 
-        let loaded = db
-            .load(&entry.namespace, &entry.key)
-            .await
-            .unwrap()
-            .unwrap();
+        let loaded = db.load(&entry.namespace, &entry.key).await.unwrap().unwrap();
 
         assert_eq!(loaded, entry);
     }

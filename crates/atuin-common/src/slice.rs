@@ -46,10 +46,7 @@ where
     ///
     /// `sorted` must be sorted and contain no duplicates.
     pub fn new(sorted: &'a [T], iter: I) -> Self {
-        debug_assert!(
-            sorted.is_sorted_by_key(|s| s.borrow()),
-            "`sorted` must be sorted",
-        );
+        debug_assert!(sorted.is_sorted_by_key(|s| s.borrow()), "`sorted` must be sorted");
         debug_assert_eq!(
             {
                 let mut vec = sorted.iter().collect::<Vec<_>>();
@@ -78,13 +75,12 @@ where
     // value of `STACK_SIZE`.
     fn eq_with_buffer(self, buffer: &mut [bool]) -> bool {
         let mut seen_heap;
-        let seen;
-        if self.slice.len() <= buffer.len() {
-            seen = &mut buffer[..self.slice.len()];
+        let seen = if self.slice.len() <= buffer.len() {
+            &mut buffer[..self.slice.len()]
         } else {
             seen_heap = vec![false; self.slice.len()];
-            seen = seen_heap.as_mut_slice();
-        }
+            seen_heap.as_mut_slice()
+        };
         for item in self.iter {
             match self.slice.binary_search_by_key(&item, |s| s.borrow()) {
                 Ok(pos) => seen[pos] = true,
@@ -97,10 +93,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::BTreeSet;
+
     use proptest::prelude::*;
     use rstest::rstest;
-    use std::collections::BTreeSet;
+
+    use super::*;
 
     #[rstest]
     #[case(&[], &[], &[])]
@@ -157,10 +155,7 @@ mod tests {
         )]
         _stack_size: [(); STACK_SIZE],
     ) {
-        assert_eq!(
-            SortedDedupedSliceComparer::new(sorted, iter).eq::<STACK_SIZE>(),
-            expected,
-        );
+        assert_eq!(SortedDedupedSliceComparer::new(sorted, iter).eq::<STACK_SIZE>(), expected,);
     }
 
     fn sorted_deduped_slice() -> impl Strategy<Value = Vec<u8>> {

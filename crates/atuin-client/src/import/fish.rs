@@ -20,10 +20,8 @@ pub struct Fish {
 /// see <https://fishshell.com/docs/current/interactive.html#searchable-command-history>
 fn default_histpath() -> Result<PathBuf> {
     let base = BaseDirs::new().ok_or_else(|| eyre!("could not determine data directory"))?;
-    let data = std::env::var("XDG_DATA_HOME").map_or_else(
-        |_| base.home_dir().join(".local").join("share"),
-        PathBuf::from,
-    );
+    let data = std::env::var("XDG_DATA_HOME")
+        .map_or_else(|_| base.home_dir().join(".local").join("share"), PathBuf::from);
 
     // fish supports multiple history sessions
     // If `fish_history` var is missing, or set to `default`, use `fish` as the session
@@ -74,9 +72,9 @@ impl Importer for Fish {
         };
 
         for b in unix_byte_lines(&self.bytes) {
-            let s = match std::str::from_utf8(b) {
-                Ok(s) => s,
-                Err(_) => continue, // we can skip past things like invalid utf8
+            // we can skip past things like invalid utf8
+            let Ok(s) = std::str::from_utf8(b) else {
+                continue;
             };
 
             if let Some(c) = s.strip_prefix("- cmd: ") {
@@ -114,9 +112,9 @@ impl Importer for Fish {
 #[cfg(test)]
 mod test {
 
-    use crate::import::{Importer, tests::TestLoader};
-
     use super::Fish;
+    use crate::import::Importer;
+    use crate::import::tests::TestLoader;
 
     #[tokio::test]
     async fn parse_out_of_range_timestamp() {

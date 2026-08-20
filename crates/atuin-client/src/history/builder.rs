@@ -1,3 +1,4 @@
+use atuin_domain::record::CmdOrigin;
 use typed_builder::TypedBuilder;
 
 use super::History;
@@ -19,7 +20,7 @@ pub struct HistoryImported {
     #[builder(default, setter(strip_option, into))]
     session: Option<String>,
     #[builder(default, setter(strip_option, into))]
-    hostname: Option<String>,
+    cmd_origin: Option<CmdOrigin>,
     #[builder(default, setter(strip_option, into))]
     author: Option<String>,
     #[builder(default, setter(strip_option, into))]
@@ -35,14 +36,14 @@ impl HistoryImported {
 
 impl From<HistoryImported> for History {
     fn from(imported: HistoryImported) -> Self {
-        History::new(
+        Self::new(
             imported.timestamp,
             imported.command,
             imported.cwd,
             imported.exit,
             imported.duration,
             imported.session,
-            imported.hostname,
+            imported.cmd_origin,
             imported.author,
             imported.intent,
             None,
@@ -74,7 +75,7 @@ pub struct HistoryCaptured {
 
 impl From<HistoryCaptured> for History {
     fn from(captured: HistoryCaptured) -> Self {
-        History::new(
+        Self::new(
             captured.timestamp,
             captured.command,
             captured.cwd,
@@ -110,8 +111,9 @@ pub struct HistoryFromDb {
 }
 
 impl From<HistoryFromDb> for History {
+    // Reads a `hostname` column that predates the strict `host:user` format.
     fn from(from_db: HistoryFromDb) -> Self {
-        History {
+        Self {
             id: from_db.id.into(),
             timestamp: from_db.timestamp,
             exit: from_db.exit,
@@ -119,7 +121,8 @@ impl From<HistoryFromDb> for History {
             cwd: from_db.cwd,
             duration: from_db.duration,
             session: from_db.session,
-            hostname: from_db.hostname,
+            #[allow(deprecated)]
+            cmd_origin: CmdOrigin::parse_lenient(from_db.hostname),
             author: from_db.author,
             intent: from_db.intent,
             deleted_at: from_db.deleted_at,
@@ -143,7 +146,7 @@ pub struct HistoryDaemonCapture {
     #[builder(setter(into))]
     session: String,
     #[builder(setter(into))]
-    hostname: String,
+    cmd_origin: CmdOrigin,
     #[builder(default, setter(strip_option, into))]
     author: Option<String>,
     #[builder(default, setter(strip_option, into))]
@@ -154,14 +157,14 @@ pub struct HistoryDaemonCapture {
 
 impl From<HistoryDaemonCapture> for History {
     fn from(captured: HistoryDaemonCapture) -> Self {
-        History::new(
+        Self::new(
             captured.timestamp,
             captured.command,
             captured.cwd,
             -1,
             -1,
             Some(captured.session),
-            Some(captured.hostname),
+            Some(captured.cmd_origin),
             captured.author,
             captured.intent,
             None,

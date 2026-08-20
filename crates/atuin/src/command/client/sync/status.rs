@@ -1,7 +1,9 @@
-use crate::{SHA, VERSION};
-use atuin_client::{api_client, settings::Settings};
+use atuin_client::api_client;
+use atuin_client::settings::Settings;
 use colored::Colorize;
 use eyre::{Result, bail};
+
+use crate::{SHA, VERSION};
 
 pub async fn run(settings: &Settings) -> Result<()> {
     if !settings.logged_in().await? {
@@ -11,7 +13,7 @@ pub async fn run(settings: &Settings) -> Result<()> {
     let caps = api_client::caps_client(&settings.sync_address, &settings.extra_headers)?;
     let client = api_client::Client::new(
         settings.sync_address.clone(),
-        settings.sync_auth_token().await?,
+        &settings.sync_auth_token().await?,
         settings.network_connect_timeout,
         settings.network_timeout,
         &settings.extra_headers,

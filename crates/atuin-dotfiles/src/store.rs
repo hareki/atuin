@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use atuin_client::record::sqlite_store::SqliteStore;
+use atuin_common::encryption::paseto_v4;
 // Sync aliases
 // This will be noticeable similar to the kv store, though I expect the two shall diverge
 // While we will support a range of shell config, I'd rather have a larger number of small records
@@ -8,8 +9,6 @@ use atuin_client::record::sqlite_store::SqliteStore;
 use atuin_common::utils::unquote;
 use atuin_domain::record::{DecryptedData, Host, HostId, RecordTag, RecordVersion};
 use eyre::{Result, bail, ensure, eyre};
-
-use atuin_common::encryption::paseto_v4;
 
 use crate::shell::Alias;
 
@@ -31,14 +30,14 @@ impl AliasRecord {
         let mut output = vec![];
 
         match self {
-            AliasRecord::Create(alias) => {
+            Self::Create(alias) => {
                 encode::write_u8(&mut output, 0)?; // create
                 encode::write_array_len(&mut output, 2)?; // 2 fields
 
                 encode::write_str(&mut output, alias.name.as_str())?;
                 encode::write_str(&mut output, alias.value.as_str())?;
             }
-            AliasRecord::Delete(name) => {
+            Self::Delete(name) => {
                 encode::write_u8(&mut output, 1)?; // delete
                 encode::write_array_len(&mut output, 1)?; // 1 field
 
@@ -66,10 +65,7 @@ impl AliasRecord {
                     // create
                     0 => {
                         let nfields = decode::read_array_len(&mut bytes).map_err(error_report)?;
-                        ensure!(
-                            nfields == 2,
-                            "too many entries in v0 shell alias create record"
-                        );
+                        ensure!(nfields == 2, "too many entries in v0 shell alias create record");
 
                         let bytes = bytes.remaining_slice();
 
@@ -82,7 +78,7 @@ impl AliasRecord {
                             bail!("trailing bytes in encoded shell alias record. malformed");
                         }
 
-                        Ok(AliasRecord::Create(Alias {
+                        Ok(Self::Create(Alias {
                             name: key.to_owned(),
                             value: value.to_owned(),
                         }))
@@ -91,10 +87,7 @@ impl AliasRecord {
                     // delete
                     1 => {
                         let nfields = decode::read_array_len(&mut bytes).map_err(error_report)?;
-                        ensure!(
-                            nfields == 1,
-                            "too many entries in v0 shell alias delete record"
-                        );
+                        ensure!(nfields == 1, "too many entries in v0 shell alias delete record");
 
                         let bytes = bytes.remaining_slice();
 
@@ -105,7 +98,7 @@ impl AliasRecord {
                             bail!("trailing bytes in encoded shell alias record. malformed");
                         }
 
-                        Ok(AliasRecord::Delete(key.to_owned()))
+                        Ok(Self::Delete(key.to_owned()))
                     }
 
                     n => {
@@ -129,8 +122,8 @@ pub struct AliasStore {
 
 impl AliasStore {
     // will want to init the actual kv store when that is done
-    pub fn new(store: SqliteStore, host_id: HostId, encryption_key: paseto_v4::Key) -> AliasStore {
-        AliasStore {
+    pub fn new(store: SqliteStore, host_id: HostId, encryption_key: paseto_v4::Key) -> Self {
+        Self {
             store,
             host_id,
             encryption_key,
@@ -244,9 +237,7 @@ impl AliasStore {
             .data(bytes)
             .build();
 
-        self.store
-            .push(&record.encrypt(&self.encryption_key))
-            .await?;
+        self.store.push(&record.encrypt(&self.encryption_key)).await?;
 
         // set mutates shell config, so build again
         self.build().await?;
@@ -280,9 +271,7 @@ impl AliasStore {
             .data(bytes)
             .build();
 
-        self.store
-            .push(&record.encrypt(&self.encryption_key))
-            .await?;
+        self.store.push(&record.encrypt(&self.encryption_key)).await?;
 
         // delete mutates shell config, so build again
         self.build().await?;
@@ -350,22 +339,18 @@ pub(crate) fn test_local_timeout() -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use atuin_client::record::sqlite_store::SqliteStore;
+    use atuin_domain::record::{RecordTag, RecordVersion};
+    use crypto_secretbox::{KeyInit, XSalsa20Poly1305};
     use rand::rngs::OsRng;
     use rstest::*;
 
-    use atuin_client::record::sqlite_store::SqliteStore;
-
-    use crate::shell::Alias;
-
     use super::{AliasRecord, AliasStore, test_local_timeout};
-    use atuin_domain::record::{RecordTag, RecordVersion};
-    use crypto_secretbox::{KeyInit, XSalsa20Poly1305};
+    use crate::shell::Alias;
 
     #[fixture]
     async fn alias_store() -> (AliasStore, SqliteStore) {
-        let store = SqliteStore::new(":memory:", test_local_timeout())
-            .await
-            .unwrap();
+        let store = SqliteStore::new(":memory:", test_local_timeout()).await.unwrap();
         let key: [u8; 32] = XSalsa20Poly1305::generate_key(&mut OsRng).into();
         let host_id = atuin_domain::record::HostId(atuin_common::utils::uuid_v7());
 
@@ -396,10 +381,7 @@ mod tests {
 
         alias.set("k", "kubectl").await.unwrap();
         alias.set("gp", "git push").await.unwrap();
-        alias
-            .set("kgap", "'kubectl get pods --all-namespaces'")
-            .await
-            .unwrap();
+        alias.set("kgap", "'kubectl get pods --all-namespaces'").await.unwrap();
 
         let mut aliases = alias.aliases().await.unwrap();
 
@@ -407,29 +389,20 @@ mod tests {
 
         assert_eq!(aliases.len(), 3);
 
-        assert_eq!(
-            aliases[0],
-            Alias {
-                name: String::from("gp"),
-                value: String::from("git push")
-            }
-        );
+        assert_eq!(aliases[0], Alias {
+            name: String::from("gp"),
+            value: String::from("git push")
+        });
 
-        assert_eq!(
-            aliases[1],
-            Alias {
-                name: String::from("k"),
-                value: String::from("kubectl")
-            }
-        );
+        assert_eq!(aliases[1], Alias {
+            name: String::from("k"),
+            value: String::from("kubectl")
+        });
 
-        assert_eq!(
-            aliases[2],
-            Alias {
-                name: String::from("kgap"),
-                value: String::from("'kubectl get pods --all-namespaces'")
-            }
-        );
+        assert_eq!(aliases[2], Alias {
+            name: String::from("kgap"),
+            value: String::from("'kubectl get pods --all-namespaces'")
+        });
 
         let build = alias.posix().await.expect("failed to build aliases");
 
@@ -462,20 +435,14 @@ alias kgap='kubectl get pods --all-namespaces'
             .data(DecryptedData(vec![1, 2, 3]))
             .build();
 
-        store
-            .push(&corrupt.encrypt(&corrupt_key.into()))
-            .await
-            .unwrap();
+        store.push(&corrupt.encrypt(&corrupt_key.into())).await.unwrap();
 
         let aliases = alias.aliases().await.unwrap();
 
         assert_eq!(aliases.len(), 1);
-        assert_eq!(
-            aliases[0],
-            Alias {
-                name: String::from("k"),
-                value: String::from("kubectl")
-            }
-        );
+        assert_eq!(aliases[0], Alias {
+            name: String::from("k"),
+            value: String::from("kubectl")
+        });
     }
 }

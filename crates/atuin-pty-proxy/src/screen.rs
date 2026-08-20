@@ -80,7 +80,7 @@ const MAX_SUBSCRIBERS: usize = 8;
 /// that recovery is imperceptible. See [`AcceptFailure`].
 const ACCEPT_RETRY_PAUSE: Duration = Duration::from_millis(50);
 
-pub(crate) enum Msg {
+pub enum Msg {
     Data(Vec<u8>),
     Resize {
         rows: u16,
@@ -120,13 +120,13 @@ type SubscriberId = u64;
 static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Default per-proxy directory: `$TMPDIR/atuin-pty-proxy-<pid>-<8 hex>`.
-pub(crate) fn default_proxy_dir() -> PathBuf {
+pub fn default_proxy_dir() -> PathBuf {
     std::env::temp_dir().join(proxy_dir_name())
 }
 
 /// Fallback when the default directory would overflow `sockaddr_un.sun_path`
 /// (macOS TMPDIR paths can be long): a literal `/tmp` location.
-pub(crate) fn fallback_proxy_dir() -> PathBuf {
+pub fn fallback_proxy_dir() -> PathBuf {
     Path::new("/tmp").join(proxy_dir_name())
 }
 
@@ -140,18 +140,14 @@ pub(crate) fn fallback_proxy_dir() -> PathBuf {
 fn proxy_dir_name() -> String {
     let mut suffix = [0u8; 4];
     rand::thread_rng().fill_bytes(&mut suffix);
-    format!(
-        "atuin-pty-proxy-{}-{}",
-        std::process::id(),
-        hex_encode(&suffix)
-    )
+    format!("atuin-pty-proxy-{}-{}", std::process::id(), hex_encode(&suffix))
 }
 
-pub(crate) fn socket_path_in(dir: &Path) -> PathBuf {
+pub fn socket_path_in(dir: &Path) -> PathBuf {
     dir.join("sock")
 }
 
-pub(crate) fn token_path_in(dir: &Path) -> PathBuf {
+pub fn token_path_in(dir: &Path) -> PathBuf {
     dir.join("token")
 }
 
@@ -159,7 +155,7 @@ pub(crate) fn token_path_in(dir: &Path) -> PathBuf {
 /// (macOS) or 108 (Linux) bytes including the NUL; 100 is conservative.
 /// Checked *before* the path is exported to the child's environment, so we
 /// never advertise a socket we cannot bind.
-pub(crate) fn socket_path_fits(path: &Path) -> bool {
+pub fn socket_path_fits(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     path.as_os_str().as_bytes().len() < 100
 }
@@ -169,7 +165,7 @@ pub(crate) fn socket_path_fits(path: &Path) -> bool {
 /// (the sticky bit protects other users' entries in `/tmp`) makes the
 /// `create` below fail with `AlreadyExists`: fail closed — never reuse a
 /// directory this process did not create.
-pub(crate) fn create_proxy_dir(dir: &Path) -> io::Result<()> {
+pub fn create_proxy_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     let _ = std::fs::remove_dir_all(dir);
     std::fs::DirBuilder::new().mode(0o700).create(dir)
@@ -177,7 +173,7 @@ pub(crate) fn create_proxy_dir(dir: &Path) -> io::Result<()> {
 
 /// Write a fresh input token (32 random bytes, hex-encoded to 64 ASCII
 /// characters) to `<dir>/token` with mode 0600 and return its bytes.
-pub(crate) fn write_token(dir: &Path) -> io::Result<Vec<u8>> {
+pub fn write_token(dir: &Path) -> io::Result<Vec<u8>> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let mut raw = [0u8; 32];
@@ -222,14 +218,13 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// each) can be queued ahead of the pump's `Msg::Data` at once — at most
 /// [`MAX_LIVE_CONNECTIONS`] of them, since each connection thread can have
 /// only one outstanding. That cap is what keeps the bound a bound.
-pub(crate) fn spawn_parser_thread(rows: u16, cols: u16, msg_rx: Receiver<Msg>) {
+pub fn spawn_parser_thread(rows: u16, cols: u16, msg_rx: Receiver<Msg>) {
     std::thread::spawn(move || {
         let mut state = ParserState::new(rows, cols);
 
         loop {
-            let first = match msg_rx.recv() {
-                Ok(msg) => msg,
-                Err(_) => break,
+            let Ok(first) = msg_rx.recv() else {
+                break;
             };
 
             state.handle(first);
@@ -379,8 +374,7 @@ impl ParserState {
     /// whose connection is gone. Never blocks (see the invariant on
     /// [`spawn_parser_thread`]).
     fn fan_out(&mut self, frame: &[u8]) {
-        self.subscribers
-            .retain(|(_, subscriber)| subscriber.try_send(frame.to_vec()).is_ok());
+        self.subscribers.retain(|(_, subscriber)| subscriber.try_send(frame.to_vec()).is_ok());
     }
 }
 
@@ -478,7 +472,7 @@ impl Drop for ConnectionSlot {
 /// per connection is what makes fd pressure reachable at all, so the two
 /// belong together, along with [`MAX_LIVE_CONNECTIONS`], which stops one
 /// same-uid client from creating that pressure in the first place.
-pub(crate) fn spawn_socket_server(
+pub fn spawn_socket_server(
     listener: UnixListener,
     msg_tx: SyncSender<Msg>,
     token: Vec<u8>,
@@ -679,25 +673,18 @@ fn write_frames(mut stream: UnixStream, frames_rx: &Receiver<Vec<u8>>) {
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "dragonfly"
-))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "dragonfly"))]
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
-    use nix::sys::socket::{getsockopt, sockopt::LocalPeerCred};
-    getsockopt(stream, LocalPeerCred)
-        .ok()
-        .map(|cred| cred.uid())
+    use nix::sys::socket::getsockopt;
+    use nix::sys::socket::sockopt::LocalPeerCred;
+    getsockopt(stream, LocalPeerCred).ok().map(|cred| cred.uid())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
-    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-    getsockopt(stream, PeerCredentials)
-        .ok()
-        .map(|cred| cred.uid())
+    use nix::sys::socket::getsockopt;
+    use nix::sys::socket::sockopt::PeerCredentials;
+    getsockopt(stream, PeerCredentials).ok().map(|cred| cred.uid())
 }
 
 #[cfg(not(any(
@@ -720,8 +707,9 @@ fn peer_uid_matches(stream: &UnixStream) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rstest::rstest;
+
+    use super::*;
 
     #[test]
     fn zero_dimension_screens_do_not_panic() {
@@ -821,10 +809,7 @@ mod tests {
         // Drain everything that was queued before the drop...
         while frames_rx.try_recv().is_ok() {}
         // ...after which the channel reports disconnection.
-        assert!(matches!(
-            frames_rx.try_recv(),
-            Err(mpsc::TryRecvError::Disconnected)
-        ));
+        assert!(matches!(frames_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
     }
 
     /// The registry is capped: a same-uid client cannot accumulate
@@ -915,17 +900,11 @@ mod tests {
         }
         // A signal or a peer that gave up between connect and accept.
         for code in [libc::EINTR, libc::ECONNABORTED] {
-            assert!(
-                matches!(classify(code), AcceptFailure::Retry),
-                "errno {code}"
-            );
+            assert!(matches!(classify(code), AcceptFailure::Retry), "errno {code}");
         }
         // The listener itself is gone: nothing left to accept.
         for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
-            assert!(
-                matches!(classify(code), AcceptFailure::Fatal),
-                "errno {code}"
-            );
+            assert!(matches!(classify(code), AcceptFailure::Fatal), "errno {code}");
         }
     }
 
@@ -939,10 +918,7 @@ mod tests {
             .map(|_| ConnectionSlot::acquire(&live).expect("under the cap"))
             .collect();
         assert_eq!(live.load(Ordering::Acquire), MAX_LIVE_CONNECTIONS);
-        assert!(
-            ConnectionSlot::acquire(&live).is_none(),
-            "the cap must hold"
-        );
+        assert!(ConnectionSlot::acquire(&live).is_none(), "the cap must hold");
 
         held.pop();
         assert_eq!(live.load(Ordering::Acquire), MAX_LIVE_CONNECTIONS - 1);

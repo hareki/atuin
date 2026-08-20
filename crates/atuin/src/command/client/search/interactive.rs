@@ -1,60 +1,48 @@
-use std::{
-    io::{IsTerminal, Write, stdout},
-    time::Duration,
-};
-
 #[cfg(unix)]
 use std::io::Read as _;
+use std::io::{IsTerminal, Write, stdout};
+use std::time::Duration;
 
-use atuin_common::{shell::Shell, string::EscapeNonPrintablePosixExt as _};
+use atuin_client::database::{Context, Sqlite, current_context};
+use atuin_client::history::store::HistoryStore;
+use atuin_client::history::{History, HistoryId, HistoryStats};
+use atuin_client::settings::{
+    CursorStyle, ExitMode, FilterMode, KeymapMode, PreviewStrategy, RequestedSearchMode,
+    SearchMode, Settings, UiColumn,
+};
+use atuin_common::shell::Shell;
+use atuin_common::string::EscapeNonPrintablePosixExt as _;
 use eyre::Result;
 use futures_util::FutureExt;
-use semver::Version;
-use time::{OffsetDateTime, UtcOffset};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-use super::{
-    block_ext::{themed_block, titled_block},
-    cursor::Cursor,
-    engines::{AnySearchEngine, SearchEngine, SearchState},
-    history_list::{HistoryList, ListState},
-};
-use atuin_client::{
-    database::{Context, Database, current_context},
-    history::{History, HistoryId, HistoryStats, store::HistoryStore},
-    settings::{
-        CursorStyle, ExitMode, FilterMode, KeymapMode, PreviewStrategy, RequestedSearchMode,
-        SearchMode, Settings, UiColumn,
-    },
-};
-
-use crate::command::client::search::history_list::HistoryHighlighter;
-use crate::command::client::search::keybindings::KeymapSet;
-use crate::command::client::theme::{Meaning, Theme};
-use crate::{VERSION, command::client::search::engines};
-
-use ratatui::{
-    Frame, Terminal, TerminalOptions, Viewport,
-    backend::{CrosstermBackend, FromCrossterm},
-    crossterm::{
-        cursor::SetCursorStyle,
-        event::{self, Event, KeyEvent, MouseEvent},
-        execute, queue, terminal,
-    },
-    layout::{Alignment, Constraint, Direction, Layout},
-    prelude::*,
-    style::{Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Tabs},
-};
-
+use ratatui::backend::{CrosstermBackend, FromCrossterm};
+use ratatui::crossterm::cursor::SetCursorStyle;
+use ratatui::crossterm::event::{self, Event, KeyEvent, MouseEvent};
 #[cfg(not(target_os = "windows"))]
 use ratatui::crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-
+use ratatui::crossterm::{execute, queue, terminal};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::prelude::*;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Tabs};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use semver::Version;
+use time::{OffsetDateTime, UtcOffset};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
+
+use super::block_ext::{themed_block, titled_block};
+use super::cursor::Cursor;
+use super::engines::{AnySearchEngine, SearchEngine, SearchState};
+use super::history_list::{HistoryList, ListState};
+use crate::VERSION;
+use crate::command::client::search::engines;
+use crate::command::client::search::history_list::HistoryHighlighter;
+use crate::command::client::search::keybindings::KeymapSet;
+use crate::command::client::theme::{Meaning, Theme};
 
 const TAB_TITLES: [&str; 2] = ["Search", "Inspect"];
 
@@ -200,7 +188,7 @@ impl State {
 
     async fn query_results(
         &mut self,
-        db: &mut dyn Database,
+        db: &mut Sqlite,
         settings: &Settings,
     ) -> Result<Vec<History>> {
         #[cfg(feature = "daemon")]
@@ -230,10 +218,7 @@ impl State {
         self.results_len = results.len();
 
         if settings.smart_sort {
-            Ok(atuin_history::sort::sort(
-                self.search.input.as_str(),
-                results,
-            ))
+            Ok(atuin_history::sort::sort(self.search.input.as_str(), results))
         } else {
             Ok(results)
         }
@@ -348,9 +333,8 @@ impl State {
     }
 
     fn handle_key_input(&mut self, settings: &Settings, input: &KeyEvent) -> InputAction {
-        use super::keybindings::Action;
-        use super::keybindings::EvalContext;
         use super::keybindings::key::{KeyCodeValue, KeyInput, SingleKey};
+        use super::keybindings::{Action, EvalContext};
 
         // Skip release events
         if input.kind == event::KeyEventKind::Release {
@@ -422,10 +406,7 @@ impl State {
                 };
                 (Some(Action::Noop), Some(c))
             } else {
-                (
-                    keymap.resolve(&KeyInput::Single(single.clone()), &ctx),
-                    None,
-                )
+                (keymap.resolve(&KeyInput::Single(single.clone()), &ctx), None)
             }
         };
 
@@ -462,8 +443,7 @@ impl State {
 
     fn scroll_up(&mut self, scroll_len: usize) {
         let i = self.results_state.selected() + scroll_len;
-        self.results_state
-            .select(i.min(self.results_len.saturating_sub(1)));
+        self.results_state.select(i.min(self.results_len.saturating_sub(1)));
         self.inspecting_state.reset();
     }
 
@@ -495,15 +475,11 @@ impl State {
                 InputAction::Continue
             }
             Action::CursorWordLeft => {
-                self.search
-                    .input
-                    .prev_word(&settings.word_chars, settings.word_jump_mode);
+                self.search.input.prev_word(&settings.word_chars, settings.word_jump_mode);
                 InputAction::Continue
             }
             Action::CursorWordRight => {
-                self.search
-                    .input
-                    .next_word(&settings.word_chars, settings.word_jump_mode);
+                self.search.input.next_word(&settings.word_chars, settings.word_jump_mode);
                 InputAction::Continue
             }
             Action::CursorWordEnd => {
@@ -529,15 +505,11 @@ impl State {
                 InputAction::Continue
             }
             Action::DeleteWordBefore => {
-                self.search
-                    .input
-                    .remove_prev_word(&settings.word_chars, settings.word_jump_mode);
+                self.search.input.remove_prev_word(&settings.word_chars, settings.word_jump_mode);
                 InputAction::Continue
             }
             Action::DeleteWordAfter => {
-                self.search
-                    .input
-                    .remove_next_word(&settings.word_chars, settings.word_jump_mode);
+                self.search.input.remove_next_word(&settings.word_chars, settings.word_jump_mode);
                 InputAction::Continue
             }
             Action::DeleteToWordBoundary => {
@@ -584,11 +556,9 @@ impl State {
             }
             // -- Page/half-page scroll (invert-aware) --
             Action::ScrollHalfPageUp => {
-                let scroll_len = self
-                    .results_state
-                    .max_entries()
-                    .saturating_sub(settings.scroll_context_lines)
-                    / 2;
+                let scroll_len =
+                    self.results_state.max_entries().saturating_sub(settings.scroll_context_lines)
+                        / 2;
                 if settings.invert {
                     self.scroll_down(scroll_len);
                 } else {
@@ -597,11 +567,9 @@ impl State {
                 InputAction::Continue
             }
             Action::ScrollHalfPageDown => {
-                let scroll_len = self
-                    .results_state
-                    .max_entries()
-                    .saturating_sub(settings.scroll_context_lines)
-                    / 2;
+                let scroll_len =
+                    self.results_state.max_entries().saturating_sub(settings.scroll_context_lines)
+                        / 2;
                 if settings.invert {
                     self.scroll_up(scroll_len);
                 } else {
@@ -610,10 +578,8 @@ impl State {
                 InputAction::Continue
             }
             Action::ScrollPageUp => {
-                let scroll_len = self
-                    .results_state
-                    .max_entries()
-                    .saturating_sub(settings.scroll_context_lines);
+                let scroll_len =
+                    self.results_state.max_entries().saturating_sub(settings.scroll_context_lines);
                 if settings.invert {
                     self.scroll_down(scroll_len);
                 } else {
@@ -622,10 +588,8 @@ impl State {
                 InputAction::Continue
             }
             Action::ScrollPageDown => {
-                let scroll_len = self
-                    .results_state
-                    .max_entries()
-                    .saturating_sub(settings.scroll_context_lines);
+                let scroll_len =
+                    self.results_state.max_entries().saturating_sub(settings.scroll_context_lines);
                 if settings.invert {
                     self.scroll_up(scroll_len);
                 } else {
@@ -662,8 +626,7 @@ impl State {
                 let top = self.results_state.offset();
                 let visible = self.results_state.max_entries().min(self.results_len);
                 let bottom = top + visible.saturating_sub(1);
-                self.results_state
-                    .select(bottom.min(self.results_len.saturating_sub(1)));
+                self.results_state.select(bottom.min(self.results_len.saturating_sub(1)));
                 self.inspecting_state.reset();
                 InputAction::Continue
             }
@@ -672,8 +635,7 @@ impl State {
                 let top = self.results_state.offset();
                 let visible = self.results_state.max_entries().min(self.results_len);
                 let middle = top + visible / 2;
-                self.results_state
-                    .select(middle.min(self.results_len.saturating_sub(1)));
+                self.results_state.select(middle.min(self.results_len.saturating_sub(1)));
                 self.inspecting_state.reset();
                 InputAction::Continue
             }
@@ -811,11 +773,8 @@ impl State {
         {
             let length_current_cmd = results[selected].command.width() as u16;
             // calculate the number of newlines in the command
-            let num_newlines = results[selected]
-                .command
-                .chars()
-                .filter(|&c| c == '\n')
-                .count() as u16;
+            let num_newlines =
+                results[selected].command.chars().filter(|&c| c == '\n').count() as u16;
             if num_newlines > 0 {
                 std::cmp::min(
                     settings.max_preview_height,
@@ -843,9 +802,8 @@ impl State {
             && settings.preview.strategy == PreviewStrategy::Static
             && tab_index == 0
         {
-            let longest_command = results
-                .iter()
-                .max_by(|h1, h2| h1.command.len().cmp(&h2.command.len()));
+            let longest_command =
+                results.iter().max_by(|h1, h2| h1.command.len().cmp(&h2.command.len()));
             longest_command.map_or(0, |v| {
                 std::cmp::min(
                     settings.max_preview_height,
@@ -931,30 +889,50 @@ impl State {
             .constraints::<&[Constraint]>(
                 if invert {
                     [
-                        Constraint::Length(1 + border_size),               // input
-                        Constraint::Min(1),                                // results list
-                        Constraint::Length(preview_height),                // preview
-                        Constraint::Length(if show_tabs { 1 } else { 0 }), // tabs
-                        Constraint::Length(if show_help { 1 } else { 0 }), // header (sic)
-                        Constraint::Length(warning_height),                // skim warning
+                        Constraint::Length(1 + border_size), // input
+                        Constraint::Min(1),                  // results list
+                        Constraint::Length(preview_height),  // preview
+                        Constraint::Length(if show_tabs {
+                            1
+                        } else {
+                            0
+                        }), // tabs
+                        Constraint::Length(if show_help {
+                            1
+                        } else {
+                            0
+                        }), // header (sic)
+                        Constraint::Length(warning_height),  // skim warning
                     ]
                 } else {
                     match compactness {
                         Compactness::Ultracompact => [
-                            Constraint::Length(if show_help { 1 } else { 0 }), // header
-                            Constraint::Length(0),                             // tabs
-                            Constraint::Min(1),                                // results list
-                            Constraint::Length(0),                             // no input
-                            Constraint::Length(0),                             // no preview
-                            Constraint::Length(warning_height),                // skim warning
+                            Constraint::Length(if show_help {
+                                1
+                            } else {
+                                0
+                            }), // header
+                            Constraint::Length(0),              // tabs
+                            Constraint::Min(1),                 // results list
+                            Constraint::Length(0),              // no input
+                            Constraint::Length(0),              // no preview
+                            Constraint::Length(warning_height), // skim warning
                         ],
                         _ => [
-                            Constraint::Length(if show_help { 1 } else { 0 }), // header
-                            Constraint::Length(if show_tabs { 1 } else { 0 }), // tabs
-                            Constraint::Min(1),                                // results list
-                            Constraint::Length(1 + border_size),               // input
-                            Constraint::Length(preview_height),                // preview
-                            Constraint::Length(warning_height),                // skim warning
+                            Constraint::Length(if show_help {
+                                1
+                            } else {
+                                0
+                            }), // header
+                            Constraint::Length(if show_tabs {
+                                1
+                            } else {
+                                0
+                            }), // tabs
+                            Constraint::Min(1),                  // results list
+                            Constraint::Length(1 + border_size), // input
+                            Constraint::Length(preview_height),  // preview
+                            Constraint::Length(warning_height),  // skim warning
                         ],
                     }
                 }
@@ -962,11 +940,31 @@ impl State {
             )
             .split(area);
 
-        let input_chunk = if invert { chunks[0] } else { chunks[3] };
-        let results_list_chunk = if invert { chunks[1] } else { chunks[2] };
-        let preview_chunk = if invert { chunks[2] } else { chunks[4] };
-        let tabs_chunk = if invert { chunks[3] } else { chunks[1] };
-        let header_chunk = if invert { chunks[4] } else { chunks[0] };
+        let input_chunk = if invert {
+            chunks[0]
+        } else {
+            chunks[3]
+        };
+        let results_list_chunk = if invert {
+            chunks[1]
+        } else {
+            chunks[2]
+        };
+        let preview_chunk = if invert {
+            chunks[2]
+        } else {
+            chunks[4]
+        };
+        let tabs_chunk = if invert {
+            chunks[3]
+        } else {
+            chunks[1]
+        };
+        let header_chunk = if invert {
+            chunks[4]
+        } else {
+            chunks[0]
+        };
         // Always last, so it is the bottom row whichever way the layout is stacked.
         let warning_chunk = chunks[5];
 
@@ -994,12 +992,8 @@ impl State {
         let header_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints::<&[Constraint]>(
-                [
-                    Constraint::Ratio(1, 5),
-                    Constraint::Ratio(3, 5),
-                    Constraint::Ratio(1, 5),
-                ]
-                .as_ref(),
+                [Constraint::Ratio(1, 5), Constraint::Ratio(3, 5), Constraint::Ratio(1, 5)]
+                    .as_ref(),
             )
             .split(header_chunk);
 
@@ -1223,11 +1217,8 @@ impl State {
             .add_modifier(Modifier::BOLD);
 
         Text::from(vec![
-            Span::styled(
-                "Warning: \"skim\" mode was removed; falling back to \"fuzzy\"",
-                style,
-            )
-            .into(),
+            Span::styled("Warning: \"skim\" mode was removed; falling back to \"fuzzy\"", style)
+                .into(),
             vec![
                 Span::styled("Set ", style),
                 Span::styled("search_mode = \"daemon-fuzzy\"", code_style),
@@ -1240,8 +1231,7 @@ impl State {
 
     fn build_stats(&self, theme: &Theme) -> Paragraph<'_> {
         Paragraph::new(Text::from(Span::raw(
-            self.history_count
-                .map_or_else(String::new, |count| format!("history count: {count}")),
+            self.history_count.map_or_else(String::new, |count| format!("history count: {count}")),
         )))
         .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
         .alignment(Alignment::Right)
@@ -1273,9 +1263,11 @@ impl State {
             Compactness::Full => {
                 if style.invert {
                     results_list.block(
-                        themed_block(theme)
-                            .borders(Borders::LEFT | Borders::RIGHT)
-                            .title(format!("{:─>width$}", "", width = style.inner_width - 2)),
+                        themed_block(theme).borders(Borders::LEFT | Borders::RIGHT).title(format!(
+                            "{:─>width$}",
+                            "",
+                            width = style.inner_width - 2
+                        )),
                     )
                 } else {
                     results_list.block(
@@ -1301,10 +1293,7 @@ impl State {
         let mode_width = usize::from(prefix_width) - pref.len() - 3;
         // sanity check to ensure we don't exceed the layout limits
         debug_assert!(mode_width >= mode.len(), "mode name '{mode}' is too long!");
-        let input = format!(
-            " [{pref}{mode:^mode_width$}] {}",
-            self.search.input.as_str()
-        );
+        let input = format!(" [{pref}{mode:^mode_width$}] {}", self.search.input.as_str());
         let input = Paragraph::new(input);
         match style.compactness {
             Compactness::Full => {
@@ -1314,9 +1303,11 @@ impl State {
                     )
                 } else {
                     input.block(
-                        themed_block(theme)
-                            .borders(Borders::LEFT | Borders::RIGHT)
-                            .title(format!("{:─>width$}", "", width = style.inner_width - 2)),
+                        themed_block(theme).borders(Borders::LEFT | Borders::RIGHT).title(format!(
+                            "{:─>width$}",
+                            "",
+                            width = style.inner_width - 2
+                        )),
                     )
                 }
             }
@@ -1396,10 +1387,7 @@ impl TerminalWriter {
         #[cfg(unix)]
         {
             Ok(TerminalWriter::Tty(
-                std::fs::File::options()
-                    .read(true)
-                    .write(true)
-                    .open("/dev/tty")?,
+                std::fs::File::options().read(true).write(true).open("/dev/tty")?,
             ))
         }
 
@@ -1408,10 +1396,7 @@ impl TerminalWriter {
         // TUI to render properly. We'll set it back to its previous value upon exit.
         #[cfg(windows)]
         {
-            let file = std::fs::File::options()
-                .read(true)
-                .write(true)
-                .open("CONOUT$")?;
+            let file = std::fs::File::options().read(true).write(true).open("CONOUT$")?;
 
             let initial_console_output_cp = unsafe { GetConsoleOutputCP() };
             if initial_console_output_cp != Self::CP_UTF8 {
@@ -1420,10 +1405,7 @@ impl TerminalWriter {
                 }
             }
 
-            Ok(TerminalWriter::ConOut(
-                std::io::LineWriter::new(file),
-                initial_console_output_cp,
-            ))
+            Ok(TerminalWriter::ConOut(std::io::LineWriter::new(file), initial_console_output_cp))
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -1571,13 +1553,8 @@ fn restore_popup_area(saved: &SavedScreen, popup_rect: Rect, scroll_offset: u16)
         }
     }
 
-    let _ = execute!(
-        stdout,
-        MoveTo(
-            saved.cursor_col,
-            saved.cursor_row.saturating_sub(scroll_offset)
-        )
-    );
+    let _ =
+        execute!(stdout, MoveTo(saved.cursor_col, saved.cursor_row.saturating_sub(scroll_offset)));
     let _ = stdout.flush();
 }
 
@@ -1697,22 +1674,16 @@ fn compute_popup_placement(
 
 // for now, it works. But it'd be great if it were more easily readable, and
 // modular. I'd like to add some more stats and stuff at some point
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity
-)]
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines, clippy::cognitive_complexity)]
 pub async fn history(
     query: &[String],
     settings: &Settings,
-    mut db: impl Database,
+    mut db: Sqlite,
     history_store: &HistoryStore,
     theme: &Theme,
 ) -> Result<String> {
     let inline_height = if settings.shell_up_key_binding {
-        settings
-            .inline_height_shell_up_key_binding
-            .unwrap_or(settings.inline_height)
+        settings.inline_height_shell_up_key_binding.unwrap_or(settings.inline_height)
     } else {
         settings.inline_height
     };
@@ -1793,29 +1764,21 @@ pub async fn history(
         );
         for row in popup_rect.y..popup_rect.y.saturating_add(popup_rect.height) {
             let _ = queue!(raw_stdout, MoveTo(popup_rect.x, row));
-            let _ = write!(
-                raw_stdout,
-                "{:width$}",
-                "",
-                width = popup_rect.width as usize
-            );
+            let _ = write!(raw_stdout, "{:width$}", "", width = popup_rect.width as usize);
         }
         let _ = raw_stdout.flush();
     }
 
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: if popup_mode {
-                Viewport::Fixed(popup_rect)
-            } else if inline_height > 0 {
-                Viewport::Inline(inline_height)
-            } else {
-                Viewport::Fullscreen
-            },
+    let mut terminal = Terminal::with_options(backend, TerminalOptions {
+        viewport: if popup_mode {
+            Viewport::Fixed(popup_rect)
+        } else if inline_height > 0 {
+            Viewport::Inline(inline_height)
+        } else {
+            Viewport::Fullscreen
         },
-    )?;
+    })?;
 
     let original_query = query.join(" ");
 
@@ -1844,7 +1807,7 @@ pub async fn history(
 
     // Counting history is a full table scan, which can take a while on a large,
     // cold database - don't hold up the first frame for it.
-    let count_db = db.clone_boxed();
+    let count_db = db.clone();
     let history_count = tokio::spawn(async move { count_db.history_count(false).await }).fuse();
     tokio::pin!(history_count);
 
@@ -1917,15 +1880,7 @@ pub async fn history(
     let accept;
     let result = 'render: loop {
         terminal.draw(|f| {
-            app.draw(
-                f,
-                &results,
-                stats.clone(),
-                inspecting.as_ref(),
-                settings,
-                theme,
-                popup_mode,
-            );
+            app.draw(f, &results, stats.clone(), inspecting.as_ref(), settings, theme, popup_mode);
         })?;
 
         let initial_input = app.search.input.as_str().to_owned();
@@ -2195,21 +2150,19 @@ fn set_clipboard(_s: String) -> Result<(), std::convert::Infallible> {
 
 #[cfg(test)]
 mod tests {
-    use rstest::{fixture, rstest};
-
     use atuin_client::database::Context;
     use atuin_client::history::History;
     use atuin_client::settings::{
         FilterMode, KeymapMode, Preview, PreviewStrategy, RequestedSearchMode, SearchMode,
         Settings, Shells,
     };
+    use rstest::{fixture, rstest};
     use time::OffsetDateTime;
 
+    use super::{Compactness, InputAction, InspectingState, KeymapSet, SearchModeState, State};
     use crate::command::client::search::engines::{self, SearchState};
     use crate::command::client::search::history_list::ListState;
     use crate::command::client::search::keybindings::Action;
-
-    use super::{Compactness, InputAction, InspectingState, KeymapSet, SearchModeState, State};
 
     #[fixture]
     fn settings() -> Settings {
@@ -2255,7 +2208,7 @@ mod tests {
                 context: Context {
                     session: String::new(),
                     cwd: String::new(),
-                    hostname: String::new(),
+                    cmd_origin: atuin_domain::record::CmdOrigin::default(),
                     host_id: String::new(),
                     git_root: None,
                 },
@@ -2283,14 +2236,21 @@ mod tests {
 
         let cmd_124: History = History::capture()
             .timestamp(time::OffsetDateTime::now_utc())
-            .command("echo 'Aurea prima sata est aetas, quae vindice nullo, sponte sua, sine lege fidem rectumque colebat. Poena metusque aberant'")
+            .command(
+                "echo 'Aurea prima sata est aetas, quae vindice nullo, sponte sua, sine lege \
+                 fidem rectumque colebat. Poena metusque aberant'",
+            )
             .cwd("/")
             .build()
             .into();
 
         let cmd_200: History = History::capture()
             .timestamp(time::OffsetDateTime::now_utc())
-            .command("CREATE USER atuin WITH ENCRYPTED PASSWORD 'supersecretpassword'; CREATE DATABASE atuin WITH OWNER = atuin; \\c atuin; REVOKE ALL PRIVILEGES ON SCHEMA public FROM PUBLIC; echo 'All done. 200 characters'")
+            .command(
+                "CREATE USER atuin WITH ENCRYPTED PASSWORD 'supersecretpassword'; CREATE DATABASE \
+                 atuin WITH OWNER = atuin; \\c atuin; REVOKE ALL PRIVILEGES ON SCHEMA public FROM \
+                 PUBLIC; echo 'All done. 200 characters'",
+            )
             .cwd("/")
             .build()
             .into();
@@ -2371,10 +2331,7 @@ mod tests {
 
         let tab_event = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
         let result = state.handle_key_input(&settings, &tab_event);
-        assert!(
-            matches!(result, super::InputAction::Accept(_)),
-            "Tab should always accept"
-        );
+        assert!(matches!(result, super::InputAction::Accept(_)), "Tab should always accept");
 
         // Test left arrow with accept_past_line_start disabled (should continue)
         let left_event = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
@@ -2518,10 +2475,8 @@ mod tests {
 
         state.results_state.select(50);
         state.pending_vim_key = Some('g');
-        let r = state.handle_key_input(
-            &settings,
-            &KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
-        );
+        let r = state
+            .handle_key_input(&settings, &KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
         assert!(matches!(r, InputAction::Continue));
         assert_eq!(state.pending_vim_key, None);
     }
@@ -2692,8 +2647,9 @@ mod tests {
         #[with(KeymapMode::Emacs, 100, 0)] mut state: State,
         mut settings: Settings,
     ) {
-        use crate::command::client::search::keybindings::Action;
         use atuin_client::settings::ExitMode;
+
+        use crate::command::client::search::keybindings::Action;
 
         settings.exit_mode = ExitMode::ReturnOriginal;
         let result = state.execute_action(&Action::Exit, &settings);
@@ -2791,7 +2747,7 @@ mod tests {
     #[cfg(all(feature = "daemon", unix))]
     #[tokio::test]
     async fn unavailable_daemon_fuzzy_retries_with_local_fuzzy() {
-        use atuin_client::database::{Database, Sqlite};
+        use atuin_client::database::Sqlite;
 
         let temp = tempfile::tempdir().unwrap();
         let mut settings = Settings::utc();
@@ -2903,9 +2859,10 @@ mod tests {
         #[with(KeymapMode::Emacs, 100, 0, FilterMode::Global, "test query")] mut state: State,
         mut settings: Settings,
     ) {
+        use std::collections::HashMap;
+
         use atuin_client::settings::KeyBindingConfig;
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        use std::collections::HashMap;
 
         // Configure tab to return-query
         settings.keymap.emacs = HashMap::from([(

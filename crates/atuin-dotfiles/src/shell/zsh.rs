@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use crate::store::{AliasStore, var::VarStore};
+use crate::store::AliasStore;
+use crate::store::var::VarStore;
 
 async fn cached_aliases(path: PathBuf, store: &AliasStore) -> String {
     match tokio::fs::read_to_string(path).await {
@@ -10,7 +11,7 @@ async fn cached_aliases(path: PathBuf, store: &AliasStore) -> String {
             // fallback to generating new aliases on the fly
 
             store.posix().await.unwrap_or_else(|e| {
-                format!("echo 'Atuin: failed to read and generate aliases: \n{r}\n{e}'",)
+                format!("echo 'Atuin: failed to read and generate aliases: \n{r}\n{e}'")
             })
         }
     }
@@ -24,7 +25,7 @@ async fn cached_vars(path: PathBuf, store: &VarStore) -> String {
             // fallback to generating new vars on the fly
 
             store.posix().await.unwrap_or_else(|e| {
-                format!("echo 'Atuin: failed to read and generate aliases: \n{r}\n{e}'",)
+                format!("echo 'Atuin: failed to read and generate aliases: \n{r}\n{e}'")
             })
         }
     }

@@ -3,12 +3,6 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-use eyre::{Result, bail};
-use reqwest::{
-    Response, StatusCode, Url,
-    header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT},
-};
-
 use atuin_common::url::UrlAppendExt;
 use atuin_domain::api::{
     ATUIN_CARGO_VERSION, ATUIN_HEADER_VERSION, ATUIN_VERSION, ChangePasswordRequest, ErrorResponse,
@@ -19,7 +13,9 @@ use atuin_domain::caps::{CapClient, CapMismatch, CapabilitiesExt};
 use atuin_domain::record::{
     EncryptedData, HostId, Record, RecordId, RecordIdx, RecordStatus, RecordTag,
 };
-
+use eyre::{Result, bail};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
+use reqwest::{Response, StatusCode, Url};
 use reqwest_middleware::ClientWithMiddleware;
 use semver::Version;
 
@@ -45,8 +41,8 @@ impl AuthToken {
     /// Format the token as an Authorization header value
     fn to_header_value(&self) -> String {
         match self {
-            AuthToken::Bearer(token) => format!("Bearer {token}"),
-            AuthToken::Token(token) => format!("Token {token}"),
+            Self::Bearer(token) => format!("Bearer {token}"),
+            Self::Token(token) => format!("Token {token}"),
         }
     }
 }
@@ -82,7 +78,8 @@ pub(crate) fn client_builder(extra_headers: &HashMap<String, String>) -> reqwest
 
         if !same_origin {
             attempt.error(
-                "refusing to follow cross-origin redirect: extra_headers are configured and will not be sent to a different origin",
+                "refusing to follow cross-origin redirect: extra_headers are configured and will \
+                 not be sent to a different origin",
             )
         } else if attempt.previous().len() > 10 {
             attempt.error("too many redirects")
@@ -173,11 +170,7 @@ pub async fn latest_version() -> Result<Version> {
     let url = crate::settings::DEFAULT_SYNC_URL.clone();
     let client = reqwest::Client::new();
 
-    let resp = client
-        .get(url)
-        .header(USER_AGENT, APP_USER_AGENT)
-        .send()
-        .await?;
+    let resp = client.get(url).header(USER_AGENT, APP_USER_AGENT).send().await?;
     let resp = handle_resp_error(resp).await?;
 
     let index = resp.json::<IndexResponse>().await?;
@@ -203,7 +196,8 @@ pub fn ensure_version(response: &Response) -> Result<bool> {
     // If the client is newer than the server
     if version.major < ATUIN_VERSION.major {
         println!(
-            "Atuin version mismatch! In order to successfully sync, the server needs to run a newer version of Atuin"
+            "Atuin version mismatch! In order to successfully sync, the server needs to run a \
+             newer version of Atuin"
         );
         println!("Client: {ATUIN_CARGO_VERSION}");
         println!("Server: {version}");
@@ -239,12 +233,14 @@ async fn handle_resp_error(resp: Response) -> Result<Response> {
             }
 
             bail!(
-                "There was an error with the atuin sync service at {url}, server error {status}: {reason}.\nIf the problem persists, contact the host"
+                "There was an error with the atuin sync service at {url}, server error {status}: \
+                 {reason}.\nIf the problem persists, contact the host"
             );
         }
 
         bail!(
-            "There was an error with the atuin sync service at {url}, Status {status:?}.\nResponse body: {body}\nIf the problem persists, contact the host"
+            "There was an error with the atuin sync service at {url}, Status \
+             {status:?}.\nResponse body: {body}\nIf the problem persists, contact the host"
         );
     }
 
@@ -260,20 +256,15 @@ pub fn caps_client(
     headers.insert(USER_AGENT, APP_USER_AGENT.parse()?);
     headers.insert(ATUIN_HEADER_VERSION, ATUIN_CARGO_VERSION.parse()?);
 
-    let http = client_builder(extra_headers)
-        .default_headers(headers)
-        .build()?;
+    let http = client_builder(extra_headers).default_headers(headers).build()?;
 
-    Ok(CapClient::new(
-        sync_addr.append_path("api/v0/capabilities")?,
-        http,
-    ))
+    Ok(CapClient::new(sync_addr.append_path("api/v0/capabilities")?, http))
 }
 
 impl Client {
     pub fn new(
         sync_addr: impl Into<Arc<Url>>,
-        auth: AuthToken,
+        auth: &AuthToken,
         connect_timeout: u64,
         timeout: u64,
         extra_headers: &HashMap<String, String>,
@@ -296,7 +287,7 @@ impl Client {
             .build()?
             .with_capabilities(caps.clone(), CapMismatch::Continue);
 
-        Ok(Client {
+        Ok(Self {
             sync_addr,
             client,
             lfs_client: reqwest::Client::builder()
@@ -374,9 +365,7 @@ impl Client {
     /// Confirm a packfile body upload with the server.
     async fn confirm_packfile(&self, manifest_id: RecordId) -> Result<()> {
         let path = format!("api/v0/packfiles/{}/confirm", manifest_id.0);
-        let url = self
-            .sync_addr
-            .append(path.split('/').filter(|s| !s.is_empty()))?;
+        let url = self.sync_addr.append(path.split('/').filter(|s| !s.is_empty()))?;
         let resp = self.client.post(url).send().await?;
         handle_resp_error(resp).await?;
         Ok(())
@@ -389,12 +378,7 @@ impl Client {
         packfile: impl Into<reqwest::Body>,
     ) -> Result<()> {
         // Not self.client: S3 rejects presigned requests that also carry an Authorization header.
-        let resp = self
-            .lfs_client
-            .put(upload_url.clone())
-            .body(packfile)
-            .send()
-            .await?;
+        let resp = self.lfs_client.put(upload_url.clone()).body(packfile).send().await?;
         handle_resp_error(resp).await?;
         Ok(())
     }
@@ -402,9 +386,7 @@ impl Client {
     async fn get_packfile_download_url(&self, manifest_id: RecordId) -> Result<Url> {
         // `append_path` takes `&'static str`; the manifest id is dynamic, so inline its logic.
         let path = format!("api/v0/packfiles/{}", manifest_id.0);
-        let url = self
-            .sync_addr
-            .append(path.split('/').filter(|s| !s.is_empty()))?;
+        let url = self.sync_addr.append(path.split('/').filter(|s| !s.is_empty()))?;
         let resp = self.client.get(url).send().await?;
         let resp = handle_resp_error(resp).await?;
 
@@ -506,8 +488,9 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rstest::*;
+
+    use super::*;
 
     #[fixture]
     fn extra_headers() -> HashMap<String, String> {
@@ -564,7 +547,8 @@ mod tests {
             serve_one(
                 &listener,
                 format!(
-                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/\r\nContent-Length: \
+                     0\r\nConnection: close\r\n\r\n",
                     port + 1
                 ),
             )
@@ -572,16 +556,9 @@ mod tests {
         });
 
         let client = client_builder(&extra_headers).build().unwrap();
-        let err = client
-            .get(format!("http://127.0.0.1:{port}/"))
-            .send()
-            .await
-            .unwrap_err();
+        let err = client.get(format!("http://127.0.0.1:{port}/")).send().await.unwrap_err();
 
-        assert!(
-            err.is_redirect(),
-            "expected a redirect policy error: {err:?}"
-        );
+        assert!(err.is_redirect(), "expected a redirect policy error: {err:?}");
     }
 
     #[rstest]
@@ -596,7 +573,8 @@ mod tests {
             serve_one(
                 &listener,
                 format!(
-                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/ok\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 302 Found\r\nLocation: \
+                     http://127.0.0.1:{port}/ok\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 ),
             )
             .await;
@@ -608,11 +586,7 @@ mod tests {
         });
 
         let client = client_builder(&extra_headers).build().unwrap();
-        let resp = client
-            .get(format!("http://127.0.0.1:{port}/"))
-            .send()
-            .await
-            .unwrap();
+        let resp = client.get(format!("http://127.0.0.1:{port}/")).send().await.unwrap();
 
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.url().path(), "/ok");
@@ -645,15 +619,9 @@ mod tests {
 
         let addr: Url = server.uri().parse().unwrap();
         let caps = caps_client(&addr, &HashMap::new()).unwrap();
-        let client = Client::new(
-            addr,
-            AuthToken::Token("t".into()),
-            30,
-            30,
-            &HashMap::new(),
-            caps,
-        )
-        .unwrap();
+        let client =
+            Client::new(addr, &AuthToken::Token("t".into()), 30, 30, &HashMap::new(), caps)
+                .unwrap();
 
         // The client observes the server's advertised packfile cap; a second read stays warm
         // (the mock expects a single capabilities fetch).
