@@ -338,6 +338,7 @@ mod tests {
             intent: None,
             deleted_at: None,
             shell: None,
+            author_kind: None,
         };
         let next = History {
             id: HistoryId::from("test2".to_string()),
@@ -353,6 +354,7 @@ mod tests {
             intent: None,
             deleted_at: None,
             shell: Some("bash".into()),
+            author_kind: None,
         };
         let prev = History {
             id: HistoryId::from("test3".to_string()),
@@ -368,6 +370,7 @@ mod tests {
             intent: None,
             deleted_at: None,
             shell: Some("nu".into()),
+            author_kind: None,
         };
         let stats = HistoryStats {
             next: Some(next),
