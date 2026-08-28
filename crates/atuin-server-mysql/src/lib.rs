@@ -1,4 +1,4 @@
-use std::str::FromStr;
+mod wrappers;
 
 use async_trait::async_trait;
 use atuin_common::db;
@@ -7,37 +7,51 @@ use atuin_domain::record::{
 };
 use atuin_server_database::models::{NewSession, NewUser, Session, User};
 use atuin_server_database::{Database, DbError, DbResult, DbSettings};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::types::Uuid;
+use sqlx::mysql::MySqlPoolOptions;
 use tracing::instrument;
+use uuid::Uuid;
 use wrappers::DbRecord;
 
-mod wrappers;
-
 #[derive(Clone)]
-pub struct Sqlite {
-    pool: sqlx::Pool<sqlx::sqlite::Sqlite>,
+pub struct MySql {
+    pool: sqlx::Pool<sqlx::mysql::MySql>,
+    /// Optional read replica pool for read-only queries
+    read_pool: Option<sqlx::Pool<sqlx::mysql::MySql>>,
+}
+
+impl MySql {
+    /// Returns the appropriate pool for read operations.
+    /// Uses read_pool if available, otherwise falls back to the primary pool.
+    fn read_pool(&self) -> &sqlx::Pool<sqlx::mysql::MySql> {
+        self.read_pool.as_ref().unwrap_or(&self.pool)
+    }
 }
 
 #[async_trait]
-impl Database for Sqlite {
+impl Database for MySql {
     async fn new(settings: &DbSettings) -> DbResult<Self> {
-        let opts = SqliteConnectOptions::from_str(&settings.db_uri)?
-            .journal_mode(SqliteJournalMode::Wal)
-            .create_if_missing(true);
-
-        let pool = SqlitePoolOptions::new().connect_with(opts).await?;
+        let pool =
+            MySqlPoolOptions::new().max_connections(100).connect_lazy(settings.db_uri.as_str())?;
 
         db::migrate!(&pool, "./migrations").await.map_err(|error| DbError::Other(error.into()))?;
 
-        Ok(Self { pool })
+        let read_pool = if let Some(read_db_uri) = &settings.read_db_uri {
+            tracing::info!("Connecting to read replica database");
+            let read_pool =
+                MySqlPoolOptions::new().max_connections(100).connect(read_db_uri.as_str()).await?;
+
+            Some(read_pool)
+        } else {
+            None
+        };
+        Ok(Self { pool, read_pool })
     }
 
     #[instrument(skip_all)]
     async fn get_session(&self, token: &str) -> DbResult<Session> {
-        db::query_as("select id, user_id, token from sessions where token = $1")
+        db::query_as("select id, user_id, token from sessions where token = ?")
             .bind(token)
-            .fetch_one(&self.pool)
+            .fetch_one(self.read_pool())
             .await
             .map_err(Into::into)
     }
@@ -48,10 +62,10 @@ impl Database for Sqlite {
             "select users.id, users.username, users.email, users.password from users
             inner join sessions
             on users.id = sessions.user_id
-            and sessions.token = $1",
+            and sessions.token = ?",
         )
         .bind(token)
-        .fetch_one(&self.pool)
+        .fetch_one(self.read_pool())
         .await
         .map_err(Into::into)
     }
@@ -63,7 +77,7 @@ impl Database for Sqlite {
         db::query(
             "insert into sessions
                 (user_id, token)
-            values($1, $2)",
+            values(?, ?)",
         )
         .bind(session.user_id)
         .bind(token)
@@ -75,18 +89,18 @@ impl Database for Sqlite {
 
     #[instrument(skip_all)]
     async fn get_user(&self, username: &str) -> DbResult<User> {
-        db::query_as("select id, username, email, password from users where username = $1")
+        db::query_as("select id, username, email, password from users where username = ?")
             .bind(username)
-            .fetch_one(&self.pool)
+            .fetch_one(self.read_pool())
             .await
             .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
     async fn get_user_session(&self, u: &User) -> DbResult<Session> {
-        db::query_as("select id, user_id, token from sessions where user_id = $1")
+        db::query_as("select id, user_id, token from sessions where user_id = ?")
             .bind(u.id)
-            .fetch_one(&self.pool)
+            .fetch_one(self.read_pool())
             .await
             .map_err(Into::into)
     }
@@ -97,30 +111,29 @@ impl Database for Sqlite {
         let username: &str = &user.username;
         let password: &str = &user.password;
 
-        let res: (i64,) = db::query_as(
+        let res = db::query(
             "insert into users
                 (username, email, password)
-            values($1, $2, $3)
-            returning id",
+            values(?, ?, ?)",
         )
         .bind(username)
         .bind(email)
         .bind(password)
-        .fetch_one(&self.pool)
+        .execute(&self.pool)
         .await?;
 
-        Ok(res.0)
+        Ok(res.last_insert_id() as i64)
     }
 
     #[instrument(skip_all)]
-    async fn update_user_password(&self, user: &User) -> DbResult<()> {
+    async fn update_user_password(&self, u: &User) -> DbResult<()> {
         db::query(
             "update users
-            set password = $1
-            where id = $2",
+            set password = ?
+            where id = ?",
         )
-        .bind(&user.password)
-        .bind(user.id)
+        .bind(&u.password)
+        .bind(u.id)
         .execute(&self.pool)
         .await?;
 
@@ -129,23 +142,20 @@ impl Database for Sqlite {
 
     #[instrument(skip_all)]
     async fn delete_user(&self, u: &User) -> DbResult<()> {
-        db::query("delete from sessions where user_id = $1").bind(u.id).execute(&self.pool).await?;
+        db::query("delete from sessions where user_id = ?").bind(u.id).execute(&self.pool).await?;
 
-        db::query("delete from users where id = $1").bind(u.id).execute(&self.pool).await?;
+        db::query("delete from history where user_id = ?").bind(u.id).execute(&self.pool).await?;
 
-        db::query("delete from history where user_id = $1").bind(u.id).execute(&self.pool).await?;
+        db::query("delete from store where user_id = ?").bind(u.id).execute(&self.pool).await?;
+
+        db::query("delete from users where id = ?").bind(u.id).execute(&self.pool).await?;
 
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn delete_store(&self, user: &User) -> DbResult<()> {
-        db::query(
-            "delete from store
-            where user_id = $1",
-        )
-        .bind(user.id)
-        .execute(&self.pool)
-        .await?;
+        db::query("delete from store where user_id = ?").bind(user.id).execute(&self.pool).await?;
 
         Ok(())
     }
@@ -160,8 +170,8 @@ impl Database for Sqlite {
             db::query(
                 "insert into store
                     (id, client_id, host, idx, timestamp, version, tag, data, cek, user_id)
-                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                on conflict do nothing
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                on duplicate key update id = id
                 ",
             )
             .bind(id)
@@ -196,19 +206,19 @@ impl Database for Sqlite {
 
         let records: Result<Vec<DbRecord>, DbError> = db::query_as(
             "select client_id, host, idx, timestamp, version, tag, data, cek from store
-                    where user_id = $1
-                    and tag = $2
-                    and host = $3
-                    and idx >= $4
+                    where user_id = ?
+                    and tag = ?
+                    and host = ?
+                    and idx >= ?
                     order by idx asc
-                    limit $5",
+                    limit ?",
         )
         .bind(user.id)
         .bind(series.tag.as_str())
         .bind(series.host_id)
         .bind(start as i64)
         .bind(count as i64)
-        .fetch_all(&self.pool)
+        .fetch_all(self.read_pool())
         .await
         .map_err(Into::into);
 
@@ -234,17 +244,24 @@ impl Database for Sqlite {
         Ok(ret)
     }
 
+    #[instrument(skip_all)]
     async fn status(&self, user: &User) -> DbResult<RecordStatus> {
         const STATUS_SQL: &str =
-            "select host, tag, max(idx) from store where user_id = $1 group by host, tag";
+            "select host, tag, max(idx) from store where user_id = ? group by host, tag";
 
-        let res: Vec<(Uuid, String, i64)> =
-            db::query_as(STATUS_SQL).bind(user.id).fetch_all(&self.pool).await?;
+        let mut res: Vec<(Vec<u8>, String, i64)> =
+            db::query_as(STATUS_SQL).bind(user.id).fetch_all(self.read_pool()).await?;
+
+        res.sort();
 
         let mut status = RecordStatus::new();
 
-        for i in res {
-            status.set_raw(RecordSeriesKey::new(HostId(i.0), RecordTag::from(i.1)), i.2 as u64);
+        for i in &res {
+            let host_uuid = Uuid::from_slice(&i.0).map_err(|e| DbError::Other(e.into()))?;
+            status.set_raw(
+                RecordSeriesKey::new(HostId(host_uuid), RecordTag::from(i.1.clone())),
+                i.2 as u64,
+            );
         }
 
         Ok(status)
