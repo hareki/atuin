@@ -285,7 +285,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "shlex 1.3.0",
+ "shlex",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.19",
@@ -693,9 +693,9 @@ dependencies = [
 
 [[package]]
 name = "atuin-vt100"
-version = "0.17.0"
+version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f1f37e21bb3cc6e1244deb0e7999c0a18da5e3e58caf92befc19ce53f6367e6"
+checksum = "5e1ab415760f579e398bed1931668a5a6866b5c1c7cf3718c889605534a76bab"
 dependencies = [
  "itoa",
  "unicode-width 0.2.2",
@@ -980,7 +980,7 @@ dependencies = [
  "find-msvc-tools",
  "jobserver",
  "libc",
- "shlex 2.0.1",
+ "shlex",
 ]
 
 [[package]]
@@ -5057,12 +5057,6 @@ checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
 dependencies = [
  "dirs",
 ]
-
-[[package]]
-name = "shlex"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shlex"
