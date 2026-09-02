@@ -4,6 +4,7 @@ use atuin_client::history::{History, HistoryStats};
 use atuin_client::settings::Settings;
 use atuin_common::string::EscapeNonPrintablePosixExt as _;
 use atuin_common::time::{DurationExt, UtcOffsetSpec};
+use easy_cast::Conv;
 use ratatui::Frame;
 use ratatui::backend::FromCrossterm;
 use ratatui::layout::Rect;
@@ -17,12 +18,11 @@ use super::super::theme::{Meaning, Theme};
 use super::block_ext::themed_block;
 use super::interactive::{Compactness, to_compactness};
 
-#[allow(clippy::cast_sign_loss)]
 fn u64_or_zero(num: i64) -> u64 {
     if num < 0 {
         0
     } else {
-        num as u64
+        u64::conv(num)
     }
 }
 
