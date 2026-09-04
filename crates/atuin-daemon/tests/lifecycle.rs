@@ -9,17 +9,19 @@ mod unix {
     use std::time::Duration;
 
     use atuin_client::database::Sqlite;
-    use atuin_client::history::HistoryId;
     use atuin_client::history::store::HistoryStore;
+    use atuin_client::history::{History, HistoryId};
     use atuin_client::record::sqlite_store::SqliteStore;
     use atuin_client::settings::{Settings, init_meta_config_for_testing};
     use atuin_daemon::client::HistoryClient;
     use atuin_daemon::grpc::HistoryService;
     use atuin_daemon::grpc::history::pb::history_server::HistoryServer;
+    use atuin_daemon::search::{IndexFilterMode, SearchIndex};
     use atuin_daemon::{Daemon, DaemonHandle, HistoryJournal, SearchComponent, SemanticComponent};
     use rstest::*;
     use tempfile::TempDir;
     use tokio::net::UnixListener;
+    use tokio::sync::RwLock;
     use tokio_stream::wrappers::UnixListenerStream;
     use tonic::transport::Server;
 
@@ -137,8 +139,6 @@ mod unix {
     #[rstest]
     #[tokio::test]
     async fn test_start_end_history(#[future] daemon: (HistoryClient, DaemonHandle, TempDir)) {
-        use atuin_client::history::History;
-
         let (mut client, _handle, _tmp) = daemon.await;
 
         let history = History::daemon()
@@ -167,8 +167,6 @@ mod unix {
     async fn end_history_without_duration_derives_from_start(
         #[future] daemon: (HistoryClient, DaemonHandle, TempDir),
     ) {
-        use atuin_client::history::History;
-
         let (mut client, _handle, _tmp) = daemon.await;
 
         let history: History = History::daemon()
@@ -202,7 +200,6 @@ mod unix {
     async fn test_tail_history_streams_started_and_ended_events(
         #[future] daemon: (HistoryClient, DaemonHandle, TempDir),
     ) {
-        use atuin_client::history::History;
         use atuin_daemon::grpc::history::pb::tail_history_reply::Event;
 
         let (mut client, _handle, _tmp) = daemon.await;
@@ -274,5 +271,154 @@ mod unix {
         // Subsequent calls should fail since the server is gone.
         let result = client.status().await;
         assert!(result.is_err());
+    }
+
+    fn history(cmd: &str) -> History {
+        // Sessions MUST be valid UUIDs or the index skips them.
+        History::daemon()
+            .timestamp(time::OffsetDateTime::now_utc())
+            .command(cmd.to_string())
+            .cwd("/tmp".to_string())
+            .session(uuid::Uuid::new_v4().to_string())
+            .cmd_origin(atuin_domain::record::CmdOrigin::try_from("test-host:test-user").unwrap())
+            .shell("bash")
+            .build()
+            .into()
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_delete_history_removes_entry(
+        #[future] daemon: (HistoryClient, DaemonHandle, TempDir),
+    ) {
+        let (mut client, _handle, _tmp) = daemon.await;
+
+        let start = client.start_history(history("echo delete-me")).await.unwrap();
+        let id: HistoryId = start.id.unwrap().try_into().unwrap();
+        client.end_history(id, Some(Duration::from_millis(1)), 0).await.unwrap();
+
+        let reply = client.delete_history(vec![id]).await.unwrap();
+        assert_eq!(reply.deleted, 1);
+        assert_eq!(reply.protocol, 2);
+
+        // Deleting an already-deleted id still succeeds (idempotent), counting the record write.
+        let reply = client.delete_history(vec![id]).await.unwrap();
+        assert_eq!(reply.deleted, 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_rebuild_history(#[future] daemon: (HistoryClient, DaemonHandle, TempDir)) {
+        let (mut client, _handle, _tmp) = daemon.await;
+
+        let start = client.start_history(history("echo before-rebuild")).await.unwrap();
+        let id: HistoryId = start.id.unwrap().try_into().unwrap();
+        client.end_history(id, Some(Duration::from_millis(1)), 0).await.unwrap();
+
+        let reply = client.rebuild_history().await.unwrap();
+        assert_eq!(reply.protocol, 2);
+
+        // The journal keeps working after a rebuild.
+        let start = client.start_history(history("echo after-rebuild")).await.unwrap();
+        let id: HistoryId = start.id.unwrap().try_into().unwrap();
+        client.end_history(id, Some(Duration::from_millis(1)), 0).await.unwrap();
+        assert_eq!(client.delete_history(vec![id]).await.unwrap().deleted, 1);
+    }
+
+    /// A journal over fresh databases in a temp dir, plus the history db and search index it
+    /// maintains.
+    #[fixture]
+    async fn journal() -> (HistoryJournal, Sqlite, Arc<RwLock<SearchIndex>>, TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("history.db");
+        let record_path = tmp.path().join("records.db");
+        let key_path = tmp.path().join("key");
+        let meta_path = tmp.path().join("meta.db");
+        init_meta_config_for_testing(meta_path.to_str().unwrap(), 5.0);
+
+        let settings: Settings = Settings::builder()
+            .unwrap()
+            .set_override("db_path", db_path.to_str().unwrap())
+            .unwrap()
+            .set_override("record_store_path", record_path.to_str().unwrap())
+            .unwrap()
+            .set_override("key_path", key_path.to_str().unwrap())
+            .unwrap()
+            .set_override("meta.db_path", meta_path.to_str().unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+
+        let history_db = Sqlite::new(&db_path, Duration::from_secs(5)).await.unwrap();
+        let store = SqliteStore::new(&record_path, Duration::from_secs(5)).await.unwrap();
+        let key =
+            atuin_common::encryption::paseto_v4::Key::try_load_or_generate(&key_path).unwrap();
+        let host_id = Settings::host_id().await.unwrap();
+        let caps = atuin_client::api_client::caps_client(&settings).unwrap();
+
+        let search_index = Arc::new(RwLock::new(SearchIndex::default()));
+        let history_store = HistoryStore::new(store, host_id, key);
+        let journal = HistoryJournal::new(
+            caps,
+            history_store,
+            history_db.clone(),
+            SemanticComponent::new(),
+            search_index.clone(),
+        );
+
+        (journal, history_db, search_index, tmp)
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn journal_delete_removes_entry_and_rebuilds_index(
+        #[future] journal: (HistoryJournal, Sqlite, Arc<RwLock<SearchIndex>>, TempDir),
+    ) {
+        let (journal, _history_db, search_index, _tmp) = journal.await;
+
+        let id_a = journal.start_cmd(history("delete_me"));
+        journal.finish(id_a, 0, Duration::from_millis(1)).await.unwrap();
+        let id_b = journal.start_cmd(history("keep_me"));
+        journal.finish(id_b, 0, Duration::from_millis(1)).await.unwrap();
+        assert_eq!(search_index.read().await.command_count(), 2);
+
+        let deleted =
+            journal.delete([id_a], &atuin_client::settings::Search::default()).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let index = search_index.read().await;
+        assert_eq!(index.command_count(), 1, "index should be rebuilt without the deleted command");
+        assert_eq!(index.search("delete_me", &IndexFilterMode::Global, 10).count(), 0);
+        assert_eq!(index.search("keep_me", &IndexFilterMode::Global, 10).count(), 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn journal_rebuild_reloads_index(
+        #[future] journal: (HistoryJournal, Sqlite, Arc<RwLock<SearchIndex>>, TempDir),
+    ) {
+        let (journal, history_db, search_index, _tmp) = journal.await;
+
+        let id_a = journal.start_cmd(history("first_cmd"));
+        journal.finish(id_a, 0, Duration::from_millis(1)).await.unwrap();
+        let id_b = journal.start_cmd(history("second_cmd"));
+        journal.finish(id_b, 0, Duration::from_millis(1)).await.unwrap();
+        assert_eq!(search_index.read().await.command_count(), 2);
+
+        // Wipe both the history db and the index; only the record store still holds the commands.
+        history_db.delete_rows([id_a, id_b]).await.unwrap();
+        assert_eq!(history_db.history_count(false).await.unwrap(), 0);
+        *search_index.write().await = SearchIndex::default();
+        assert_eq!(search_index.read().await.command_count(), 0);
+
+        journal.rebuild(&atuin_client::settings::Search::default()).await.unwrap();
+
+        assert_eq!(history_db.history_count(false).await.unwrap(), 2);
+        let index = search_index.read().await;
+        assert_eq!(index.command_count(), 2, "rebuild should repopulate the index from the store");
+        assert_eq!(index.search("first_cmd", &IndexFilterMode::Global, 10).count(), 1);
+        assert_eq!(index.search("second_cmd", &IndexFilterMode::Global, 10).count(), 1);
     }
 }

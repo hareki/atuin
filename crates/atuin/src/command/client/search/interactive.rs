@@ -1914,8 +1914,13 @@ pub async fn history(
 
                                 let entry = results.remove(index);
 
-                                let ids = history_store.delete_entries([entry]).await?;
-                                history_store.build_all(&db, &ids).await?;
+                                crate::command::client::history::delete_history_entries(
+                                    settings,
+                                    history_store,
+                                    &db,
+                                    [entry],
+                                )
+                                .await?;
 
                                 app.tab_index  = 0;
                             },
@@ -1938,8 +1943,13 @@ pub async fn history(
                                     )
                                 ).await?;
 
-                                let ids = history_store.delete_entries(all_matching).await?;
-                                history_store.build_all(&db, &ids).await?;
+                                crate::command::client::history::delete_history_entries(
+                                    settings,
+                                    history_store,
+                                    &db,
+                                    all_matching,
+                                )
+                                .await?;
 
                                 app.results_len = results.len();
                                 app.results_state = ListState::default();

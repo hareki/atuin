@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use atuin_client::history::{History, HistoryId};
 use atuin_common::time::OffsetDateTimeExt;
+use easy_cast::Cast;
 use futures::StreamExt;
 use time::OffsetDateTime;
 use tokio_stream::Stream;
@@ -15,7 +16,8 @@ use tracing::{Level, instrument};
 use crate::DaemonHandle;
 use crate::grpc::history::pb::history_server::History as GrpcService;
 use crate::grpc::history::pb::{
-    CancelHistoryReply, CancelHistoryRequest, EndHistoryReply, EndHistoryRequest, Lagged,
+    CancelHistoryReply, CancelHistoryRequest, DeleteHistoryReply, DeleteHistoryRequest,
+    EndHistoryReply, EndHistoryRequest, Lagged, RebuildHistoryReply, RebuildHistoryRequest,
     ShutdownReply, ShutdownRequest, StartHistoryReply, StartHistoryRequest, StatusReply,
     StatusRequest, TailHistoryEvent, TailHistoryReply, TailHistoryRequest,
 };
@@ -235,10 +237,8 @@ const DAEMON_PROTOCOL_VERSION: u32 = 2;
 #[derive(Clone)]
 pub struct Service {
     journal: Arc<HistoryJournal>,
-    /// TODO(markovejnovic): Revisit whether we need to hold this handle. At the moment, the only
-    /// reason why this exists is to be able to service the [`GrpcService::shutdown`] request, but
-    /// perhaps that function does not belong in the history service -- perhaps we should have a
-    /// Control service.
+    /// TODO(markovejnovic): Revisit whether we need to hold this handle. It exists only to service
+    /// the [`GrpcService::shutdown`] request.
     daemon_handle: DaemonHandle,
 }
 
@@ -310,6 +310,42 @@ impl GrpcService for Service {
 
         Ok(Response::new(CancelHistoryReply {
             // TODO(markovejnovic): Pull this from one constant, well-defined spot.
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol: DAEMON_PROTOCOL_VERSION,
+        }))
+    }
+
+    #[instrument(skip_all, level = Level::TRACE)]
+    async fn delete_history(
+        &self,
+        request: Request<DeleteHistoryRequest>,
+    ) -> Result<Response<DeleteHistoryReply>, Status> {
+        // We collect here to validate every id up front: `into_history_ids` yields an iterator of
+        // `Result`s, and [`HistoryJournal::delete`] needs validated, correct HistoryIds. Consuming
+        // the request (rather than borrowing + cloning each proto id) keeps this to a single
+        // allocation, and a malformed request deletes nothing.
+        let ids: Vec<HistoryId> =
+            request.into_inner().into_history_ids().collect::<Result<Vec<_>, _>>()?;
+
+        let search_settings = self.daemon_handle.settings().await.search.clone();
+        let deleted = self.journal.delete(ids, &search_settings).await?;
+
+        Ok(Response::new(DeleteHistoryReply {
+            deleted: deleted.cast(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol: DAEMON_PROTOCOL_VERSION,
+        }))
+    }
+
+    #[instrument(skip_all, level = Level::TRACE)]
+    async fn rebuild_history(
+        &self,
+        _request: Request<RebuildHistoryRequest>,
+    ) -> Result<Response<RebuildHistoryReply>, Status> {
+        let search_settings = self.daemon_handle.settings().await.search.clone();
+        self.journal.rebuild(&search_settings).await?;
+
+        Ok(Response::new(RebuildHistoryReply {
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol: DAEMON_PROTOCOL_VERSION,
         }))
