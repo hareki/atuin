@@ -37,6 +37,18 @@ impl OutputCapture {
         }
     }
 
+    /// A capture store whose every operation fails, standing in for a broken backend.
+    ///
+    /// Lets a test prove that a broken output store never sinks a primary operation (for example,
+    /// that deleting history still succeeds when its captured output cannot be removed).
+    #[cfg(test)]
+    #[must_use]
+    pub fn failing() -> Self {
+        Self {
+            backend: AnyBackend::Failing(backend::FailingBackend),
+        }
+    }
+
     #[must_use]
     pub fn kind(&self) -> BackendKind {
         BackendKind::from(&self.backend)
@@ -80,9 +92,9 @@ mod tests {
 
     fn cap(output: &str) -> CommandCapture {
         CommandCapture {
-            output: output.to_string(),
+            output_start: output.to_string(),
+            output_end: None,
             output_observed_bytes: u64::conv(output.len()),
-            output_truncated: false,
             terminal_width: 80,
             terminal_height: 24,
         }
@@ -94,7 +106,7 @@ mod tests {
         let store = OutputCapture::open(dir.path().join("capture"));
         assert_eq!(store.kind(), BackendKind::Fjall);
         store.capture(hid(1), cap("hello")).await.expect("capture");
-        assert_eq!(store.get(hid(1)).await.expect("get").expect("present").output, "hello");
+        assert_eq!(store.get(hid(1)).await.expect("get").expect("present").output_start, "hello");
     }
 
     #[tokio::test]
