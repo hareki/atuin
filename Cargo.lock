@@ -461,6 +461,7 @@ dependencies = [
  "pretty_assertions",
  "proptest",
  "prost",
+ "regex",
  "rmp",
  "rstest",
  "rustix",
@@ -517,6 +518,8 @@ dependencies = [
  "rand 0.8.7",
  "reqwest",
  "rstest",
+ "strum 0.27.2",
+ "strum_macros 0.28.0",
  "tempfile",
  "thiserror 2.0.19",
  "time",
@@ -632,9 +635,13 @@ dependencies = [
  "crossterm",
  "easy-cast",
  "eyre",
+ "parking_lot",
  "portable-pty",
  "rstest",
+ "rustix",
  "signal-hook",
+ "tempfile",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -4686,13 +4693,13 @@ dependencies = [
 
 [[package]]
 name = "rpassword"
-version = "7.4.0"
+version = "7.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66d4c8b64f049c6721ec8ccec37ddfc3d641c4a7fca57e8f2a89de509c73df39"
+checksum = "2da316a15f47e3d053de9cb2c439650bd8fa4aaeb9365f2e5f27f492ff73c196"
 dependencies = [
  "libc",
  "rtoolbox",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
