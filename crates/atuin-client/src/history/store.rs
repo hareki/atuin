@@ -97,7 +97,8 @@ impl HistoryRecord {
                 // written by write_bin above
                 let _ = decode::read_bin_len(&mut bytes).map_err(error_report)?;
 
-                let record = History::deserialize(bytes.remaining_slice(), version)?;
+                let record =
+                    History::deserialize(bytes.remaining_slice(), version).map_err(error_report)?;
 
                 Ok(Self::Create(record))
             }
@@ -247,12 +248,13 @@ impl HistoryStore {
 
             // A record we can't decrypt or decode must not block the rest of the store -
             // skip it, and load everything else.
-            let hist = match Version::from_name(version.as_str()) {
-                Some(_) => record.decrypt(&self.encryption_key).and_then(|decrypted| {
-                    HistoryRecord::deserialize(&decrypted.data, version.as_str())
-                }),
-                None => Err(eyre!("unknown history version {version:?}")),
-            };
+            let hist =
+                match Version::from_name(version.as_str()) {
+                    Some(_) => record.decrypt(&self.encryption_key).map_err(Into::into).and_then(
+                        |decrypted| HistoryRecord::deserialize(&decrypted.data, version.as_str()),
+                    ),
+                    None => Err(eyre!("unknown history version {version:?}")),
+                };
 
             match hist {
                 Ok(hist) => ret.push(hist),
@@ -383,9 +385,11 @@ impl HistoryStore {
 
         // Skip records we can't decrypt or decode, rather than failing the entire build.
         let record = match Version::from_name(version.as_str()) {
-            Some(_) => record.decrypt(&self.encryption_key).and_then(|decrypted| {
-                HistoryRecord::deserialize(&decrypted.data, version.as_str())
-            }),
+            Some(_) => {
+                record.decrypt(&self.encryption_key).map_err(Into::into).and_then(|decrypted| {
+                    HistoryRecord::deserialize(&decrypted.data, version.as_str())
+                })
+            }
             None => Err(eyre!("unknown history version {version:?}")),
         };
 

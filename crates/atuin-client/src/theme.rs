@@ -95,10 +95,12 @@ impl Theme {
         self.get_alert(tracing::Level::ERROR)
     }
 
+    #[must_use]
     pub fn get_border(&self) -> ContentStyle {
         self.as_style(Meaning::Border)
     }
 
+    #[must_use]
     pub fn get_selection(&self) -> ContentStyle {
         self.as_style(Meaning::Selection)
     }

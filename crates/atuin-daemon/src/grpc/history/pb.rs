@@ -307,10 +307,6 @@ impl RegisterCommandOutputRequest {
     }
 
     /// The capture to store, rejected unless it carries its [`CommandCaptureMeta`].
-    ///
-    /// `meta` is logically required, and nothing downstream can tell an omitted one from an
-    /// all-defaults one: a capture stored without it reads back as `output_truncated = false`, so
-    /// truncated output would be presented as complete. Reject it at the edge instead.
     pub fn capture(&self) -> Result<CommandCapture, RegisterCommandOutputRequestParseError> {
         let capture =
             self.capture.clone().ok_or(RegisterCommandOutputRequestParseError::MissingCapture)?;
@@ -440,15 +436,14 @@ impl GetCommandOutputResponse {
 
         Self {
             chunks,
-            total_bytes: u64::try_from(
-                capture
-                    .output_start
-                    .len()
-                    .saturating_add(capture.output_end.as_ref().map_or_default(|end| end.len())),
-            )
+            total_bytes: u64::try_from(capture.output_start.len().saturating_add(
+                capture.output_end.as_ref().map(|end| end.len()).unwrap_or_default(),
+            ))
             .unwrap_or(u64::MAX),
             total_lines: u64::try_from(
-                lines_start.len().saturating_add(lines_end.map_or_default(|lines| lines.len())),
+                lines_start
+                    .len()
+                    .saturating_add(lines_end.map(|lines| lines.len()).unwrap_or_default()),
             )
             .unwrap_or(u64::MAX),
             truncated,

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand, ValueEnum};
 
-use crate::{CommandCaptureSink, runtime};
+use crate::{CaptureConfig, runtime};
 
 #[derive(Args, Debug)]
 pub struct PtyProxy {
@@ -49,7 +49,7 @@ pub enum Shell {
 pub struct RuntimeOptions {
     pub(crate) debug_osc133: bool,
     pub(crate) shell: Option<PathBuf>,
-    pub(crate) command_capture_sink: Option<CommandCaptureSink>,
+    pub(crate) command_capture: Option<CaptureConfig>,
     pub(crate) child_umask: Option<u32>,
 }
 
@@ -57,13 +57,13 @@ impl RuntimeOptions {
     fn new(
         debug_osc133: bool,
         shell: Option<PathBuf>,
-        command_capture_sink: Option<CommandCaptureSink>,
+        command_capture: Option<CaptureConfig>,
         child_umask: Option<u32>,
     ) -> Self {
         Self {
             debug_osc133: debug_osc133 || env_flag("ATUIN_PTY_PROXY_DEBUG"),
             shell,
-            command_capture_sink,
+            command_capture,
             child_umask,
         }
     }
@@ -73,7 +73,7 @@ impl PtyProxy {
     /// `child_umask` is the umask to restore in the spawned shell. Atuin sets
     /// a restrictive process-wide umask early in startup, which the shell
     /// would otherwise inherit (#3695).
-    pub fn run(self, command_capture_sink: Option<CommandCaptureSink>, child_umask: Option<u32>) {
+    pub fn run(self, command_capture: Option<CaptureConfig>, child_umask: Option<u32>) {
         if self.cmd.is_some() && self.shell.is_some() {
             eprintln!("atuin pty-proxy: --shell only applies when no subcommand is given");
             std::process::exit(2);
@@ -88,7 +88,7 @@ impl PtyProxy {
             None => runtime::main(RuntimeOptions::new(
                 self.debug_osc133,
                 self.shell,
-                command_capture_sink,
+                command_capture,
                 child_umask,
             )),
         }
@@ -185,9 +185,12 @@ then
     # Prefer ZSH_ARGZERO (zsh 5.3+) -- it preserves the path zsh was
     # invoked with -- and fall back to PATH lookup otherwise. Login shells
     # set argv[0] to "-zsh", and ZSH_ARGZERO keeps that leading dash, so
-    # strip it (${var#-}) before passing it along.
+    # strip it (${var#-}) before passing it along. ZSH_ARGZERO may also be
+    # a bare command name ("zsh") rather than a path; the :c modifier
+    # resolves that to an absolute path via $PATH, leaves an absolute path
+    # unchanged, and leaves an unresolvable name as-is.
     _atuin_pty_proxy_zsh="${ZSH_ARGZERO:-$(command -v zsh)}"
-    exec atuin pty-proxy --shell "${_atuin_pty_proxy_zsh#-}"
+    exec atuin pty-proxy --shell "${${_atuin_pty_proxy_zsh#-}:c}"
   else
     exec atuin pty-proxy
   fi
@@ -293,10 +296,11 @@ mod tests {
     fn init_scripts_forward_shell_path() {
         let posix = init_script(Shell::Bash);
         assert!(posix.contains(r#"exec atuin pty-proxy --shell "$BASH""#));
-        // zsh: capture ZSH_ARGZERO (with PATH fallback), then strip the
-        // leading dash present on login shells before forwarding the path.
+        // zsh: capture ZSH_ARGZERO (with PATH fallback), strip the leading
+        // dash present on login shells, then resolve a bare command name to
+        // an absolute path with the :c modifier before forwarding it.
         assert!(posix.contains(r#"_atuin_pty_proxy_zsh="${ZSH_ARGZERO:-$(command -v zsh)}""#));
-        assert!(posix.contains(r#"exec atuin pty-proxy --shell "${_atuin_pty_proxy_zsh#-}""#));
+        assert!(posix.contains(r#"exec atuin pty-proxy --shell "${${_atuin_pty_proxy_zsh#-}:c}""#));
 
         let fish = init_script(Shell::Fish);
         assert!(fish.contains("exec atuin pty-proxy --shell (status fish-path)"));
