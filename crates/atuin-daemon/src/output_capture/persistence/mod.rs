@@ -1,8 +1,6 @@
 mod blob;
 mod index;
 
-use std::num::NonZeroUsize;
-
 use atuin_client::history::{CommandCapture, HistoryId};
 use atuin_common::futures::stream::{ChunkedStream, EitherOrBoth, try_merge_join};
 #[cfg(test)]
@@ -11,13 +9,11 @@ pub use blob::{
     AnyBlobStore, BlobStore, CaptureError, DeleteOutputError, FjallBlobStore, GetOutputError,
     NopBlobStore,
 };
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 #[cfg(test)]
 pub use index::FailingIndex;
-pub use index::{AnyIndex, Index, IndexError, NopIndex, SqliteIndex};
+pub use index::{AnyIndex, Index, IndexError, NopIndex, OutputMatch, RankedMatch, SqliteIndex};
 use tracing::warn;
-
-use super::OutputMatch;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
@@ -71,32 +67,42 @@ impl OutputStore {
         query: &str,
         limit: usize,
     ) -> ChunkedStream<Result<OutputMatch, IndexError>> {
-        let ranked = self.index.search(query, limit).await;
-        let hits: Vec<OutputMatch> = match ranked.try_collect().await {
-            Ok(hits) => hits,
-            Err(err) => return ChunkedStream::from_error(err),
-        };
+        // Only the ranking (history_id + score) comes from the contentless index; it is small, so
+        // collecting it keeps error handling simple. The bodies -- each up to `max_output_size` --
+        // are the memory risk, so they are hydrated lazily from the blob as `highlight` pulls its
+        // batches, and the caller dropping the stream stops that work early.
+        let ranked: Vec<RankedMatch> =
+            match self.index.search(query, limit).await.try_collect().await {
+                Ok(ranked) => ranked,
+                Err(err) => return ChunkedStream::from_error(err),
+            };
 
+        let blob = self.blob.clone();
         // The index is derived and can briefly hold entries whose blob was deleted -- a
         // capture/remove race, a swallowed index write, or reconcile lag. The blob is
-        // authoritative, so never surface a hit whose capture is gone. (This can return fewer
-        // than `limit` hits even when more live matches exist further down the ranking.)
-        let mut live = Vec::with_capacity(hits.len());
-        for hit in hits {
-            match self.blob.contains(hit.history_id).await {
-                Ok(true) => live.push(Ok(hit)),
-                Ok(false) => {} // the capture is gone; drop the stale index hit
-                // A transient existence check hides only this hit, not the whole search.
-                Err(err) => warn!(
-                    ?err,
-                    id = %hit.history_id,
-                    "failed to confirm a search hit's capture; dropping it",
-                ),
+        // authoritative: a hit is highlighted from its stored capture, and one whose capture is
+        // gone is dropped. (This can yield fewer than `limit` hits even when more live matches
+        // exist further down the ranking.)
+        let bodies = stream::iter(ranked).filter_map(move |hit| {
+            let blob = blob.clone();
+            async move {
+                match blob.get(hit.history_id).await {
+                    Ok(Some(capture)) => Some((hit, capture.plaintext())),
+                    Ok(None) => None, // the capture is gone; drop the stale index hit
+                    // A transient read failure hides only this hit, not the whole search.
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            id = %hit.history_id,
+                            "failed to read a search hit's capture; dropping it",
+                        );
+                        None
+                    }
+                }
             }
-        }
+        });
 
-        const CHUNK: NonZeroUsize = NonZeroUsize::new(512).unwrap();
-        ChunkedStream::from_items(live, CHUNK)
+        self.index.highlight(query, bodies).await
     }
 
     pub fn estimated_disk_space(&self) -> u64 {
