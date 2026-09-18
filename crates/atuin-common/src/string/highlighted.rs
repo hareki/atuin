@@ -109,6 +109,7 @@ impl TextHighlighter {
 ///
 /// `Display` implementations come in the form of [`Self::display_plain`], [`Self::display_subs`]
 /// and [`Self::display_raw`].
+#[derive(Clone, Copy)]
 pub struct HighlightedText<S> {
     data: S,
     highlighter: TextHighlighter,
@@ -127,6 +128,14 @@ impl<S> HighlightedText<S> {
 
     pub fn markers(&self) -> [char; 2] {
         self.highlighter.markers()
+    }
+
+    /// Swap the underlying string type, keeping the highlighter (e.g. `line.map(str::to_owned)`).
+    pub fn map<T>(self, f: impl FnOnce(S) -> T) -> HighlightedText<T> {
+        HighlightedText {
+            data: f(self.data),
+            highlighter: self.highlighter,
+        }
     }
 }
 
@@ -174,6 +183,45 @@ impl<S: AsRef<str>> HighlightedText<S> {
         }
     }
 
+    /// Whether any highlighted span is present.
+    pub fn has_match(&self) -> bool {
+        self.ranges().next().is_some()
+    }
+
+    /// Each line as its own highlighted text. A match never spans a newline, so every span stays
+    /// within one line.
+    pub fn lines(&self) -> impl Iterator<Item = HighlightedText<&str>> + '_ {
+        self.data.as_ref().lines().map(|line| self.highlighter.as_highlighted(line))
+    }
+
+    /// The marker-free text together with the byte range of every match within *that* text --
+    /// unlike [`Self::ranges`], whose offsets index the raw, marker-bearing string.
+    pub fn to_plain(&self) -> Plain<'_> {
+        let raw = self.data.as_ref();
+        if !raw.contains(self.highlighter.markers()) {
+            return Plain {
+                text: Cow::Borrowed(raw),
+                ranges: Vec::new(),
+            };
+        }
+        let (text, ranges) =
+            self.pieces().fold((String::new(), Vec::new()), |(mut plain, mut ranges), piece| {
+                let start = plain.len();
+                match piece {
+                    Piece::Text(text) => plain.push_str(text),
+                    Piece::Match(text) => {
+                        plain.push_str(text);
+                        ranges.push(start..plain.len());
+                    }
+                }
+                (plain, ranges)
+            });
+        Plain {
+            text: Cow::Owned(text),
+            ranges,
+        }
+    }
+
     /// `Display` the highlighted text, stripping away the highlight markers.
     pub fn display_plain(&self) -> impl fmt::Display + '_ {
         DisplayPlain(self)
@@ -188,6 +236,15 @@ impl<S: AsRef<str>> HighlightedText<S> {
     pub fn display_raw(&self) -> impl fmt::Display + '_ {
         DisplayRaw(self)
     }
+}
+
+/// The marker-free view of a [`HighlightedText`], from [`HighlightedText::to_plain`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plain<'a> {
+    /// Borrowed from the source when it holds no markers.
+    pub text: Cow<'a, str>,
+    /// Byte ranges of the matches within `text`.
+    pub ranges: Vec<Range<usize>>,
 }
 
 /// One marker-free chunk of a [`HighlightedText`], produced by [`HighlightedText::pieces`].
@@ -345,7 +402,7 @@ mod proto {
 
     use super::{HighlightedString, HighlightedText, NewTextHighlighterError, TextHighlighter};
 
-    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    #[derive(Clone, PartialEq, Eq, Hash, prost::Message)]
     pub struct HighlightedTextProto {
         #[prost(uint32, tag = "1")]
         pub open: u32,
@@ -540,6 +597,26 @@ mod tests {
         assert_eq!(out, expected);
     }
 
+    #[rstest]
+    #[case::clean("clean text", "clean text", vec![])]
+    #[case::span_between_text("the «build» failed", "the build failed", vec![4..9])]
+    #[case::back_to_back("«a»«b»", "ab", vec![0..1, 1..2])]
+    #[case::multibyte_before_span("héllo «wörld»", "héllo wörld", vec![7..13])]
+    fn to_plain_indexes_the_plain_text(
+        #[case] body: &str,
+        #[case] plain: &str,
+        #[case] ranges: Vec<Range<usize>>,
+    ) {
+        let hl = highlighter().as_highlighted(body);
+        let got = hl.to_plain();
+        assert_eq!(got.text, plain);
+        assert_eq!(got.ranges, ranges);
+        assert_eq!(matches!(got.text, Cow::Borrowed(_)), ranges.is_empty());
+        for r in got.ranges {
+            assert!(got.text.is_char_boundary(r.start) && got.text.is_char_boundary(r.end));
+        }
+    }
+
     #[test]
     fn display_raw_is_verbatim() {
         let body = "«a«b»";
@@ -565,6 +642,20 @@ mod tests {
                 Piece::Match(m) => (true, m),
             })
             .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[rstest]
+    #[case::single("a «b»", vec![("a b", true)])]
+    #[case::mixed("x\n«hit» here\ny\n", vec![("x", false), ("hit here", true), ("y", false)])]
+    #[case::blank_lines("\n\n«a»", vec![("", false), ("", false), ("a", true)])]
+    #[case::empty("", vec![])]
+    fn lines_keep_each_lines_own_markers(#[case] body: &str, #[case] expected: Vec<(&str, bool)>) {
+        let hl = highlighter().as_highlighted(body);
+        let got: Vec<(String, bool)> =
+            hl.lines().map(|l| (l.display_plain().to_string(), l.has_match())).collect();
+        let expected: Vec<(String, bool)> =
+            expected.into_iter().map(|(t, m)| (t.to_owned(), m)).collect();
         assert_eq!(got, expected);
     }
 

@@ -323,7 +323,9 @@ impl DrawState<'_> {
                     .and_then(|b| syntax.get(b))
                     .map_or(style, |&meaning| self.theme.as_style(meaning))
             };
-            self.draw(&ch.to_string(), Style::from_crossterm(char_style));
+
+            let mut ch_buf = [0u8; 4];
+            self.draw(ch.encode_utf8(&mut ch_buf), Style::from_crossterm(char_style));
         }
     }
 
