@@ -228,6 +228,8 @@ This repository is a flake, and can be installed using `nix profile`:
 nix profile install "github:atuinsh/atuin"
 ```
 
+Linux builds of `main` are cached on [Cachix](https://atuin.cachix.org). Run `cachix use atuin` first to download them instead of building from source.
+
 Atuin is available in the Arch Linux [extra repository](https://archlinux.org/packages/extra/x86_64/atuin/):
 
 ```
@@ -599,7 +601,7 @@ Pressing this key combination again will return to the initial context. You can 
 
 Atuin uses shell hooks to capture your command history. This page explains how the integration works, and why Atuin might not record commands in certain environments.
 
-To keep specific commands *out* of your history on purpose, see [Excluding Commands from History](https://docs.atuin.sh/guide/excluding-commands/index.md).
+To keep specific commands *out* of your history on purpose, see [Keeping Secrets Out of Atuin](https://docs.atuin.sh/guide/excluding-commands/index.md).
 
 ## How Atuin's Shell Integration Works
 
@@ -910,13 +912,26 @@ hooks.PostToolUseFailure: already installed, skipping
 
 For opencode and pi, reinstalling will also skip if the installed extension already matches the bundled version.
 
-# Excluding Commands from History
+# Keeping Secrets Out of Atuin
 
-Sometimes you don't want a command in your history and Atuin gives you four ways to exclude the commands.
+Atuin records your commands, and can also record [what they print](https://docs.atuin.sh/guide/output-capture/index.md) and your [AI agents' sessions](https://docs.atuin.sh/ai/sessions/index.md). This page covers how to keep secrets, and anything else you don't want stored, out of all three.
 
-## Prefix with a space
+| You want to keep out                       | Use                                                    |
+| ------------------------------------------ | ------------------------------------------------------ |
+| One command, just this once                | [A leading space](#one-command-with-a-leading-space)   |
+| Commands matching a pattern                | [`history_filter`](#commands-history_filter)           |
+| Everything run in a directory              | [`cwd_filter`](#a-directory-cwd_filter)                |
+| What a command prints, but not the command | [`command_filter`](#a-commands-output-command_filter)  |
+| The contents of a file, read or written    | [`sensitive_files`](#a-files-contents-sensitive_files) |
+| A secret of your own, wherever it appears  | [`redact_patterns`](#your-own-secrets-redact_patterns) |
+| What your AI agents' tools read and run    | [`capture_tools`](#ai-agents-tool-calls-capture_tools) |
+| Everything from a particular tool          | [Skip Atuin for it](#everything-from-a-tool)           |
 
-Most shells support "ignorespace": a command typed with a leading space isn't saved to history. Atuin honors this convention, and it's the quickest way to keep a single command out.
+Atuin already keeps a lot out without any setup; see [what's kept out by default](#whats-kept-out-by-default). Filters apply to what Atuin records from then on; to remove what it already has, see [cleaning up](#cleaning-up-what-you-already-recorded).
+
+## One command, with a leading space
+
+Most shells support "ignorespace": a command typed with a leading space isn't saved to history. Atuin honors this convention, and it's the quickest way to keep a single command out. Its output isn't captured either.
 
 ```
  echo "this won't be saved"  # note the leading space
@@ -926,9 +941,9 @@ Bash with bash-preexec
 
 When using bash-preexec (not ble.sh), there's a known issue where ignorespace isn't fully honored. The command won't appear in Atuin, but may still appear in your bash history. See [installation](https://docs.atuin.sh/guide/installation/index.md) for details.
 
-## Filter by command: `history_filter`
+## Commands: `history_filter`
 
-[`history_filter`](https://docs.atuin.sh/configuration/config/#history_filter) excludes any command matching a regular expression:
+[`history_filter`](https://docs.atuin.sh/configuration/config/#history_filter) keeps any command matching a regular expression out of your history:
 
 ```
 history_filter = [
@@ -940,9 +955,11 @@ history_filter = [
 
 Patterns are unanchored, so `secret` matches anywhere in the command. Use `^` and `$` when you want to match the whole command exactly.
 
-## Filter by directory: `cwd_filter`
+A filtered command's output isn't captured. When an AI agent runs a matching command, its session keeps only the name of the tool it used, not the command or what it printed.
 
-[`cwd_filter`](https://docs.atuin.sh/configuration/config/#cwd_filter) excludes every command run from a matching directory:
+## A directory: `cwd_filter`
+
+[`cwd_filter`](https://docs.atuin.sh/configuration/config/#cwd_filter) keeps out every command run from a matching directory:
 
 ```
 cwd_filter = [
@@ -954,22 +971,67 @@ cwd_filter = [
 
 These patterns are unanchored regular expressions too, matched against the working directory path.
 
-## Keep the command, drop its output: `command_filter`
+Nothing run there has its output captured. An AI agent working in a matching directory has every tool call there kept as the tool's name only.
 
-With [output capture](https://docs.atuin.sh/guide/output-capture/index.md) on, both filters above also keep a command's output out of the store. To record a command in your history but never store what it prints, use [`command_filter`](https://docs.atuin.sh/configuration/config/#command_filter) in `[output]`:
+## A command's output: `command_filter`
+
+To keep a command in your history but never store what it prints, use [`command_filter`](https://docs.atuin.sh/configuration/config/#command_filter) in `[output]`:
 
 ```
 [output]
-enabled = true
 command_filter = [
-    "^cat ",              # file contents, like `cat .env`
-    "^kubectl get secret",
+    "^terraform plan",
+    "^psql ",
 ]
 ```
 
 Patterns work like `history_filter`'s: unanchored regular expressions matched against the command.
 
-## Skip Atuin entirely for a tool
+The filter applies to your AI agents' commands too, even if you don't capture your own output: a matching command is kept in the session, but what it printed isn't.
+
+## A file's contents: `sensitive_files`
+
+Some files hold nothing but credentials: `.env` files, SSH keys, cloud logins. Atuin knows the common ones (see [`sensitive_files`](https://docs.atuin.sh/configuration/config/#sensitive_files) for the list) and keeps their contents out:
+
+- the output of a command that names one, such as `cat .env` or `cat ~/.aws/credentials`
+- what an AI agent reads from one
+- what an AI agent writes to one, whether with its edit tool or a command like `echo KEY=value > .env`. The session keeps that the agent changed the file, not what it wrote.
+
+Add your own by name or by path:
+
+```
+[security]
+sensitive_files = [
+    "*.secret",                 # any file with this name, anywhere
+    "~/work/credentials/**",    # everything under this directory
+    "config/master.key",        # this path within any project
+]
+```
+
+## Your own secrets: `redact_patterns`
+
+Atuin replaces the credentials it recognises with `****` in captured output and AI sessions. If you have secrets in a format it doesn't know, such as internal tokens, give it their pattern:
+
+```
+[security]
+redact_patterns = [
+    "ACME-[0-9A-F]{32}",                    # replace the whole match
+    "internal-api-key: (?<secret>\\S+)",    # replace only the `secret` group
+]
+```
+
+Redaction replaces the value and keeps the text around it. To keep a whole command out instead, use [`history_filter`](#commands-history_filter).
+
+## AI agents' tool calls: `capture_tools`
+
+When Atuin [captures your AI agents' sessions](https://docs.atuin.sh/ai/sessions/index.md), it keeps their tool calls with what each was given and what it returned, after applying everything on this page. To keep only the name of each tool the agent called, turn that off:
+
+```
+[ai]
+capture_tools = false
+```
+
+## Everything from a tool
 
 If a tool spawns interactive shells and you'd rather it recorded nothing at all, guard the `atuin init` call in your shell config:
 
@@ -984,11 +1046,23 @@ Then configure the tool to set `MY_TOOL_SESSION=1` when it spawns a shell. See t
 
 Commands from AI agents
 
-You don't need to exclude AI agent commands to keep them out of your way. Atuin tags them with the agent that ran them and hides them from interactive search by default — see [AI Agent Hooks](https://docs.atuin.sh/guide/agent-hooks/index.md).
+You don't need to exclude AI agent commands to keep them out of your way. Atuin tags them with the agent that ran them and hides them from interactive search by default; see [AI Agent Hooks](https://docs.atuin.sh/guide/agent-hooks/index.md).
 
-## Cleaning up commands you already recorded
+## What's kept out by default
 
-Filters only apply going forward. To remove entries recorded *before* you added a filter, run [`atuin history prune`](https://docs.atuin.sh/reference/prune/index.md):
+Without any of the settings above, Atuin:
+
+- **doesn't record commands containing a credential** it recognises, such as AWS, GitHub, OpenAI or Anthropic keys, while [`secrets_filter`](https://docs.atuin.sh/configuration/config/#secrets_filter) is on (the default). It also leaves those commands out of AI sessions.
+- **redacts credentials in captured output and AI sessions**, replacing them with `****`: the same formats, plus private keys, passwords in connection strings, and values assigned to names like `DB_PASSWORD` or `api_key`.
+- **never stores the output of commands that print a credential**: Atuin's own `atuin key` and `atuin login`, and others such as `gh auth token`, `aws configure get`, `kubectl get secret` and `printenv`. See [`command_filter`](https://docs.atuin.sh/configuration/config/#command_filter) for the list.
+- **keeps the contents of credential files out**, as described under [`sensitive_files`](#a-files-contents-sensitive_files).
+- **doesn't store output it can't redact quickly**, rather than slow your shell down.
+
+Recognising credentials is best-effort: it only knows common formats. For anything it might miss, use the settings above.
+
+## Cleaning up what you already recorded
+
+Filters only apply going forward. To remove history entries recorded *before* you added a filter, run [`atuin history prune`](https://docs.atuin.sh/reference/prune/index.md):
 
 ```
 # See what would be removed
@@ -1000,9 +1074,7 @@ atuin history prune
 
 This deletes existing entries matching your current `history_filter` and `cwd_filter`. For deleting entries that don't match a filter, see [Deleting History](https://docs.atuin.sh/guide/delete-history/index.md).
 
-## Secrets are filtered automatically
-
-Independently of your own filters, Atuin refuses to record commands that look like they contain credentials — AWS keys, GitHub and npm tokens, Slack webhooks, Stripe keys, and more. This is on by default. For the full list, see [`secrets_filter`](https://docs.atuin.sh/configuration/config/#secrets_filter).
+AI sessions and captured output already stored keep what they had. Changes to these settings apply to AI sessions once the daemon restarts.
 
 # Capturing Command Output
 
@@ -1062,14 +1134,15 @@ Some output is never stored:
 - **Full-screen programs** such as `vim`, `less`, and `htop`. Anything drawn on the terminal's alternate screen is skipped.
 - **Commands Atuin doesn't record.** Output belongs to a history entry, so a command typed with a leading space, one excluded by [`history_filter`](https://docs.atuin.sh/configuration/config/#history_filter) or [`cwd_filter`](https://docs.atuin.sh/configuration/config/#cwd_filter), or a failing command with [`store_failed = false`](https://docs.atuin.sh/configuration/config/#store_failed) has none.
 - **Commands in [`command_filter`](https://docs.atuin.sh/configuration/config/#command_filter).** These stay in your history; only their output is dropped.
-- **Atuin's own credential commands**: `atuin key`, `atuin login`, `atuin register`, and `atuin account change-password`.
+- **Commands whose output can hold a credential**: Atuin's own `atuin key`, `atuin login`, `atuin register` and `atuin account change-password`, and other tools' commands that print a token, a password or the environment, such as `gh auth token`, `aws configure get`, `kubectl get secret`, `vault kv get`, `op read` and `printenv`. See [`command_filter`](https://docs.atuin.sh/configuration/config/#command_filter) for the list.
+- **Commands that name a file holding credentials**, such as `cat .env` or `cat ~/.aws/credentials`. See [`sensitive_files`](https://docs.atuin.sh/configuration/config/#sensitive_files).
 
 When a command prints more than [`max_output_size`](https://docs.atuin.sh/configuration/config/#max_output_size) (1MB by default), Atuin keeps the start and the end, half each, and drops the middle, recording that it's missing.
 
 ## Privacy
 
-- Recognised credentials in the output (API keys, tokens, and the like) are replaced with `****` before storage, while [`secrets_filter`](https://docs.atuin.sh/configuration/config/#secrets_filter) is on (the default). This is best-effort: it only knows common formats, and misses a credential that colour codes split apart.
-- For a command that prints secrets, don't rely on redaction: add it to [`command_filter`](https://docs.atuin.sh/configuration/config/#command_filter) to keep it in your history but never store its output. See [Excluding commands](https://docs.atuin.sh/guide/excluding-commands/#keep-the-command-drop-its-output-command_filter).
+- Recognised credentials in the output (API keys, tokens, private keys, passwords in URLs and connection strings, values assigned to names like `DB_PASSWORD`) are replaced with `****` before storage, while [`secrets_filter`](https://docs.atuin.sh/configuration/config/#secrets_filter) is on (the default). Add patterns of your own with [`redact_patterns`](https://docs.atuin.sh/configuration/config/#redact_patterns). This is best-effort: it only knows common formats, and misses a credential that colour codes split apart. Output that can't be redacted quickly isn't stored.
+- For a command that prints secrets, don't rely on redaction: add it to [`command_filter`](https://docs.atuin.sh/configuration/config/#command_filter) to keep it in your history but never store its output. See [Keeping secrets out](https://docs.atuin.sh/guide/excluding-commands/#a-commands-output-command_filter).
 - Captured output stays on your machine. **It isn't synced**, even with [sync](https://docs.atuin.sh/guide/sync/index.md) set up. We're actively working on supporting this.
 - Atuin AI only sends output to the LLM when it asks for a specific command's output, and asks your permission first by default. See [Reading Command Output](https://docs.atuin.sh/ai/command-output/#permissions).
 
@@ -1727,7 +1800,7 @@ history_filter = [
 ]
 ```
 
-A filtered command's output isn't captured either. To keep a command in history but not its output, use [`command_filter`](#command_filter) in `[output]`.
+A filtered command's output isn't captured either. To keep a command in history but not its output, use [`command_filter`](#command_filter) in `[output]`. The filter applies to the commands your AI agents run too: a matching call is [captured](https://docs.atuin.sh/ai/sessions/#whats-captured) with its tool's name only.
 
 ### `cwd_filter`
 
@@ -1744,6 +1817,8 @@ This supports regular expressions, so you can hide pretty much whatever you want
 ```
 
 After updating that parameter, you can run [the prune command](https://docs.atuin.sh/reference/prune/index.md) to remove old history entries that match the new filters.
+
+An [AI session](https://docs.atuin.sh/ai/sessions/#whats-captured) captured in a matching directory keeps only the names of the tools its agent called there.
 
 ### `store_failed`
 
@@ -1765,27 +1840,34 @@ secrets_filter = true
 
 Matches each command against a set of built-in regular expressions, and refuses to save it if any of them match. The patterns currently cover:
 
-| Service      | Matches                                                                                                               |
-| ------------ | --------------------------------------------------------------------------------------------------------------------- |
-| AWS          | Access key IDs, and commands setting `AWS_SECRET_ACCESS_KEY` or `AWS_SESSION_TOKEN`                                   |
-| Azure        | Commands setting `AZURE_*_KEY`                                                                                        |
-| Google Cloud | Commands setting `GOOGLE_SERVICE_ACCOUNT_KEY`                                                                         |
-| GitHub       | Personal access tokens (old and new), OAuth access tokens (app and user), app installation tokens, and refresh tokens |
-| GitLab       | Personal access tokens                                                                                                |
-| Slack        | OAuth v2 bot and user tokens, and webhook URLs                                                                        |
-| Stripe       | Live and test keys                                                                                                    |
-| Netlify      | Authentication tokens                                                                                                 |
-| npm          | Tokens                                                                                                                |
-| Pulumi       | Personal access tokens                                                                                                |
-| Atuin        | `atuin login`, which takes your password and encryption key as arguments                                              |
+| Service            | Matches                                                                                                                                                                                                                                                       |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| AWS                | Access key IDs, commands setting `AWS_SECRET_ACCESS_KEY` or `AWS_SESSION_TOKEN`, and Amazon Bedrock API keys                                                                                                                                                  |
+| Azure              | Commands setting `AZURE_*_KEY`, and Entra ID client secrets                                                                                                                                                                                                   |
+| Google Cloud       | Commands setting `GOOGLE_SERVICE_ACCOUNT_KEY`, and API keys                                                                                                                                                                                                   |
+| GitHub             | Personal access tokens (old and new), OAuth access tokens (app and user), app installation tokens, and refresh tokens                                                                                                                                         |
+| GitLab             | Personal, deploy, runner, CI/CD job, feed, SCIM, agent and OAuth tokens                                                                                                                                                                                       |
+| AI providers       | Anthropic, OpenAI, OpenRouter, Groq, xAI, Perplexity, Pinecone, LangSmith and Hugging Face keys                                                                                                                                                               |
+| Slack              | Bot, user, app and config tokens, and webhook URLs                                                                                                                                                                                                            |
+| Stripe             | Live, test and restricted keys                                                                                                                                                                                                                                |
+| Package registries | npm, PyPI, RubyGems, Clojars, Docker Hub and Artifactory tokens                                                                                                                                                                                               |
+| Infrastructure     | DigitalOcean, Terraform Cloud, HashiCorp Vault, Fly.io, Heroku, Cloudflare origin CA, Databricks, PlanetScale, Supabase, Tailscale, Dynatrace, Grafana, Sentry, Doppler and OpenShift tokens                                                                  |
+| Other services     | Netlify, Pulumi, Atlassian, Linear, Notion, Postman, Shopify, SendGrid, Brevo, Square, EasyPost, Duffel, Frame.io, ReadMe, Prefect, Infracost and Telegram tokens, Discord and Microsoft Teams webhooks, 1Password service account tokens and age secret keys |
+| Atuin              | `atuin login`, which takes your password and encryption key as arguments                                                                                                                                                                                      |
 
-For the exact expressions, see [`secrets.rs`](https://github.com/atuinsh/atuin/blob/main/crates/atuin-common/src/secrets.rs).
+Many of these come from the rules of [gitleaks](https://github.com/gitleaks/gitleaks). For the exact expressions, see [`secrets.rs`](https://github.com/atuinsh/atuin/blob/main/crates/atuin-common/src/secrets.rs).
 
-The same patterns are applied to captured command output. A command whose own text is clean can still print a credential — `cat .env`, `gh auth token` — so recognised values in the captured output are replaced with `****` before storage. Only the value is replaced; the variable name or flag beside it stays. A credential that color codes split apart in the output isn't recognised.
+The same patterns are applied to captured command output, and to [AI sessions](https://docs.atuin.sh/ai/sessions/#whats-captured). A command whose own text is clean can still print a credential, so recognised values in the captured output are replaced with `****` before storage. Only the value is replaced; the variable name or flag beside it stays. Output is also checked for credentials recognised by where they sit, which never keep a command out of history:
+
+- private keys (`-----BEGIN ... PRIVATE KEY-----`), JSON web tokens, `Authorization` headers and bearer tokens, and `curl -u user:password`
+- the password in a web address or connection string (`postgres://app:pw@db`, `password=...`)
+- a value assigned to a name that holds a credential, such as `DB_PASSWORD=...`, `"client_secret": "..."` or `api_key: ...`. Placeholders like `${TOKEN}`, `<password>` and `changeme` stay.
+
+A credential that color codes split apart in the output isn't recognised. Output that can't be redacted quickly (within a quarter of a second) isn't stored at all. Add patterns of your own with [`redact_patterns`](#redact_patterns).
 
 Note
 
-This is a safety net, not a guarantee. It only catches credentials in recognized formats — use [`history_filter`](#history_filter) for anything else you need kept out, or [`command_filter`](#command_filter) to keep a command but not its output, and see [Excluding Commands from History](https://docs.atuin.sh/guide/excluding-commands/index.md).
+This is a safety net, not a guarantee. It only catches credentials in recognized formats — use [`history_filter`](#history_filter) for anything else you need kept out, or [`command_filter`](#command_filter) to keep a command but not its output, and see [Keeping Secrets Out of Atuin](https://docs.atuin.sh/guide/excluding-commands/index.md).
 
 ### macOS Ctrl-n key shortcuts
 
@@ -2379,11 +2461,69 @@ command_filter = [
 
 The filter applies to output captured after the daemon picks up the change; it doesn't remove output that's already stored.
 
+Some commands' output is never stored, whatever this filter says, because it can hold a credential: Atuin's own `atuin key`, `atuin login`, `atuin register` and `atuin account change-password`; commands that print a token or a password, such as `gh auth token`, `gcloud auth print-access-token`, `aws configure get`, `kubectl get secret`, `vault kv get`, `op read`, `pass show` and `security find-generic-password -w`; commands that print the environment (`printenv`, `env`); and commands that name a [sensitive file](#sensitive_files), such as `cat .env`.
+
+The filter also applies to the commands your AI agents run, whether or not output capture is enabled: a matching call is [captured](https://docs.atuin.sh/ai/sessions/#whats-captured) without its output.
+
 ### `sync`
 
 Default: `false`
 
 Reserved for syncing captured output between machines, which isn't implemented yet: captured output never leaves your machine, whatever this is set to.
+
+## Security
+
+Settings under `[security]` add to Atuin's built-in rules for keeping credentials out of what it stores: captured command output and [AI sessions](https://docs.atuin.sh/ai/sessions/#whats-captured). For which setting to reach for, see [Keeping Secrets Out of Atuin](https://docs.atuin.sh/guide/excluding-commands/index.md).
+
+```
+[security]
+redact_patterns = []
+sensitive_files = []
+```
+
+### `redact_patterns`
+
+Default: `[]`
+
+Regular expressions for credentials of your own, redacted wherever Atuin redacts, alongside the [built-in patterns](#secrets_filter). Atuin replaces a pattern's `secret` group with `****` if it has one, otherwise everything the pattern matches.
+
+```
+[security]
+redact_patterns = [
+   "ACME-[0-9A-F]{32}",
+   "internal-api-key: (?<secret>\\S+)",
+]
+```
+
+These patterns don't keep a command out of history; use [`history_filter`](#history_filter) for that. When [`secrets_filter`](#secrets_filter) is off, captured command output is redacted with these patterns only.
+
+### `sensitive_files`
+
+Default: `[]`
+
+Files whose contents are credentials, on top of the built-in ones. The output of a command naming one isn't stored. An AI agent's reads of one aren't captured, and nor is what it writes to one.
+
+A glob without a `/` matches a file's name wherever it is. A glob with a `/` matches its path, from `~` or `/`, or anywhere below a directory for a relative one.
+
+```
+[security]
+sensitive_files = [
+   "*.secret",
+   "~/work/credentials/**",
+   "config/master.key",
+]
+```
+
+The built-in files are:
+
+- `.env` and `.env.*` (but not `.env.example`, `.env.sample`, `.env.template` or `.env.dist`), `*.env` and `.envrc`
+- private keys: `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519` (not their `.pub` halves), `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks` and `*.keystore`
+- Terraform state and variables: `*.tfstate`, `*.tfvars`
+- `.netrc`, `.pgpass`, `.git-credentials`, `.npmrc`, `.pypirc`, `.htpasswd` and `.vault-token`
+- cloud and registry logins: `~/.aws/credentials` and its SSO cache, the gcloud credential files, `~/.kube/config`, `~/.docker/config.json`, the `gh` and `glab` logins, and Cargo, RubyGems and Terraform Cloud credentials
+- `~/.gnupg/private-keys-v1.d` and `~/.password-store`
+- the AI agents' own logins: `~/.claude/.credentials.json`, `~/.codex/auth.json`, opencode's and Pi's `auth.json`
+- Atuin's encryption key ([`key_path`](#key_path))
 
 ## logs
 
@@ -2825,6 +2965,8 @@ $env.config = (
 | Ctrl + a, D                          | Delete **all** history entries matching the selected command                                                   |
 | Ctrl + a, a                          | Move cursor to the start of the line                                                                           |
 | Ctrl + a, c                          | Switch to the context of the currently selected command / return to default                                    |
+| Ctrl + a, g                          | Change to the directory the selected command ran in                                                            |
+| Ctrl + a, G                          | Put a `cd` to the selected command's directory on the command line                                             |
 
 ### Prefix mode
 
@@ -3094,6 +3236,8 @@ Note: `select-next` and `select-previous` respect the `invert` setting. When `in
 | `accept-N`           | Accept the Nth entry below the selection and execute it (for example, `accept-1` through `accept-9`)                        |
 | `return-selection`   | Return the selected entry to the command line **without executing**                                                         |
 | `return-selection-N` | Return the Nth entry below the selection without executing (for example, `return-selection-1` through `return-selection-9`) |
+| `accept-cd`          | Change to the directory the selected entry ran in, **immediately**                                                          |
+| `return-cd`          | Put a command changing to the directory the selected entry ran in on the command line **without executing**                 |
 | `return-original`    | Close the TUI and return the original command line text                                                                     |
 | `return-query`       | Close the TUI and return the current search query                                                                           |
 | `copy`               | Copy the selected entry to the clipboard                                                                                    |
@@ -3108,6 +3252,14 @@ Note: `select-next` and `select-previous` respect the `invert` setting. When `in
 | `clear-context`      | Return to the initial [context](https://docs.atuin.sh/guide/advanced-usage/#context-switch)                                 |
 
 The difference between `accept` and `return-selection`: `accept` runs the command immediately when the TUI closes, while `return-selection` places it on your command line for further editing before you press enter. The `enter_accept` setting controls which of these the default `enter` key uses.
+
+`accept-cd` and `return-cd` are bound to `g` and `G` in prefix mode (`ctrl-a g`, `ctrl-a G`); see [Jumping to a command's directory](#jumping-to-a-commands-directory). They act like `accept` and `return-selection`, but return a command changing to the entry's directory:
+
+- The path is quoted for the current shell: `cd -- '<path>'` in bash, zsh and fish, `cd r#'<path>'#` in nushell (with more `#` when the path contains `'#`), `cd @('<path>')` in xonsh, and `Set-Location -LiteralPath '<path>'` in PowerShell.
+- In the inspector tab, they use the inspected entry.
+- With [`command_chaining`](https://docs.atuin.sh/configuration/config/#command_chaining), in the search tab, the command is appended to the chain and not executed, as with `accept`.
+- Atuin doesn't check that the directory still exists. If it's gone, for example because it came from another synced host, the shell reports the error.
+- They close the TUI like `return-original` when there is no safe command: the entry has no absolute directory (imported history records `unknown`), the path contains control or line-separator characters, the path contains `\` in PowerShell outside Windows, or the shell is unknown (`ATUIN_SHELL` unset: `atuin search -i` outside the shell integration, or nushell older than 0.106).
 
 ### Mode changes
 
@@ -3270,6 +3422,19 @@ Use `noop` to make a key do nothing:
 
 This is equivalent to setting `enter_accept = false`, but expressed directly as a keybinding.
 
+### Jumping to a command's directory
+
+By default, press `ctrl-a g` to change to the selected entry's directory, or `ctrl-a G` to put the `cd` on the command line to edit first. Prefix bindings work in every mode.
+
+To use a single key instead:
+
+```
+[keymap.emacs]
+"alt-c" = "accept-cd"
+```
+
+A binding under `[keymap.emacs]` doesn't apply in vim mode: add the same key to `[keymap.vim-insert]` and `[keymap.vim-normal]` too.
+
 ### Custom vim-normal bindings
 
 ```
@@ -3296,12 +3461,14 @@ This is equivalent to setting `enter_accept = false`, but expressed directly as 
 
 Prefix mode is a two-step shortcut: press the prefix key (`Ctrl`+`A` by default), then a second key. This is useful for actions you don't need on a single key. The default prefix bindings are:
 
-| Key | Action                                                             |
-| --- | ------------------------------------------------------------------ |
-| `d` | Delete the selected entry                                          |
-| `D` | Delete all entries matching the selected command                   |
-| `a` | Move cursor to start of line                                       |
-| `c` | Clear context (if in a switched context), otherwise switch context |
+| Key | Action                                                                         |
+| --- | ------------------------------------------------------------------------------ |
+| `d` | Delete the selected entry                                                      |
+| `D` | Delete all entries matching the selected command                               |
+| `a` | Move cursor to start of line                                                   |
+| `c` | Clear context (if in a switched context), otherwise switch context             |
+| `g` | Change to the selected entry's directory (`accept-cd`)                         |
+| `G` | Put a `cd` to the selected entry's directory on the command line (`return-cd`) |
 
 You can customize these with `[keymap.prefix]`:
 
@@ -3569,6 +3736,23 @@ $ atuin config enable output-capture
 
 If the daemon is already enabled, its `autostart` is left alone, since a service manager such as systemd or `launchd` may run it. With `autostart` off, Atuin asks you to restart the daemon rather than doing it itself. Open a new shell afterward.
 
+### `atuin config disable <feature>`
+
+Turn off a feature.
+
+```
+$ atuin config disable output-capture
+```
+
+| Feature          | What it sets                                                                                                 |
+| ---------------- | ------------------------------------------------------------------------------------------------------------ |
+| `daemon`         | `daemon.enabled = false`, `daemon.autostart = false`, and `search_mode = "fuzzy"` if it was `"daemon-fuzzy"` |
+| `output-capture` | `output.enabled = false`. Leaves the daemon and search mode unchanged                                        |
+
+Disabling the daemon stops it if it was running.
+
+Disabling output capture restarts an enabled daemon with `autostart` on so it picks up the change. Open a new shell afterward.
+
 ### `atuin config print [key]`
 
 Print configuration values from your config file in TOML format. Without a key, prints the entire file. With a key, prints that section:
@@ -3692,6 +3876,7 @@ Supported shells: `zsh`, `bash`, `fish`, `nu`, `xonsh`, `powershell`. See [Suppo
 
 - **Hooks** that record each command, its exit code, and its duration. See [Shell Integration](https://docs.atuin.sh/guide/shell-integration/index.md).
 - **Key bindings** for `Ctrl`+`R` and the `Up` arrow, and `?` for [Atuin AI](https://docs.atuin.sh/ai/introduction/index.md).
+- **Widgets** for `atuin ai resume` (zsh, bash and fish), unbound unless you ask for them: see [Binding `atuin ai resume`](#binding-atuin-ai-resume).
 
 ## Flags
 
@@ -3700,12 +3885,51 @@ Supported shells: `zsh`, `bash`, `fish`, `nu`, `xonsh`, `powershell`. See [Suppo
 | `--disable-up-arrow` | Don't bind the `Up` arrow key                                                |
 | `--disable-ctrl-r`   | Don't bind `Ctrl`+`R`                                                        |
 | `--disable-ai`       | Don't bind `?` to [Atuin AI](https://docs.atuin.sh/ai/introduction/index.md) |
+| `--bind-ai-resume`   | Bind `Ctrl`+`]` to `atuin ai resume` (zsh, bash and fish; off by default)    |
 
 For example, to keep `Ctrl`+`R` but leave the up arrow alone:
 
 ```
 eval "$(atuin init zsh --disable-up-arrow)"
 ```
+
+## Binding `atuin ai resume`
+
+`atuin init` defines widgets that open the [`atuin ai resume`](https://docs.atuin.sh/ai/sessions/index.md) picker at the prompt and put the command it picks into your shell, but binds no key to them by default. To bind `Ctrl`+`]` in the emacs, vi-insert and vi-command keymaps, pass `--bind-ai-resume`:
+
+```
+eval "$(atuin init zsh --bind-ai-resume)"
+```
+
+`Ctrl`+`]` replaces a shell binding
+
+`Ctrl`+`]` is zsh's `vi-find-next-char` (emacs keymap) and bash's `character-search`: jump to the next occurrence of the character you type next. `--bind-ai-resume` replaces it. To keep it, bind the widget to another key yourself.
+
+To bind a key of your choice instead, add it after the `atuin init` line:
+
+```
+eval "$(atuin init zsh)"
+bindkey -M emacs '^x^r' atuin-ai-resume
+bindkey -M viins '^x^r' atuin-ai-resume-viins
+bindkey -M vicmd '^x^r' atuin-ai-resume-vicmd
+```
+
+```
+eval "$(atuin init bash)"
+atuin-bind -m emacs      '\C-x\C-r' atuin-ai-resume-emacs
+atuin-bind -m vi-insert  '\C-x\C-r' atuin-ai-resume-viins
+atuin-bind -m vi-command '\C-x\C-r' atuin-ai-resume-vicmd
+```
+
+`atuin-bind` is the helper `atuin init bash` defines (see [Key Binding](https://docs.atuin.sh/configuration/key-binding/index.md)); it also works under ble.sh.
+
+```
+atuin init fish | source
+bind ctrl-x,ctrl-r _atuin_ai_resume
+bind -M insert ctrl-x,ctrl-r _atuin_ai_resume
+```
+
+(Fish 3.x spells the key `\cx\cr`.)
 
 ## Environment variables
 
@@ -4231,6 +4455,8 @@ atuin store rebuild history
 ```
 
 Useful when the record store is intact but the local view of it isn't.
+
+`atuin store rebuild ai-session` rebuilds the daemon's index of captured [AI agent sessions](https://docs.atuin.sh/ai/sessions/index.md) from the session records alone: the daemon (started for it if `daemon.autostart` is on) deletes it and replays every record in the background (`atuin ai session` waits for it meanwhile). `atuin store purge` and `atuin store pull --force` do the same after deleting records, so their sessions leave the index. The index belongs to the daemon, so this needs it enabled and running: without it, the command fails and leaves the index as it was, and a purge or forced pull says the index still lists the deleted sessions until `atuin store rebuild ai-session` runs with the daemon up.
 
 ### `atuin store push`
 
@@ -5056,6 +5282,18 @@ Default: `true`
 
 Display tips in Atuin AI at the bottom of agent turns.
 
+### `capture_sessions`
+
+Default: `false`
+
+Capture the sessions of your AI coding agents (Claude Code, Codex, opencode and Pi) into the encrypted record store, and sync them. See [Agent sessions](https://docs.atuin.sh/ai/sessions/index.md).
+
+### `capture_tools`
+
+Default: `true`
+
+With `capture_sessions`, also capture what each tool call was given and what it returned, and the diff of each edit, so a resumed session has its tool calls and edits back. Set it to `false` to keep only the name of each tool called. See [What's captured](https://docs.atuin.sh/ai/sessions/#whats-captured).
+
 ## Capabilities
 
 Settings that control what capabilities are sent to the LLM, which the LLM uses to understand what features the client has available. These are specified under `[ai.capabilities]`.
@@ -5499,6 +5737,193 @@ To turn the capability off entirely, set `ai.capabilities.enable_history_output`
 
 Captured output isn't limited to Atuin AI: external tools like Claude Code and Cursor can read it too, via Atuin's [MCP server](https://docs.atuin.sh/ai/mcp/index.md).
 
+# Agent sessions
+
+With `capture_sessions = true` under `[ai]`, the Atuin daemon records the sessions of your AI coding agents (Claude Code, Codex, opencode and Pi) into the encrypted record store, and syncs them like your history. `atuin ai session` lists, shows, searches and follows them.
+
+The daemon keeps a local search index of these sessions beside the record store, and brings it up to date as sessions are captured, synced in from your other machines, or imported.
+
+## What's captured
+
+Capture keeps the conversation (what you and the agent said) and its tool calls: each call's input and output (the commands run and what they printed, the files read and written). A session resumed from them, on this machine or another, has its tool calls back as they were, and so does a session continued in another agent (see [Resuming](#resuming)). Reasoning is kept only as a marker that the model reasoned.
+
+When an agent edits a file, capture also keeps the diff the agent recorded for the edit (Claude Code, Codex, opencode and pi each keep one), so a resumed session shows its edits as the agent showed them, and `atuin ai session show` prints them. A diff names its file and the lines changed, with a few lines around them, not the whole file. Search covers the names of the files a session changed.
+
+Secrets Atuin recognises are replaced with `****`, in the conversation and the tool calls alike: the [same patterns](https://docs.atuin.sh/configuration/config/#secrets_filter) as for captured command output, and your own [`redact_patterns`](https://docs.atuin.sh/configuration/config/#redact_patterns). Images are left out, and the input or output of a single call is clipped to 64 KiB, keeping its start and its end. An edit's diff past 64 KiB keeps only the files it changed. Search covers a call's input, but not its output.
+
+The rules that keep things out of your history and your captured output apply to your agents' tool calls too:
+
+- A command [`history_filter`](https://docs.atuin.sh/configuration/config/#history_filter) excludes, or one [`secrets_filter`](https://docs.atuin.sh/configuration/config/#secrets_filter) recognises a credential in, is kept as the name of its tool only, without its input or output. Every call in a directory [`cwd_filter`](https://docs.atuin.sh/configuration/config/#cwd_filter) excludes is kept the same way.
+- A command whose output is never stored is kept without its output: one [`command_filter`](https://docs.atuin.sh/configuration/config/#command_filter) matches, one of Atuin's own credential commands (such as `atuin key` and `atuin login`), or another tool's that prints a credential, such as `gh auth token` or `kubectl get secret`.
+- A file holding credentials (`.env`, `~/.ssh/id_ed25519`, `~/.aws/credentials`, any of your [`sensitive_files`](https://docs.atuin.sh/configuration/config/#sensitive_files)) is never captured: a call that reads one, or a command naming one, is kept without its output, and a call that writes to one without what it wrote.
+
+Text that can't be redacted quickly isn't kept. To keep more out, see [Keeping Secrets Out of Atuin](https://docs.atuin.sh/guide/excluding-commands/index.md).
+
+Tool calls can be a lot of your codebase, not just your conversations. To keep only the name of each tool called (and whether the call failed), and no diffs, set `capture_tools = false` under `[ai]`:
+
+```
+[ai]
+capture_sessions = true
+capture_tools = false
+```
+
+These settings, and the filters above, apply to sessions captured or imported after the daemon restarts. Sessions already captured keep what they had.
+
+## Searching
+
+```
+atuin ai session search "flaky test"
+```
+
+- Each word of the query matches a whole word: `atuin ai session search "migration"` finds sessions mentioning migration, but `"migr"` doesn't. The `atuin ai resume` picker searches as you type, so there the last word also matches as a prefix once it's at least two characters long.
+- An empty query (`atuin ai session search ""`) lists the newest sessions first, rather than returning nothing.
+- `--harness` limits the search to one agent.
+
+## Resuming
+
+`atuin ai resume` (or a key you bind to it, see [Binding `atuin ai resume`](https://docs.atuin.sh/reference/init/#binding-atuin-ai-resume)) opens a picker over your sessions. It works like the history search: type to search, `Ctrl`+`O` inspects the selected session, and `Esc` leaves.
+
+No key opens it by default. To open it with `Ctrl`+`]` (which replaces the shell's own character search on that key), pass `--bind-ai-resume` to `atuin init`; or bind the widget to a key of your choice after the `atuin init` line:
+
+```
+bindkey -M emacs '^]' atuin-ai-resume
+bindkey -M viins '^]' atuin-ai-resume-viins
+bindkey -M vicmd '^]' atuin-ai-resume-vicmd
+```
+
+```
+atuin-bind -m emacs      '\C-]' atuin-ai-resume-emacs
+atuin-bind -m vi-insert  '\C-]' atuin-ai-resume-viins
+atuin-bind -m vi-command '\C-]' atuin-ai-resume-vicmd
+```
+
+```
+bind ctrl-] _atuin_ai_resume
+bind -M insert ctrl-] _atuin_ai_resume
+```
+
+Through the widget, the command it picks lands in your shell, as with the history search.
+
+Each row shows when the session was last active, its agent, its title and its message count (when there's room). `Ctrl`+`R` cycles which sessions are listed: those in the current repository (where the picker opens), all of them, this machine's, the current directory's, and the current branch's.
+
+Words in the query of the form `filter:value` narrow the search further, and show as chips in the input:
+
+- `agent:<name>` (or `a:<name>` for short): only that agent's sessions, with `claude-code` (or `claude`, `cc`), `codex` (`cx`), `opencode` (`oc`) or `pi`. `Alt`+`A` cycles through them in turn, and back to all agents.
+- `m:<model>`: only sessions whose model contains this, as in `m:opus`.
+- `b:<branch>`: only sessions on this git branch.
+
+Put a `\` before a word to search for it as text instead (`\b:main`).
+
+The preview under the list starts with where the session ran, its repository, branch and, for a session recorded on another machine, that machine (by the end of its host id), and how many forks it has:
+
+```
+       atuin · feat/ai-sessions · @3f9a12bc · 2 forks
+first  …
+last   …
+```
+
+At first the preview shows a line or two of the first prompt, the match and the last reply. Scroll it to read them in full, one after another: with the mouse wheel over it, or with `Shift`+`Down` and `Shift`+`Up` (a line) and `Shift`+`Page Down` and `Shift`+`Page Up` (a page). `Alt` works in place of `Shift`, for terminals that keep shift and the arrows for themselves. Scroll back to the top for the overview again. On a wide terminal the same goes for the pane beside the list, and in Inspect for the conversation. The wheel over the list moves the selection, as in the history search, and a scrollbar shows when there's more than fits.
+
+While the picker has the mouse, your terminal can't select text the usual way. Most terminals still select with `Shift` held while you drag (`Option` in iTerm2, `Fn` in macOS Terminal). To leave the mouse to the terminal (the top-level `no_mouse = true` does the same for both the picker and the history search):
+
+```
+[ai.sessions]
+mouse = false
+```
+
+- Forks of a session (including Claude Code `--resume` copies, and continuations in another agent) are grouped under it. Inspect (`Ctrl`+`O`) lists them, and `C` there expands the list.
+- Subagents aren't listed at all, as they can't be resumed. A search that matches something a subagent said still finds the session it worked for, and `atuin ai resume <subagent-id>` resumes that session. Atuin records whether a child session is a subagent, a fork or a continuation as it captures it. Sessions captured by older versions don't say, and for Codex and opencode nearly all such children are subagents, so the picker treats them as such (they still resume by id).
+
+Once you choose a session, with `Enter` (or `Tab` to edit the command first), Atuin asks where to resume it:
+
+```
+╭ Resume in ──────────────────────────────────────────────────────────────────╮
+│ > 1 CC Claude Code  original                                                │
+│   2 CC Claude Code  fork: new session, same history                         │
+│   3 CX Codex        continue, 42 tool calls become notes, reasoning dropped │
+│   4 OC opencode     continue, 42 tool calls become notes, reasoning dropped │
+│ <enter>: resume  <tab>: edit  <esc>: back                                   │
+╰─────────────────────────────────────────────────────────────────────────────╯
+```
+
+- The session's own agent comes first and is already selected, so `Enter` `Enter` resumes it. If the session was recorded on another machine, or its transcript was deleted, Atuin writes the transcript back out from the synced messages before resuming it ("from sync").
+- Right under it, forking writes the session out as a new session of the same agent, with the same history, tool calls and all, and resumes that. The original is left as it is. The fork is linked to it the way the agent links its own forks (Claude Code's `forkedFrom`, Codex's `forked_from_id`, Pi's `parentSession`; opencode gets a line it keeps from the model), so it's grouped under the original, with an Atuin id of its own. It keeps the original's title. Pi names the original by its file, so a Pi session that isn't on this machine is written out first. Forking is selected instead of the original when the original can't resume here, or its agent has it open on this machine. Copilot sessions, and sessions with no messages, can't be forked.
+- Every other agent installed on this machine follows. Picking one continues the session there as a new session: the conversation carries over, and so do the tool calls captured with their input and output (`capture_tools`), with what they returned. Each becomes the new agent's own tool where it has one that does the same (a shell command, reading, writing or editing a file, a search), and stays the tool it was otherwise: the agent reads it, it just can't call it again. Calls captured without their input, calls that never got a result, and web searches the model's provider ran itself become notes in the text, and reasoning is dropped. The line says how much. The new session opens with a note to the agent naming the session it continues, by its own agent's id and its Atuin id (in Pi, the note opens the first prompt, so you see it too). Agents that aren't installed aren't listed, and with nothing else to offer (no other agent installed, and a session that can't be forked) `Enter` resumes straight away.
+- If the session's own agent can't resume it here (a Copilot session, an agent that isn't installed, or a session whose transcript is here but whose directory is gone, for an agent that needs it), its line is dimmed with the reason, and the next one is selected instead.
+
+A session keeps one id on every machine. When you resume one in its own agent and its transcript is on this machine, Atuin first catches it up with the synced messages:
+
+- If the session continued on another machine since, the messages this copy lacks are appended to it, and it resumes in place. The status line says `caught up: 12 messages from @3f9a12bc`.
+- If this copy is up to date, or went on past the newest messages along the same branch, it resumes unchanged.
+- Otherwise Atuin writes nothing and asks, with the chooser saying why: when the agent is running this session here (`Claude Code is running this session here`), when this copy went another way than the newest messages, when it has messages sync hasn't got, or when this copy can't be caught up (`couldn't catch up: ...`). Its first line resumes this copy unchanged, and a fork line for each branch of the session, newest first, forks from that branch (`fork @3f9a12bc's · +11 since they split · 20m ago`). With the agent running here, the newest fork is selected.
+- When this copy went another way, sync holds every message of it, and the agent isn't running it here, a switch line for each other branch comes after the first line (`switch to @3f9a12bc's · replaces this copy, yours stays in atuin`). It moves this copy onto that branch, in place, under the same session id, and resumes it. The history this copy shares with that branch stays exactly as it was, and the messages this copy went on with are taken out. The branch's messages since the two split are added from sync, so, like a restore, they carry what Atuin keeps of them: the conversation and which tools were called, but not the other machine's tool input and output, or its images. Before anything changes, your copy is saved whole to `ai/switched/<agent>/` in Atuin's data directory, where no agent lists it, and the status line says where: `switched to @3f9a12bc's branch: 24 messages (your copy is at ...)`. Atuin never deletes these copies. The branch this copy was on stays in Atuin too, so forking it brings it back. Claude Code, Codex and Pi sessions can switch. These can only fork, and get no switch line: a Codex session that was reverted, so its history spans several files, or that Codex wrote in its older format; a Pi session file Pi hasn't opened since version 2 of its format; and opencode sessions, which live in a database.
+
+Atuin never merges branches, and never writes to a session its agent has open. Claude Code, and Codex where it keeps session locks, say which session they have open. opencode, Pi and other Codex installs don't, so Atuin treats a session as possibly open, and doesn't catch it up, while one of that agent's processes works in the session's directory or below it: the directory this copy records, or else where the session works on this machine. A process elsewhere counts when its command line names the session (`opencode -s <id>`, `codex resume <id>`, `pi --session <file>`). While the session's transcript has changed in the last two minutes, any running process of that agent counts, wherever it works.
+
+A session written back out from sync, or continued in another agent, resumes in the directory the session ran in when that exists here. Otherwise, when you're in a checkout of a repository with the same name, it resumes in the same place in that checkout (or at its root), and otherwise in the current directory. The picker says which.
+
+In the chooser, `Up` / `Down` (or `K` / `J`) move, `F` moves to the fork, a digit picks that line, and `Esc` goes back to the list. `Enter` does what the key that opened the chooser did: it resumes (or, without `enter_accept`, puts the command on your command line), and after `Tab` it edits. `Tab` in the chooser always edits. `Ctrl`+`Y` copies the command.
+
+`Alt`+`Enter` in the list or Inspect opens the chooser with the fork selected (`Shift`+`F` in vim's normal mode, `F` in Inspect). Some terminals keep `Alt`+`Enter` for themselves; `Enter` then `F` always works.
+
+To resume in the session's own agent straight away, without the chooser:
+
+```
+[ai.sessions]
+resume_chooser = false
+```
+
+The chooser still opens for a session its own agent can't resume.
+
+From the command line, `atuin ai resume <id>` resumes a session in its own agent directly (an id prefix works too), writing it out from sync first when it isn't on this machine, and `atuin ai resume <id> --in codex` continues it in another (`claude`, `codex`, `opencode` or `pi`). `atuin ai resume <id> --fork` forks it. It catches the session up with sync as the picker does, and fails when that needs a choice, saying which: `--as-is` resumes this copy unchanged, `--switch` switches it to another branch, and `--fork` forks it from its newest branch. `--branch` picks the branch to catch up to, to switch to, or to fork from: `this`, `@<host id>`, or the start of the id the error lists. `--as-is`, `--switch` and `--branch` need an id that names a single session: when it names several, Atuin lists them and asks you to be more specific. `--print` prints the command instead of running it.
+
+The id can be the agent's own, or the session's Atuin id, which Inspect and the MCP session tools show. An Atuin id is a UUIDv7, written as 32 hex digits like a history id. It's fixed when Atuin first records the session, and is the same for every agent and on every machine. Its first 12 digits are when the session started, so a prefix needs more digits than that to name a single session.
+
+## Settings
+
+The picker follows the history search's `style`, `invert`, `show_preview`, `max_preview_height`, `enter_accept`, `keymap_mode` and theme settings. Its own go under `[ai.sessions]`:
+
+```
+[ai.sessions]
+## The filter the picker opens in: "workspace" (the default, widening to "global"
+## outside a git repository or when the workspace has no sessions), "global",
+## "host", "directory" or "branch". `--filter-mode` overrides it.
+filter_mode = "workspace"
+
+## Height of the inline picker; 0 for fullscreen. Defaults to the top-level
+## inline_height. `--inline-height` overrides it.
+inline_height = 40
+
+## Take the mouse (see above). Defaults to the top-level no_mouse.
+mouse = true
+```
+
+To resume an agent's sessions with a command of your own in place of the built-in one, give a template per agent under `[ai.sessions.resume]` (`claude`, `codex`, `opencode` or `pi`). It runs after `cd -- <cwd> &&`, with these substituted:
+
+- `{id}`: the agent's own id for the session;
+- `{path}`: the session's transcript on this machine (for a session written back out from sync, the one Atuin wrote);
+- `{cwd}`: the directory the session worked in.
+
+```
+[ai.sessions.resume]
+claude = "claude --resume {id} --model opus"
+pi = "pi --session {path}"
+```
+
+Each value is substituted within its word, unquoted, so don't quote them, and don't pass them through another shell (`sh -c "..."`), which would split and expand them. The program is looked up on `PATH` only: shell aliases, functions and `~/` aren't expanded, so give a full path for a program that isn't on `PATH`.
+
+## Rebuilding the index
+
+The index is derived entirely from the record store. If it ever looks wrong or incomplete, rebuild it:
+
+```
+atuin store rebuild ai-session
+```
+
+The daemon deletes the index and replays every session record into it in the background (`atuin ai session` waits for it meanwhile), so this needs the daemon enabled. `atuin ai resume` doesn't wait: it stays usable, and its status row says how far the rebuild has got, as its results may be incomplete until it finishes. `atuin store purge` and `atuin store pull --force` do the same after deleting records, and commands that re-encrypt the records (`atuin store rekey`, `atuin login`) have the daemon replay them the next time it starts.
+
+If `atuin ai resume` reports that the session database is at an older schema version, the running daemon is an older Atuin than the command: restart it (`atuin daemon restart`) so it upgrades the database. If it reports that the session database was made by another build of Atuin (a development build, say), the daemon deletes it and rebuilds it from the record store when it starts: restart it (`atuin daemon restart`), and sessions reappear as the rebuild replays them.
+
 # MCP Server
 
 Atuin ships with a built-in [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server, giving external AI tools like Claude Code and Cursor access to your shell history. Your agent can look up commands you've run before, check whether they succeeded, and — with [output capture](https://docs.atuin.sh/guide/output-capture/index.md) set up — read what they printed, or search that output for something it remembers seeing.
@@ -5540,7 +5965,7 @@ If the `atuin` binary isn't on your client's `PATH`, use the full path to the bi
 
 ### `atuin_history`
 
-Searches your shell history, using the same fuzzy matching as the search TUI. Each result includes the command, when and where it ran, its exit code, and its duration, along with a history ID that can be passed to `atuin_output`.
+Searches your shell history. Commands containing every search term come first, and the rest of the page is filled with fuzzy matches (the same matching as the search TUI), marked as such. Each result includes the command, when and where it ran, its exit code, and its duration, along with a history ID that can be passed to `atuin_output`.
 
 Searches can be narrowed down in a few ways:
 
@@ -5711,7 +6136,7 @@ history_filter = [
 
 You can also exclude commands by directory with `cwd_filter`, or prefix individual commands with a space.
 
-See [Excluding Commands from History](https://docs.atuin.sh/guide/excluding-commands/index.md) for more options.
+See [Keeping Secrets Out of Atuin](https://docs.atuin.sh/guide/excluding-commands/index.md) for more options.
 
 ## How do I remove the default up arrow binding?
 
