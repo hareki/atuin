@@ -112,13 +112,14 @@ use crate::harnesstools::session::model::{
     ToolResult, ToolUse, Usage,
 };
 use crate::harnesstools::session::{
-    Checkpoint, Listener, Message, MessageError, Observable, RuntimeError, Session, SessionId,
-    Sessions, WatchError,
+    Change, Checkpoint, FilePatch, Hunk, Listener, Message, MessageError, Observable, Patch,
+    RuntimeError, Session, SessionId, Sessions, WatchError,
 };
 use crate::os::fs::FdIdentity;
 use crate::sync::BlockingPool;
 use crate::utils::{env_nonempty, home_dir};
 
+pub(crate) mod projection;
 mod v2;
 
 #[derive(Debug, Clone, TypedBuilder)]
@@ -197,6 +198,39 @@ impl OpencodeSessions {
         }
         Ok(Self::discover(&data).unwrap_or_else(|| data.join("opencode.db")))
     }
+}
+
+/// opencode's database, resolved as opencode resolves it (see `OpencodeSessions::resolve_db`).
+pub(crate) fn default_db() -> Option<PathBuf> {
+    OpencodeSessions::builder().build().resolve_db().ok()
+}
+
+/// `db` if it holds session `id`, which `opencode --session` reads from the `session` table
+/// (opencode 2.0: `session_v2`). A database that cannot be read holds no session.
+pub(crate) async fn locate(db: &Path, id: &str) -> Option<PathBuf> {
+    if !db.is_file() {
+        return None;
+    }
+    let opts = SqliteConnectOptions::new()
+        .filename(db)
+        .read_only(true)
+        .busy_timeout(Duration::from_secs(2));
+    let mut conn = SqliteConnection::connect_with(&opts).await.ok()?;
+    let mut found = false;
+    for query in [
+        "SELECT 1 FROM session WHERE id = ? LIMIT 1",
+        "SELECT 1 FROM session_v2 WHERE id = ? LIMIT 1",
+    ] {
+        // A table this version of opencode never created is an error, and no session.
+        let row: Result<Option<i64>, _> =
+            query_scalar::<Sqlite, i64>(query).bind(id).fetch_optional(&mut conn).await;
+        if matches!(row, Ok(Some(_))) {
+            found = true;
+            break;
+        }
+    }
+    let _ = conn.close().await;
+    found.then(|| db.to_path_buf())
 }
 
 impl Sessions for OpencodeSessions {
@@ -783,8 +817,10 @@ impl Reader {
             "session.next.tool.success.1" | "session.next.tool.failed.1" => {
                 let error = kind == "session.next.tool.failed.1";
                 assistant.as_ref().zip(data["callID"].as_str()).map(|(message, call)| {
+                    let id = ToolCallId::from(call.to_owned());
+                    let patch = (!error).then(|| tool_patch(&id, &data["structured"])).flatten();
                     let content = Content::ToolResult(ToolResult {
-                        call: ToolCallId::from(call.to_owned()),
+                        call: id,
                         output: if error {
                             data["error"]["message"].clone()
                         } else {
@@ -792,7 +828,10 @@ impl Reader {
                         },
                         error,
                     });
-                    Next::said(Role::Assistant, format!("{message}/{call}/result"), content)
+                    let mut next =
+                        Next::said(Role::Assistant, format!("{message}/{call}/result"), content);
+                    next.content.extend(patch.map(Content::Patch));
+                    next
                 })
             }
             "session.next.step.ended.2" => assistant.as_ref().map(|message| Next {
@@ -1990,6 +2029,58 @@ impl Next {
     }
 }
 
+/// The files a tool call changed, from what opencode keeps of its result: an `edit`'s `filediff`
+/// (`{file, patch}`; older opencode kept `{file, before, after}`), an `apply_patch`'s `files`
+/// (`{filePath, type, patch, movePath}`), or the experimental runner's `files`
+/// (`{file, status, patch}`). A file kept without its own patch takes its hunks from the unified
+/// diff of the call (`diff`), which alone, without any of those, names the files too. opencode
+/// trims the indentation every line of a diff shares (`trimDiff`), so its lines are kept as it
+/// trimmed them.
+pub(crate) fn tool_patch(call: &ToolCallId, metadata: &Value) -> Option<Patch> {
+    let entries: Vec<&Value> = match (&metadata["files"], &metadata["filediff"]) {
+        (Value::Array(files), _) => files.iter().collect(),
+        (_, filediff @ Value::Object(_)) => vec![filediff],
+        _ => Vec::new(),
+    };
+    let diff = metadata["diff"].as_str().map(FilePatch::from_diff).unwrap_or_default();
+    let alone = entries.len() == 1 && diff.len() == 1;
+    let files: Vec<FilePatch> = entries
+        .iter()
+        .filter_map(|entry| {
+            let path = entry["file"].as_str().or_else(|| entry["filePath"].as_str())?;
+            let kind = entry["type"].as_str().or_else(|| entry["status"].as_str());
+            let change = match kind {
+                Some("add" | "added") => Change::Add,
+                Some("delete" | "deleted") => Change::Delete,
+                _ => Change::Update,
+            };
+            let hunks = match entry["patch"].as_str() {
+                Some(patch) => Hunk::parse(patch),
+                None => diff
+                    .iter()
+                    .find(|file| alone || file.path == path)
+                    .map(|file| file.hunks.clone())
+                    .unwrap_or_default(),
+            };
+            Some(FilePatch {
+                path: path.to_owned(),
+                change,
+                moved_to: entry["movePath"].as_str().map(str::to_owned),
+                hunks,
+            })
+        })
+        .collect();
+    let files = if files.is_empty() {
+        diff
+    } else {
+        files
+    };
+    (!files.is_empty()).then(|| Patch {
+        call: call.clone(),
+        files,
+    })
+}
+
 /// A model call's usage from its token counts (a `step-finish` part's or a
 /// `session.next.step.ended` row's `tokens`), `None` when there are none.
 ///
@@ -2157,11 +2248,15 @@ impl OpencodeMessage {
                     input: state["input"].clone(),
                 })];
                 match state["status"].as_str() {
-                    Some("completed") => content.push(Content::ToolResult(ToolResult {
-                        call,
-                        output: state["output"].clone(),
-                        error: false,
-                    })),
+                    Some("completed") => {
+                        let patch = tool_patch(&call, &state["metadata"]);
+                        content.push(Content::ToolResult(ToolResult {
+                            call,
+                            output: state["output"].clone(),
+                            error: false,
+                        }));
+                        content.extend(patch.map(Content::Patch));
+                    }
                     Some("error") => content.push(Content::ToolResult(ToolResult {
                         call,
                         output: state["error"].clone(),

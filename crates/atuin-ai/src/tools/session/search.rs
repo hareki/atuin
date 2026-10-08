@@ -1,8 +1,9 @@
 //! `atuin_ai_session_search`: full-text search across captured AI-agent session transcripts.
 
 use std::fmt::Write as _;
+use std::path::PathBuf;
 
-use atuin_client::ai_session::{HarnessKind, SessionMatch};
+use atuin_client::ai_session::{HarnessKind, SearchTerms, SessionFilter, SessionMatch};
 use atuin_client::settings::Settings;
 use atuin_common::range::Clamped;
 use atuin_common::string::NonBlankString;
@@ -149,7 +150,8 @@ impl AtuinAiSessionSearchToolCall {
         let _ = write!(
             out,
             "\nRead around a match with atuin_ai_session_read, e.g. start a few messages before \
-             the matched message number."
+             the matched message number. Each session shows only its best match; to find every \
+             mention in one, read it with query."
         );
         Ok(out)
     }
@@ -163,8 +165,18 @@ async fn search(
     any_term: bool,
     limit: u32,
 ) -> Result<Vec<SessionMatch>, ToolOutcome> {
+    let filter = SessionFilter {
+        harness,
+        workspace: cwd.map(PathBuf::from),
+        ..SessionFilter::default()
+    };
+    let terms = if any_term {
+        SearchTerms::Any
+    } else {
+        SearchTerms::All
+    };
     client
-        .search_sessions(query, harness, cwd, any_term, limit)
+        .search_sessions(query, terms, &filter, limit)
         .await
         .map_err(|e| ToolOutcome::Error(format!("AI session search failed: {e}")))?
         .map(|hit| {
@@ -193,7 +205,13 @@ impl SessionHit<'_> {
         render_session_summary(out, index, &self.0.session, offset);
         let preview = one_line(&self.0.preview.to_plain().text, 400);
         if !preview.is_empty() {
-            let _ = writeln!(out, "   match (message #{}): {preview}", self.0.message_index);
+            // The message number is in the session holding it, which a grouped search can
+            // return under its root: name that session, to read around the match in.
+            let place = match &self.0.matched {
+                Some(matched) => format!(" in {}", matched.handle.session),
+                None => String::new(),
+            };
+            let _ = writeln!(out, "   match (message #{}{place}): {preview}", self.0.message_index);
         }
     }
 }
@@ -243,6 +261,7 @@ mod tests {
             title: TextHighlighter::default().as_highlighted(String::new()),
             preview: TextHighlighter::default().as_highlighted(String::new()),
             message_index: 0,
+            matched: None,
             score: 1.0,
         }
     }
@@ -270,6 +289,7 @@ mod tests {
             title: TextHighlighter::default().as_highlighted("Add FTS".to_owned()),
             preview: TextHighlighter::default().as_highlighted("the flaky test".to_owned()),
             message_index: 42,
+            matched: None,
             score: 1.0,
         };
 
@@ -277,11 +297,26 @@ mod tests {
         SessionHit(&hit).render_into(&mut out, 1, time::UtcOffset::UTC);
 
         assert!(out.contains("claude-code"));
-        assert!(out.contains("abc-123"));
+        assert!(out.contains(&hit.session.atuin_id.to_string()));
         assert!(out.contains("Add FTS"));
         assert!(out.contains("the flaky test"));
         assert!(out.contains("in /work/atuin"));
-        assert!(out.contains("message #42"));
+        assert!(out.contains("message #42):"), "{out}");
         assert!(out.contains("last reply: Done: the index is backfilled."), "{out}");
+
+        // A match in another session of the group names it.
+        let child = SessionMatch {
+            matched: Some(atuin_client::ai_session::MatchedSession {
+                handle: atuin_client::ai_session::HarnessSession {
+                    harness: HarnessKind::ClaudeCode,
+                    session: "child-9".to_owned().into(),
+                },
+                title: TextHighlighter::default().as_highlighted(String::new()),
+            }),
+            ..hit
+        };
+        let mut out = String::new();
+        SessionHit(&child).render_into(&mut out, 1, time::UtcOffset::UTC);
+        assert!(out.contains("message #42 in child-9):"), "{out}");
     }
 }

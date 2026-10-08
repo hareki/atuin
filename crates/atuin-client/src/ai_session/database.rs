@@ -1,31 +1,173 @@
-use std::collections::{BTreeSet, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use atuin_common::db::sqlite::fts::{TextHighlighter, match_any_expression, match_expression};
+use atuin_common::db::sqlite::fts::{
+    TextHighlighter, match_any_expression, match_expression, prefix_match_expression,
+};
 use atuin_common::db::sqlite::{Sqlite, SqliteOpenOrCreateError};
 use atuin_common::db::{self};
+use atuin_common::harnesstools::rehydrate::RehydrateSession;
 use atuin_common::harnesstools::session::{
     Checkpoint, Content, ParentKind, Role, TitleChange, TitleSource, Usage,
 };
 use atuin_common::string::TruncateCharsExt;
-use atuin_domain::record::RecordId;
-use futures::{Stream, StreamExt, TryStreamExt};
-use sqlx::SqliteConnection;
+use atuin_common::string::highlighted::HighlightedString;
+use atuin_domain::record::{HostId, RecordId};
+use futures::{Stream, TryStreamExt};
+use sqlx::migrate::MigrateError;
 use time::OffsetDateTime;
 use tracing::warn;
+use uuid::Uuid;
 
 use super::{
-    HarnessKind, HarnessSession, Message, NativeSessionId, Session, SessionMatch, SourceId,
+    AtuinSessionId, HarnessKind, HarnessSession, MatchedSession, Message, NativeSessionId,
+    PreviewParts, SearchTerms, Session, SessionFilter, SessionMatch, SourceId,
 };
+
+mod heads;
+mod watermark;
+
+pub use heads::{Analysis, FastForward, Head};
+pub use watermark::{Generation, Watermark};
+pub use write::PreparedMessage;
+use write::{Interned, Writer};
 
 const COMPRESS_THRESHOLD: usize = 256;
 const ZSTD_LEVEL: i32 = 3;
-const REINDEX_CHUNK: i64 = 512;
 const SNIPPET_TOKENS: usize = 32;
+
+/// The newest migration this build knows: [`AiSessionDatabase::open_read_only`] reads only a
+/// sidecar at exactly this version.
+const SCHEMA_VERSION: i64 = 1;
+
+/// How much more a title match weighs than a body match in bm25.
+const TITLE_WEIGHT: f64 = 5.0;
+
+/// A search hit's relevance is divided by `1 + age / RECENCY_DAYS`: one this many days older than
+/// another ranks as if half as relevant.
+const RECENCY_DAYS: f64 = 30.0;
+
+const DAY_MILLIS: f64 = 86_400_000.0;
+
+/// The shortest last term that matches as a prefix. A one-character prefix matches most of the
+/// index (every row with a word starting `e`), which costs hundreds of milliseconds to rank for
+/// nothing useful, so a lone character matches only as a whole token until the next keystroke.
+const MIN_PREFIX_CHARS: usize = 2;
+
+/// The `sessions` columns [`SessionRow`] reads, from a table aliased `s`. Every query also selects
+/// `child_count` and `group_updated_at`.
+///
+/// Links are stored as the harness gave them, (harness, native id): the atuin ids of the parent,
+/// root and children are looked up here, at read time, from whichever of them are stored.
+/// `child_uuids` is comma-separated.
+macro_rules! session_columns {
+    () => {
+        "s.harness, s.session_id, s.parent_harness, s.parent_session_id, s.cwd, s.git_branch, \
+         s.model, s.started_at, s.updated_at, s.message_count, s.usage_input, s.usage_output, \
+         s.usage_cache_read, s.usage_cache_write, s.usage_reasoning, s.title, s.title_source, \
+         s.preview, s.last_reply, s.parent_kind, s.host_id, s.root_harness, s.root_session_id, \
+         s.copy_of_session_id, s.atuin_id, (SELECT lp.atuin_id FROM sessions lp WHERE lp.harness = \
+         s.parent_harness AND lp.session_id = s.parent_session_id) AS parent_atuin_id, (SELECT \
+         lr.atuin_id FROM sessions lr WHERE lr.harness = s.root_harness AND lr.session_id = \
+         s.root_session_id) AS root_atuin_id, (SELECT group_concat(hex(lc.atuin_id)) FROM sessions \
+         lc WHERE lc.parent_harness = s.harness AND lc.parent_session_id = s.session_id) AS \
+         child_atuin_ids"
+    };
+}
+
+/// The `messages` columns [`MessageRow`] reads, from a table aliased `m`. A row's parent kind is
+/// its session's: rows do not store one.
+macro_rules! message_columns {
+    () => {
+        "m.id, m.harness, (SELECT session_id FROM sessions WHERE id = m.session) AS session_id, \
+         (SELECT parent_kind FROM sessions WHERE id = m.session) AS parent_kind, m.source_id, \
+         m.parent_harness, m.parent_session_id, m.parent_source_id, m.timestamp, (SELECT value \
+         FROM interned WHERE id = m.role) AS role, m.content, m.content_z, (SELECT value FROM \
+         interned WHERE id = m.cwd) AS cwd, (SELECT value FROM interned WHERE id = m.git_branch) \
+         AS git_branch, (SELECT value FROM interned WHERE id = m.model) AS model, m.usage_input, \
+         m.usage_output, m.usage_cache_read, m.usage_cache_write, m.usage_reasoning, \
+         m.stop_reason, m.usage_present, m.turn_id, m.title_change, (SELECT value FROM interned \
+         WHERE id = m.host) AS host_id"
+    };
+}
+
+/// Whether the session `c` is a subagent, or a child of unknown kind, as
+/// [`Session::inferred_parent_kind`] tells from its parent kind (`ParentKind` as
+/// [`parent_kind_repr`] stores it), in SQL. Such a session is grouped under its root but not
+/// counted in its size.
+///
+/// [`parent_kind_repr`]: AiSessionDatabase::parent_kind_repr
+macro_rules! subagent_like {
+    () => {
+        "(c.parent_session_id IS NOT NULL AND (c.parent_kind IS 0 OR c.parent_kind IS NULL))"
+    };
+}
+
+/// The group size and newest activity of a root `s`, for roots-only queries. The size counts the
+/// sessions a person carried on: the forks and continuations (copies included), not the subagents
+/// or children of unknown kind (see [`subagent_like`]), whose activity still counts toward the
+/// group's.
+macro_rules! group_columns {
+    () => {
+        concat!(
+            "(SELECT count(*) FROM sessions c WHERE c.root_harness = s.harness AND \
+             c.root_session_id = s.session_id AND NOT (c.harness = s.harness AND c.session_id = \
+             s.session_id) AND NOT ",
+            subagent_like!(),
+            ") AS child_count, (SELECT max(c.updated_at) FROM sessions c WHERE c.root_harness = \
+             s.harness AND c.root_session_id = s.session_id) AS group_updated_at"
+        )
+    };
+}
+
+/// Whether the row `m`'s `turn_id` is an id its harness gave the model call, which a copy of the
+/// row keeps and nothing else holds: only such an id links a copy to its original (see
+/// [`AiSessionDatabase::link_copies`]). Not one capture derived from the line's content, because
+/// unrelated sessions can share that:
+///
+/// - Codex lines with no `response_id` are keyed by their token counts (`token_count:<total>`,
+///   `token_count:<time>:<last>` and `thread:<total>`, harnesstools `codex::session`
+///   `usage_turn`), which two fresh sessions sent the same first prompt report alike.
+/// - Pi lines with no entry id are keyed by their kind, timestamps and token counts
+///   (`line:...`, harnesstools `pi::session` `turn_id`).
+/// - opencode assistant messages are keyed by their creation time and model (`<millis>:...`,
+///   harnesstools `opencode::session` `turn_of` and `v2` `turn`). opencode records a fork's
+///   original as its parent anyway.
+///
+/// The same rule decides how far a call's usage is deduplicated (see
+/// [`AiSessionDatabase::attribute_call`]): across every session holding a harness-given id, but
+/// only within one group of sessions (those sharing a root) for an id derived from content.
+macro_rules! linkable_turn {
+    () => {
+        "(m.turn_id IS NOT NULL AND NOT ((m.harness = 2 AND (m.turn_id GLOB 'token_count:*' OR \
+         m.turn_id GLOB 'thread:*')) OR (m.harness = 5 AND m.turn_id GLOB 'line:*') OR (m.harness \
+         = 4 AND m.turn_id GLOB '[0-9]*')))"
+    };
+}
+
+/// [`group_columns`] for queries that do not group.
+macro_rules! no_group_columns {
+    () => {
+        "0 AS child_count, NULL AS group_updated_at"
+    };
+}
+
+// After the macros, which they use.
+mod query;
+mod write;
 
 #[derive(Debug, Clone)]
 pub struct AiSessionDatabase {
     db: Sqlite,
+    /// See [`Self::lock_local_projection`]. Shared by clones, so by everything in the one process
+    /// (the daemon) that writes the sidecar.
+    local_projection: Arc<tokio::sync::Mutex<()>>,
+    /// See [`Self::lock_reprojection`]. Shared by clones, like `local_projection`.
+    reprojection: Arc<tokio::sync::Mutex<()>>,
+    /// Every write that projects rows goes through this connection (see [`mod@write`]). None when
+    /// opened read-only.
+    writer: Option<Writer>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +184,12 @@ pub enum DbError {
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("ai-session sqlite query failed: {0}")]
     Query(#[from] sqlx::Error),
+    #[error("ai-session sqlite write failed: {0}")]
+    Write(#[from] rusqlite::Error),
+    #[error("the ai-session sqlite write was cancelled")]
+    WriterCancelled,
+    #[error("the ai-session sqlite database is open read-only")]
+    ReadOnly,
     #[error("failed to serialize ai-session message: {0}")]
     Json(#[from] serde_json::Error),
     #[error("failed to compress ai-session message content: {0}")]
@@ -56,6 +204,52 @@ pub enum DbError {
     InvalidContentEncoding,
     #[error("stored ai-session record id is not a valid uuid")]
     InvalidRecordId,
+    #[error("stored ai-session atuin id is missing or not a valid uuid")]
+    InvalidAtuinId,
+    /// No daemon has created the sidecar yet.
+    #[error(
+        "the AI session database has not been created yet: start the atuin daemon (`atuin daemon \
+         start`) and try again"
+    )]
+    Uninitialized {
+        expected: i64,
+    },
+    /// The sidecar is at an older schema than this build reads: the daemon that owns it is an
+    /// older atuin still running since an upgrade, or is migrating it right now.
+    #[error(
+        "the AI session database is at schema version {found}, older than the version {expected} \
+         this atuin reads: the atuin daemon upgrades it when it starts. If atuin was just \
+         updated, restart the daemon (`atuin daemon restart`); if the daemon is starting, try \
+         again in a moment"
+    )]
+    OutdatedSchema {
+        found: i64,
+        expected: i64,
+    },
+    /// The sidecar's migration history is not one this build can bring up to date: a migration
+    /// this build knows with other contents, one it does not know (a newer build's), or one that
+    /// failed part way. The sidecar is a projection of the record store, so deleting it is safe:
+    /// the daemon rebuilds it from the records when it next starts.
+    #[error(
+        "the AI session database at {} cannot be migrated ({source}). It is rebuilt from the \
+         record store, so to start it over, stop the daemon (`atuin daemon stop`), delete that \
+         file with its -wal and -shm files, and start the daemon again",
+        path.display()
+    )]
+    IncompatibleSchema {
+        path: PathBuf,
+        source: sqlx::migrate::MigrateError,
+    },
+    /// The sidecar is at a newer schema than this build reads: a newer atuin's daemon owns it.
+    #[error(
+        "the AI session database is at schema version {found}, newer than the version {expected} \
+         this atuin reads: the atuin daemon is newer than this atuin. Update atuin, or check that \
+         the shell and the daemon run the same atuin binary"
+    )]
+    UnknownSchema {
+        found: i64,
+        expected: i64,
+    },
 }
 
 #[derive(sqlx::FromRow)]
@@ -80,6 +274,16 @@ struct SessionRow {
     preview: Option<String>,
     last_reply: Option<String>,
     parent_kind: Option<i64>,
+    host_id: Option<String>,
+    root_harness: Option<i64>,
+    root_session_id: Option<String>,
+    copy_of_session_id: Option<String>,
+    atuin_id: Vec<u8>,
+    parent_atuin_id: Option<Vec<u8>>,
+    root_atuin_id: Option<Vec<u8>>,
+    child_atuin_ids: Option<String>,
+    child_count: i64,
+    group_updated_at: Option<i64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -90,6 +294,7 @@ struct MessageRow {
     source_id: String,
     parent_harness: Option<i64>,
     parent_session_id: Option<String>,
+    parent_kind: Option<i64>,
     parent_source_id: Option<String>,
     timestamp: i64,
     role: String,
@@ -107,13 +312,14 @@ struct MessageRow {
     usage_present: i64,
     turn_id: Option<String>,
     title_change: Option<String>,
+    host_id: Option<String>,
 }
 
 /// Input, output, cache read, cache write, reasoning: the `usage_*` columns in order.
 type Tokens = [i64; 5];
 
-#[derive(sqlx::FromRow)]
 struct SessionKey {
+    id: i64,
     started_at: i64,
     parent_harness: Option<i64>,
     parent_session_id: Option<String>,
@@ -128,9 +334,11 @@ impl SessionKey {
 }
 
 /// A session holding rows of one model call, with the most usage any of them reported.
-#[derive(sqlx::FromRow)]
 struct Claimant {
     session_id: String,
+    /// The group the session is in, as a content-derived call's scope (see
+    /// [`AiSessionDatabase::attribute_call`]).
+    scope: String,
     started_at: i64,
     parent_harness: Option<i64>,
     parent_session_id: Option<String>,
@@ -157,8 +365,10 @@ impl Claimant {
     }
 }
 
-#[derive(sqlx::FromRow)]
+/// A `calls` row: one count of a model call, in `scope`, owned by `session_id`.
+#[derive(PartialEq, Eq)]
 struct CallRow {
+    scope: String,
     session_id: String,
     usage_input: i64,
     usage_output: i64,
@@ -186,31 +396,114 @@ struct SearchRow {
     match_content: String,
     match_content_z: Option<Vec<u8>>,
     match_index: i64,
+    /// The session holding the best-matching message.
+    match_harness: i64,
+    match_session_id: String,
+    match_title: Option<String>,
     score: f64,
 }
 
-#[derive(sqlx::FromRow)]
-struct ReindexRow {
-    rowid: i64,
-    #[sqlx(flatten)]
-    message: MessageRow,
-    session_title: Option<String>,
-}
-
 impl AiSessionDatabase {
+    /// Open the sidecar at `path` to write, creating and migrating it as needed.
+    ///
+    /// Fails with [`DbError::IncompatibleSchema`], leaving the file as it is, when its migration
+    /// history is not one this build can bring up to date.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
-        let db = Sqlite::builder(path.as_ref().as_os_str()).restrict_permissions().open().await?;
-        let db = Self { db };
-        db.migrate().await?;
-        db.reindex().await?;
+        let path = path.as_ref();
+        let db = Sqlite::builder(path.as_os_str()).restrict_permissions().open().await?;
+        // The pool opening it checked the path is UTF-8, and created the file.
+        let writer = Writer::open(&path.to_string_lossy())?;
+        let db = Self::from_sqlite(db, Some(writer));
+        db.migrate().await.map_err(|err| match err {
+            DbError::Migrate(
+                source @ (MigrateError::VersionMismatch(_)
+                | MigrateError::VersionMissing(_)
+                | MigrateError::Dirty(_)),
+            ) => DbError::IncompatibleSchema {
+                path: path.to_owned(),
+                source,
+            },
+            err => err,
+        })?;
+        Ok(db)
+    }
+
+    /// Open the sidecar to read beside the daemon that writes it (WAL keeps the two apart): no
+    /// migration, and no writes. Fails when the file is missing, and with
+    /// [`DbError::Uninitialized`], [`DbError::OutdatedSchema`] or [`DbError::UnknownSchema`]
+    /// unless it is at exactly the schema this build reads.
+    pub async fn open_read_only(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        let db = Sqlite::builder(path.as_ref().as_os_str()).read_only().open().await?;
+        let db = Self::from_sqlite(db, None);
+        db.check_schema().await?;
         Ok(db)
     }
 
     pub async fn in_memory() -> Result<Self, DbError> {
-        let db = Sqlite::builder_in_memory().open().await?;
-        let db = Self { db };
+        let (db, writer) = Self::memory().await?;
+        let db = Self::from_sqlite(db, Some(writer));
         db.migrate().await?;
         Ok(db)
+    }
+
+    /// A fresh in-memory database, unmigrated, and a writer on it: named and shared-cache, so
+    /// the writer opens the same database as the pool.
+    async fn memory() -> Result<(Sqlite, Writer), DbError> {
+        let location = format!("file:ai-session-{}?mode=memory&cache=shared", Uuid::now_v7());
+        let db = Sqlite::builder(OsStr::new(&location)).open().await?;
+        let writer = Writer::open(&location)?;
+        Ok((db, writer))
+    }
+
+    fn from_sqlite(db: Sqlite, writer: Option<Writer>) -> Self {
+        Self {
+            db,
+            writer,
+            local_projection: Arc::default(),
+            reprojection: Arc::default(),
+        }
+    }
+
+    /// Serialize projecting this host's records: live capture holds it from its dedup check
+    /// until the message it pushed to the record store is appended here, and a reprojection
+    /// holds it while replaying this host's record series. Without it, a reprojection could
+    /// append a record capture has just pushed, before capture does, and capture would report
+    /// its own message as a duplicate.
+    pub async fn lock_local_projection(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.local_projection.clone().lock_owned().await
+    }
+
+    /// Serialize reprojections in this process (startup recovery, the sync worker's, a rebuild):
+    /// two at once would each see the other's watermark moves as invalidations and start over,
+    /// until one gave up with the sidecar short of the store.
+    pub async fn lock_reprojection(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.reprojection.clone().lock_owned().await
+    }
+
+    /// Whether the sidecar is at exactly the schema this build reads, by the newest migration
+    /// applied to it.
+    async fn check_schema(&self) -> Result<(), DbError> {
+        let expected = SCHEMA_VERSION;
+        let pool = self.db.pool();
+        let tracked: Option<i64> = db::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+        )
+        .fetch_optional(pool)
+        .await?;
+        let found: Option<i64> = match tracked {
+            Some(_) => {
+                db::query_scalar("SELECT max(version) FROM _sqlx_migrations")
+                    .fetch_one(pool)
+                    .await?
+            }
+            None => None,
+        };
+        match found {
+            None => Err(DbError::Uninitialized { expected }),
+            Some(found) if found > expected => Err(DbError::UnknownSchema { found, expected }),
+            Some(found) if found < expected => Err(DbError::OutdatedSchema { found, expected }),
+            Some(_) => Ok(()),
+        }
     }
 
     async fn migrate(&self) -> Result<(), DbError> {
@@ -219,244 +512,48 @@ impl AiSessionDatabase {
         Ok(())
     }
 
+    /// Run `write` on the writer (see [`Writer::run`]).
+    async fn write<T, F>(&self, write: F) -> Result<T, DbError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> Result<T, DbError> + Send + 'static,
+    {
+        self.writer.as_ref().ok_or(DbError::ReadOnly)?.run(write).await
+    }
+
+    /// Run `write` on the writer with its interned ids (see [`Writer::run_interning`]).
+    async fn write_interning<T, F>(&self, write: F) -> Result<T, DbError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection, &mut Interned) -> Result<T, DbError> + Send + 'static,
+    {
+        self.writer.as_ref().ok_or(DbError::ReadOnly)?.run_interning(write).await
+    }
+
     pub async fn append(&self, msg: &Message) -> Result<Appended, DbError> {
-        let mut tx = self.db.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let msg = PreparedMessage::new(msg.clone())?;
+        self.write_interning(move |conn, interned| Self::append_one(conn, interned, &msg)).await
+    }
 
-        let harness = msg.session.harness as i64;
-        let session_id = msg.session.session.as_ref();
-        let source_id = msg.source_id.as_ref();
-        let id = msg.id.0.as_bytes().as_slice();
-
-        let (parent_harness, parent_session_id) = match &msg.parent {
-            Some(parent) => (Some(parent.harness as i64), Some(parent.session.as_ref().to_owned())),
-            None => (None, None),
-        };
-
-        let timestamp = Self::millis(msg.timestamp);
-        let role_json = serde_json::to_string(&msg.role)?;
-        let content_json = serde_json::to_string(&msg.content)?;
-        let (content, content_z) = Self::split_content(content_json)?;
-        let stop_reason_json = msg.stop_reason.as_ref().map(serde_json::to_string).transpose()?;
-        let title_change = msg.title_change.as_ref().map(serde_json::to_string).transpose()?;
-        let [usage_input, usage_output, usage_cache_read, usage_cache_write, _] =
-            Self::fold_usage(msg.usage.as_ref());
-        // Unlike the others, a row's reasoning stays NULL when unreported: most harnesses never
-        // break it out, and zero would claim the call did not reason.
-        let usage_reasoning =
-            msg.usage.and_then(|u| u.reasoning).map(|n| i64::try_from(n).unwrap_or(i64::MAX));
-        let cwd = msg.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
-
-        let before = Self::session_key(&mut tx, harness, session_id).await?;
-
-        // Messages reference their session by id, so it has to exist first. The upsert below
-        // folds this row in exactly as it would a fresh insert: same timestamps, nothing counted.
-        db::query(
-            "INSERT INTO sessions (harness, session_id, started_at, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(harness, session_id) DO NOTHING",
-        )
-        .bind(harness)
-        .bind(session_id)
-        .bind(timestamp)
-        .bind(timestamp)
-        .execute(&mut *tx)
-        .await?;
-        let session: i64 =
-            db::query_scalar("SELECT id FROM sessions WHERE harness = ? AND session_id = ?")
-                .bind(harness)
-                .bind(session_id)
-                .fetch_one(&mut *tx)
-                .await?;
-
-        let inserted = db::query(
-            "INSERT INTO messages (
-                id, harness, session, source_id, parent_harness, parent_session_id,
-                parent_source_id, timestamp, role, content, content_z, cwd, git_branch, model,
-                usage_input, usage_output, usage_cache_read, usage_cache_write,
-                usage_reasoning, stop_reason, usage_present, turn_id, title_change
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(session, source_id) DO NOTHING",
-        )
-        .bind(id)
-        .bind(harness)
-        .bind(session)
-        .bind(source_id)
-        .bind(parent_harness)
-        .bind(parent_session_id.clone())
-        .bind(msg.parent_source_id.as_ref().map(|s| s.as_ref()))
-        .bind(timestamp)
-        .bind(role_json)
-        .bind(content)
-        .bind(content_z)
-        .bind(cwd.clone())
-        .bind(msg.git_branch.as_deref())
-        .bind(msg.model.as_deref())
-        .bind(usage_input)
-        .bind(usage_output)
-        .bind(usage_cache_read)
-        .bind(usage_cache_write)
-        .bind(usage_reasoning)
-        .bind(stop_reason_json)
-        .bind(i64::from(msg.usage.is_some()))
-        .bind(msg.turn_id.as_deref())
-        .bind(title_change)
-        .execute(&mut *tx)
-        .await?;
-
-        if inserted.rows_affected() == 0 {
-            tx.commit().await?;
-            return Ok(Appended::Duplicate);
+    /// [`Self::append`] each of `msgs` in order, in one transaction: all of them or, on an error,
+    /// none. A reprojection replays a page of records at a time this way, as committing each row
+    /// on its own (and flushing the full-text index with it) is most of what replaying costs.
+    ///
+    /// Appends nothing, and returns false, if the sidecar was invalidated since `generation` (see
+    /// [`Self::advance_reproject_watermark`]): a wipe may have deleted what the page builds on,
+    /// and a write that outlives the replay waiting on it lands after whatever came next.
+    pub async fn append_all(
+        &self,
+        msgs: Vec<PreparedMessage>,
+        generation: Generation,
+    ) -> Result<bool, DbError> {
+        if msgs.is_empty() {
+            return Ok(true);
         }
-
-        let rowid = inserted.last_insert_rowid();
-        let body = Self::searchable_body(msg);
-        db::query("INSERT INTO messages_fts(rowid, title, body) VALUES (?, ?, ?)")
-            .bind(rowid)
-            .bind(msg.session_title.as_deref().unwrap_or(""))
-            .bind(&body)
-            .execute(&mut *tx)
-            .await?;
-
-        // Session title denormalised onto the message so it survives a reproject from records
-        // (which carry messages only). The session upsert below takes the newest row's, so a
-        // cleared title clears; the capture pipeline stamps every row with the ranked title.
-        let title = msg.session_title.as_deref();
-        let preview = Self::preview_text(msg);
-        let last_reply = Self::reply_text(msg);
-
-        // Usage is not folded in here: it is attributed per model call below. A structural row
-        // (usage, title, session context, a tree node with nothing to show) is no message.
-        let counted = i64::from(!msg.content.is_empty());
-        db::query(
-            "INSERT INTO sessions (
-                harness, session_id, parent_harness, parent_session_id, cwd, git_branch, model,
-                started_at, updated_at, message_count, title, title_source, preview, last_reply,
-                last_reply_at, parent_kind
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(harness, session_id) DO UPDATE SET
-                parent_harness = COALESCE(excluded.parent_harness, sessions.parent_harness),
-                parent_session_id = COALESCE(excluded.parent_session_id, \
-             sessions.parent_session_id),
-                parent_kind = COALESCE(excluded.parent_kind, sessions.parent_kind),
-                cwd = COALESCE(excluded.cwd, sessions.cwd),
-                git_branch = COALESCE(excluded.git_branch, sessions.git_branch),
-                model = COALESCE(excluded.model, sessions.model),
-                started_at = MIN(sessions.started_at, excluded.started_at),
-                updated_at = MAX(sessions.updated_at, excluded.updated_at),
-                message_count = sessions.message_count + excluded.message_count,
-                title = CASE WHEN excluded.updated_at >= sessions.updated_at THEN excluded.title \
-             ELSE sessions.title END,
-                title_source = CASE WHEN excluded.updated_at >= sessions.updated_at THEN \
-             excluded.title_source ELSE sessions.title_source END,
-                preview = COALESCE(sessions.preview, excluded.preview),
-                last_reply = CASE WHEN excluded.last_reply_at >= COALESCE(sessions.last_reply_at, \
-             excluded.last_reply_at) THEN excluded.last_reply ELSE sessions.last_reply END,
-                last_reply_at = MAX(COALESCE(sessions.last_reply_at, excluded.last_reply_at), \
-             COALESCE(excluded.last_reply_at, sessions.last_reply_at))",
-        )
-        .bind(harness)
-        .bind(session_id)
-        .bind(parent_harness)
-        .bind(parent_session_id)
-        .bind(cwd)
-        .bind(msg.git_branch.as_deref())
-        .bind(msg.model.as_deref())
-        .bind(timestamp)
-        .bind(timestamp)
-        .bind(counted)
-        .bind(title)
-        .bind(msg.session_title_source.map(Self::title_source_repr))
-        .bind(preview)
-        .bind(last_reply.as_deref())
-        .bind(last_reply.as_ref().map(|_| timestamp))
-        .bind(msg.parent.as_ref().and(msg.parent_kind).map(Self::parent_kind_repr))
-        .execute(&mut *tx)
-        .await?;
-
-        let mut recount = BTreeSet::new();
-        if let Some(usage) = &msg.usage {
-            match &msg.turn_id {
-                Some(turn) => {
-                    recount.insert(turn.clone());
-                }
-                // A row outside any model call counts on its own.
-                None => {
-                    let tokens = Self::fold_usage(Some(usage));
-                    Self::add_usage(&mut tx, harness, session_id, tokens, 1).await?;
-                }
-            }
-        }
-        // Which session owns a call shared with others depends on each claimant's start and
-        // ancestry: when either moves, every call this session claims is attributed afresh.
-        let existed = before.is_some();
-        let previous_title = match before {
-            Some(before) => {
-                let after = Self::session_key(&mut tx, harness, session_id).await?;
-                if after.as_ref().map(SessionKey::rank) != Some(before.rank()) {
-                    let turns: Vec<String> = db::query_scalar(
-                        "SELECT DISTINCT turn_id FROM messages WHERE session = ? AND \
-                         usage_present = 1 AND turn_id IS NOT NULL",
-                    )
-                    .bind(session)
-                    .fetch_all(&mut *tx)
-                    .await?;
-                    recount.extend(turns);
-                }
-                before.title
-            }
-            None => None,
-        };
-        for turn in &recount {
-            Self::attribute_call(&mut tx, harness, turn).await?;
-        }
-
-        // A changed (or cleared) title has to reach the rows indexed before it. messages_fts is
-        // contentless, so a single-column UPDATE is not supported: rewrite each of the session's
-        // index rows, re-deriving the body from the stored content. Gated on the session's title
-        // actually changing, since every replayed line of a titled session carries it.
-        let current_title: Option<String> =
-            db::query_scalar("SELECT title FROM sessions WHERE harness = ? AND session_id = ?")
-                .bind(harness)
-                .bind(session_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if existed && current_title != previous_title {
-            let title = current_title.as_deref().unwrap_or("");
-            type BodyRow =
-                (i64, String, Option<Vec<u8>>, Option<String>, Option<String>, Option<String>);
-            let rows: Vec<BodyRow> = db::query_as(
-                "SELECT rowid, content, content_z, cwd, git_branch, model FROM messages WHERE \
-                 session = ?",
-            )
-            .bind(session)
-            .fetch_all(&mut *tx)
-            .await?;
-
-            for (rowid, content, content_z, cwd, git_branch, model) in rows {
-                let body = Self::body_from_parts(
-                    content,
-                    content_z,
-                    cwd.as_deref(),
-                    git_branch.as_deref(),
-                    model.as_deref(),
-                )
-                .unwrap_or_else(|err| {
-                    warn!(?err, rowid, "failed to decode ai-session message; indexing empty");
-                    String::new()
-                });
-                db::query(
-                    "INSERT OR REPLACE INTO messages_fts(rowid, title, body) VALUES (?, ?, ?)",
-                )
-                .bind(rowid)
-                .bind(title)
-                .bind(&body)
-                .execute(&mut *tx)
-                .await?;
-            }
-        }
-
-        tx.commit().await?;
-        Ok(Appended::New)
+        self.write_interning(move |conn, interned| {
+            Self::append_page(conn, interned, &msgs, generation)
+        })
+        .await
     }
 
     pub async fn contains_message(
@@ -477,7 +574,6 @@ impl AiSessionDatabase {
         Ok(found.is_some())
     }
 
-    /// The source ids of a session's rows that start with `prefix`.
     /// Every title the session's lines set or cleared, oldest first: replayed, they give each
     /// source's current title again.
     pub async fn title_changes(
@@ -514,13 +610,12 @@ impl AiSessionDatabase {
         Ok(ids.into_iter().map(SourceId::from).collect())
     }
 
-    /// Where capture resumes a session, if it checkpointed one with a digest; one without a
-    /// digest reads as `None`, so the session is read again from its start.
+    /// Where capture resumes a session, if it checkpointed one.
     pub async fn checkpoint(
         &self,
         session: &HarnessSession,
     ) -> Result<Option<Checkpoint>, DbError> {
-        let row: Option<(i64, Option<i64>)> = db::query_as(
+        let row: Option<(i64, i64)> = db::query_as(
             "SELECT \"offset\", digest FROM checkpoints WHERE harness = ? AND session_id = ?",
         )
         .bind(session.harness as i64)
@@ -528,11 +623,10 @@ impl AiSessionDatabase {
         .fetch_optional(self.db.pool())
         .await?;
 
-        Ok(row.and_then(|(at, digest)| {
-            Some(Checkpoint {
-                at: u64::try_from(at).unwrap_or(0),
-                digest: digest?.cast_unsigned(),
-            })
+        Ok(row.map(|(at, digest)| Checkpoint {
+            at: at.cast_unsigned(),
+            digest: digest.cast_unsigned(),
+            generation: 0,
         }))
     }
 
@@ -547,7 +641,9 @@ impl AiSessionDatabase {
         )
         .bind(session.harness as i64)
         .bind(session.session.as_ref())
-        .bind(i64::try_from(checkpoint.at).unwrap_or(i64::MAX))
+        // Both are kept bit for bit: a checkpoint may use every bit of either (opencode's packs
+        // two places into `at`, its top bit set).
+        .bind(checkpoint.at.cast_signed())
         .bind(checkpoint.digest.cast_signed())
         .execute(self.db.pool())
         .await?;
@@ -557,15 +653,12 @@ impl AiSessionDatabase {
 
     /// The newest stored message of a session, by timestamp then record id.
     pub async fn last_message(&self, session: &HarnessSession) -> Result<Option<Message>, DbError> {
-        let row: Option<MessageRow> = db::query_as(
-            "SELECT m.id, m.harness, s.session_id, m.source_id, m.parent_harness, \
-             m.parent_session_id, m.parent_source_id, m.timestamp, m.role, m.content, \
-             m.content_z, m.cwd, m.git_branch, m.model, m.usage_input, m.usage_output, \
-             m.usage_cache_read, m.usage_cache_write, m.usage_reasoning, m.stop_reason, \
-             m.usage_present, m.turn_id, m.title_change FROM messages m JOIN sessions s ON s.id = \
-             m.session WHERE s.harness = ? AND s.session_id = ? ORDER BY m.timestamp DESC, m.id \
-             DESC LIMIT 1",
-        )
+        let row: Option<MessageRow> = db::query_as(concat!(
+            "SELECT ",
+            message_columns!(),
+            " FROM messages m WHERE m.session = (SELECT id FROM sessions WHERE harness = ? AND \
+             session_id = ?) ORDER BY m.timestamp DESC, m.id DESC LIMIT 1"
+        ))
         .bind(session.harness as i64)
         .bind(session.session.as_ref())
         .fetch_optional(self.db.pool())
@@ -575,12 +668,13 @@ impl AiSessionDatabase {
     }
 
     pub async fn get_session(&self, session: &HarnessSession) -> Result<Option<Session>, DbError> {
-        let row: Option<SessionRow> = db::query_as(
-            "SELECT harness, session_id, parent_harness, parent_session_id, cwd, git_branch, \
-             model, started_at, updated_at, message_count, usage_input, usage_output, \
-             usage_cache_read, usage_cache_write, usage_reasoning, title, title_source, preview, \
-             last_reply, parent_kind FROM sessions WHERE harness = ? AND session_id = ?",
-        )
+        let row: Option<SessionRow> = db::query_as(concat!(
+            "SELECT ",
+            session_columns!(),
+            ", ",
+            no_group_columns!(),
+            " FROM sessions s WHERE s.harness = ? AND s.session_id = ?"
+        ))
         .bind(session.harness as i64)
         .bind(session.session.as_ref())
         .fetch_optional(self.db.pool())
@@ -589,37 +683,253 @@ impl AiSessionDatabase {
         row.map(Self::session_from_row).transpose()
     }
 
-    /// Sessions newest first, of `harness` and active at or after `updated_since` when given.
-    pub async fn list_sessions(
-        &self,
-        harness: Option<HarnessKind>,
-        updated_since: Option<OffsetDateTime>,
-    ) -> Result<Vec<Session>, DbError> {
-        let mut sql = String::from(
-            "SELECT harness, session_id, parent_harness, parent_session_id, cwd, git_branch, \
-             model, started_at, updated_at, message_count, usage_input, usage_output, \
-             usage_cache_read, usage_cache_write, usage_reasoning, title, title_source, preview, \
-             last_reply, parent_kind FROM sessions WHERE 1 = 1",
-        );
+    /// Every session passing `filter`, newest first. With [`SessionFilter::roots_only`], the
+    /// roots of the groups with a session passing it, newest activity in the group first.
+    pub async fn list_sessions(&self, filter: &SessionFilter) -> Result<Vec<Session>, DbError> {
+        self.recent_sessions(filter, 0).await
+    }
 
-        if harness.is_some() {
-            sql.push_str(" AND harness = ?");
+    /// Every session whose id or [atuin id](AtuinSessionId) starts with `prefix`, across
+    /// harnesses, newest first (to find a session by an abbreviated id). Wildcards mean nothing
+    /// here: the prefix is a byte range, not a pattern.
+    pub async fn sessions_with_id_prefix(&self, prefix: &str) -> Result<Vec<Session>, DbError> {
+        // Text compares by its UTF-8 bytes, which order as the code points do: the ids starting
+        // with `prefix` are those at or past it and before its successor.
+        let upper = prefix_successor(prefix);
+        let upper_clause = if upper.is_some() {
+            " AND s.session_id < ?"
+        } else {
+            ""
+        };
+        let atuin_ids = AtuinSessionId::prefix_range(prefix);
+        let atuin_clause = if atuin_ids.is_some() {
+            " OR s.atuin_id BETWEEN ? AND ?"
+        } else {
+            ""
+        };
+
+        let sql = format!(
+            "SELECT {}, {} FROM sessions s WHERE (s.session_id >= ?{upper_clause}){atuin_clause} \
+             ORDER BY s.updated_at DESC, s.session_id",
+            session_columns!(),
+            no_group_columns!(),
+        );
+        let mut query = db::query_as::<_, SessionRow>(sqlx::AssertSqlSafe(sql)).bind(prefix);
+        if let Some(upper) = upper {
+            query = query.bind(upper);
         }
-        if updated_since.is_some() {
-            sql.push_str(" AND updated_at >= ?");
+        if let Some((low, high)) = &atuin_ids {
+            query = query.bind(low.as_bytes().as_slice()).bind(high.as_bytes().as_slice());
         }
-        sql.push_str(" ORDER BY updated_at DESC");
+        let rows: Vec<SessionRow> = query.fetch_all(self.db.pool()).await?;
+        rows.into_iter().map(Self::session_from_row).collect()
+    }
+
+    /// The sessions grouped under the root `root` (not the root itself), newest first.
+    pub async fn children(&self, root: &HarnessSession) -> Result<Vec<Session>, DbError> {
+        let rows: Vec<SessionRow> = db::query_as(concat!(
+            "SELECT ",
+            session_columns!(),
+            ", ",
+            no_group_columns!(),
+            " FROM sessions s WHERE s.root_harness = ? AND s.root_session_id = ? AND NOT \
+             (s.harness = ? AND s.session_id = ?) ORDER BY s.updated_at DESC, s.session_id"
+        ))
+        .bind(root.harness as i64)
+        .bind(root.session.as_ref())
+        .bind(root.harness as i64)
+        .bind(root.session.as_ref())
+        .fetch_all(self.db.pool())
+        .await?;
+        rows.into_iter().map(Self::session_from_row).collect()
+    }
+
+    /// Session `session` with every message it holds, in transcript order, as its harness can
+    /// write it back out to be resumed in `cwd`; `None` for a session not stored. Only reads, so
+    /// a read-only database will do.
+    pub async fn rehydrate_session(
+        &self,
+        session: &HarnessSession,
+        cwd: PathBuf,
+    ) -> Result<Option<RehydrateSession>, DbError> {
+        let Some(stored) = self.get_session(session).await? else {
+            return Ok(None);
+        };
+        let messages: Vec<Message> = self.messages(session).try_collect().await?;
+        Ok(Some(stored.rehydrate(messages, cwd)))
+    }
+
+    /// What a session's preview shows: the content of only the first user message and the last
+    /// assistant message with conversation text. The rest of the content is never read, so a
+    /// long session previews as fast as a short one.
+    pub async fn preview_parts(&self, session: &HarnessSession) -> Result<PreviewParts, DbError> {
+        let mut parts = PreviewParts::default();
+        let id: Option<i64> =
+            db::query_scalar("SELECT id FROM sessions WHERE harness = ? AND session_id = ?")
+                .bind(session.harness as i64)
+                .bind(session.session.as_ref())
+                .fetch_optional(self.db.pool())
+                .await?;
+        let Some(id) = id else {
+            return Ok(parts);
+        };
+        // Roles are stored as their JSON's `interned` id, so a role is matched by that: SQLite walks
+        // the session's messages in time order (`messages_session_timestamp`) and stops at the
+        // first match, without the roles of the rest ever reaching here.
+        let user = serde_json::to_string(&Role::User)?;
+        let assistant = serde_json::to_string(&Role::Assistant)?;
+
+        let first: Option<(String, Option<Vec<u8>>)> = db::query_as(
+            "SELECT content, content_z FROM messages WHERE session = ? AND role = (SELECT id FROM \
+             interned WHERE value = ?) ORDER BY timestamp, id LIMIT 1",
+        )
+        .bind(id)
+        .bind(&user)
+        .fetch_optional(self.db.pool())
+        .await?;
+        if let Some((content, content_z)) = first {
+            parts.first_user = Some(Self::read_content(content, content_z)?);
+        }
+
+        // Newest first, reading each assistant message only until one has text: the tail of a
+        // session is often tool calls and reasoning. Each step asks for the next older one.
+        // An assistant message: its time and id (where the next step starts), and its content.
+        type Reply = (i64, Vec<u8>, String, Option<Vec<u8>>);
+        let mut before: Option<(i64, Vec<u8>)> = None;
+        loop {
+            let row: Option<Reply> = match &before {
+                None => {
+                    db::query_as(
+                        "SELECT timestamp, id, content, content_z FROM messages WHERE session = ? \
+                         AND role = (SELECT id FROM interned WHERE value = ?) ORDER BY timestamp \
+                         DESC, id DESC LIMIT 1",
+                    )
+                    .bind(id)
+                    .bind(&assistant)
+                    .fetch_optional(self.db.pool())
+                    .await?
+                }
+                Some((timestamp, message)) => {
+                    db::query_as(
+                        "SELECT timestamp, id, content, content_z FROM messages WHERE session = ? \
+                         AND role = (SELECT id FROM interned WHERE value = ?) AND (timestamp < ? \
+                         OR (timestamp = ? AND id < ?)) ORDER BY timestamp DESC, id DESC LIMIT 1",
+                    )
+                    .bind(id)
+                    .bind(&assistant)
+                    .bind(*timestamp)
+                    .bind(*timestamp)
+                    .bind(message.as_slice())
+                    .fetch_optional(self.db.pool())
+                    .await?
+                }
+            };
+            let Some((timestamp, message, content, content_z)) = row else {
+                break;
+            };
+            let content = Self::read_content(content, content_z)?;
+            if content.iter().any(is_conversation_text) {
+                parts.last_assistant = Some(content);
+                break;
+            }
+            before = Some((timestamp, message));
+        }
+        Ok(parts)
+    }
+
+    /// [`Self::list_sessions`], at most `limit` of them (0 is unbounded).
+    async fn recent_sessions(
+        &self,
+        filter: &SessionFilter,
+        limit: u32,
+    ) -> Result<Vec<Session>, DbError> {
+        let (clause, binds) = Self::filter_clause(filter);
+        let limit_clause = if limit == 0 {
+            ""
+        } else {
+            " LIMIT ?"
+        };
+        let sql = if filter.roots_only {
+            format!(
+                "WITH hits AS (SELECT DISTINCT s.root_harness AS gh, s.root_session_id AS gs FROM \
+                 sessions s WHERE 1 = 1{clause}) SELECT {}, {} FROM hits JOIN sessions s ON \
+                 s.harness = hits.gh AND s.session_id = hits.gs ORDER BY group_updated_at DESC, \
+                 s.session_id{limit_clause}",
+                session_columns!(),
+                group_columns!(),
+            )
+        } else {
+            format!(
+                "SELECT {}, {} FROM sessions s WHERE 1 = 1{clause} ORDER BY s.updated_at DESC, \
+                 s.session_id{limit_clause}",
+                session_columns!(),
+                no_group_columns!(),
+            )
+        };
 
         let mut query = db::query_as::<_, SessionRow>(sqlx::AssertSqlSafe(sql));
-        if let Some(harness) = harness {
-            query = query.bind(harness as i64);
+        for bind in binds {
+            query = bind.apply_as(query);
         }
-        if let Some(since) = updated_since {
-            query = query.bind(Self::millis(since));
+        if limit != 0 {
+            query = query.bind(i64::from(limit));
         }
 
         let rows: Vec<SessionRow> = query.fetch_all(self.db.pool()).await?;
         rows.into_iter().map(Self::session_from_row).collect()
+    }
+
+    /// The SQL (each part led by ` AND `) and values selecting the sessions `s` passing `filter`,
+    /// ignoring [`SessionFilter::roots_only`].
+    fn filter_clause(filter: &SessionFilter) -> (String, Vec<Bind>) {
+        let mut sql = String::new();
+        let mut binds = Vec::new();
+        if let Some(host) = filter.host {
+            sql.push_str(if filter.or_unrecorded {
+                " AND (s.host_id = ? OR s.host_id IS NULL)"
+            } else {
+                " AND s.host_id = ?"
+            });
+            binds.push(Bind::Text(Self::host_repr(host)));
+        }
+        if let Some(workspace) = &filter.workspace {
+            // At the path or under it, whichever separator the recording machine used (`\` on
+            // Windows). A root path leaves "", under which every absolute path is. The session's
+            // directory, not each message's: some harnesses (Codex) record the cwd only on
+            // metadata rows, never on the prompts and replies a search matches.
+            let prefix = Self::path_repr(workspace);
+            sql.push_str(
+                " AND (s.cwd = ? OR substr(s.cwd, 1, length(?) + 1) IN (? || '/', ? || '\\'))",
+            );
+            binds.extend(std::iter::repeat_n(Bind::Text(prefix), 4));
+        }
+        if let Some(directory) = &filter.directory {
+            sql.push_str(" AND s.cwd = ?");
+            binds.push(Bind::Text(Self::path_repr(directory)));
+        }
+        if let Some(branch) = &filter.branch {
+            sql.push_str(" AND s.git_branch = ?");
+            binds.push(Bind::Text(branch.clone()));
+        }
+        if let Some(harness) = filter.harness {
+            sql.push_str(" AND s.harness = ?");
+            binds.push(Bind::Int(harness as i64));
+        }
+        if let Some(model) = &filter.model {
+            sql.push_str(" AND instr(lower(s.model), lower(?)) > 0");
+            binds.push(Bind::Text(model.clone()));
+        }
+        if let Some(since) = filter.updated_since {
+            sql.push_str(" AND s.updated_at >= ?");
+            binds.push(Bind::Int(Self::millis(since)));
+        }
+        (sql, binds)
+    }
+
+    /// A path as stored in `cwd`, without a trailing separator (`/`, or a Windows `\`).
+    fn path_repr(path: &Path) -> String {
+        let path = path.to_string_lossy();
+        path.trim_end_matches(['/', '\\']).to_owned()
     }
 
     pub fn messages(
@@ -631,15 +941,12 @@ impl AiSessionDatabase {
         let session_id = session.session.as_ref().to_owned();
 
         async_stream::try_stream! {
-            let mut rows = db::query_as::<_, MessageRow>(
-                "SELECT m.id, m.harness, s.session_id, m.source_id, m.parent_harness, \
-                 m.parent_session_id, m.parent_source_id, m.timestamp, m.role, m.content, \
-                 m.content_z, m.cwd, m.git_branch, m.model, m.usage_input, m.usage_output, \
-                 m.usage_cache_read, m.usage_cache_write, m.usage_reasoning, m.stop_reason, \
-                 m.usage_present, m.turn_id, m.title_change FROM messages m JOIN sessions s ON \
-                 s.id = m.session WHERE s.harness = ? AND s.session_id = ? \
-                 ORDER BY m.timestamp, m.id",
-            )
+            let mut rows = db::query_as::<_, MessageRow>(concat!(
+                "SELECT ",
+                message_columns!(),
+                " FROM messages m WHERE m.session = (SELECT id FROM sessions WHERE harness = ? \
+                 AND session_id = ?) ORDER BY m.timestamp, m.id"
+            ))
             .bind(harness)
             .bind(session_id)
             .fetch(&pool);
@@ -650,95 +957,118 @@ impl AiSessionDatabase {
         }
     }
 
-    pub fn transcript(
-        &self,
-        session: &HarnessSession,
-    ) -> impl Stream<Item = Result<String, DbError>> + Send + 'static {
-        self.messages(session).map(|result| result.map(|msg| Self::render_transcript_chunk(&msg)))
-    }
-
+    /// Sessions matching `query` (its terms matching as `terms` says) and passing `filter`, most
+    /// relevant first, at most `limit` (0 is unbounded).
+    ///
+    /// Relevance is bm25 at the session's best message, a title match weighing five times a body
+    /// one, divided by `1 + age_in_days / 30` so that equally relevant sessions rank newest
+    /// first. With [`SessionFilter::roots_only`], a match anywhere in a group is its root's. A
+    /// query with no terms returns the sessions [`Self::list_sessions`] does, newest first.
+    ///
+    /// Each match carries its title and a snippet of the best message, with the query's matches
+    /// highlighted, and where that message is in its own session. When that session is not the
+    /// one returned (a root, whose group it is in), the match names it
+    /// ([`SessionMatch::matched`]), with its title highlighted instead of the root's.
     pub fn search(
         &self,
         query: &str,
-        harness: Option<HarnessKind>,
+        terms: SearchTerms,
+        filter: &SessionFilter,
         limit: u32,
-    ) -> impl Stream<Item = Result<SessionMatch, DbError>> + Send + 'static {
-        self.search_in(query, harness, None, false, limit)
-    }
-
-    /// [`Self::search`], optionally restricted to sessions whose directory is `cwd` or beneath it.
-    /// The session's directory, not each message's: some harnesses (Codex) record the cwd only on
-    /// metadata rows, never on the prompts and replies that actually match.
-    pub fn search_in(
-        &self,
-        query: &str,
-        harness: Option<HarnessKind>,
-        cwd: Option<&str>,
-        any_term: bool,
-        limit: u32,
-    ) -> impl Stream<Item = Result<SessionMatch, DbError>> + Send + 'static {
+    ) -> impl Stream<Item = Result<SessionMatch, DbError>> + Send + 'static + use<> {
+        let this = self.clone();
         let pool = self.db.pool().clone();
         let query = query.to_owned();
-        let cwd = cwd.map(|c| c.trim_end_matches(['/', '\\']).to_owned());
+        let filter = filter.clone();
 
         async_stream::try_stream! {
-            let expr = if any_term { match_any_expression(&query) } else { match_expression(&query) };
+            let highlighter = TextHighlighter::default();
+            let expr = match terms {
+                SearchTerms::All => match_expression(&query),
+                SearchTerms::Typed if QueryTerms::prefixes_last(&query) => {
+                    prefix_match_expression(&query)
+                }
+                SearchTerms::Typed => match_expression(&query),
+                SearchTerms::Any => match_any_expression(&query),
+            };
             let Some(expr) = expr else {
+                for session in this.recent_sessions(&filter, limit).await? {
+                    let title = session.title.clone().unwrap_or_default();
+                    let preview = session.preview.clone().unwrap_or_default();
+                    yield SessionMatch {
+                        title: highlighter.as_highlighted(highlighter.sanitize(&title).into_owned()),
+                        preview: highlighter
+                            .as_highlighted(highlighter.sanitize(&preview).into_owned()),
+                        session,
+                        message_index: 0,
+                        matched: None,
+                        score: 0.0,
+                    };
+                }
                 return;
             };
 
-            let harness_clause = if harness.is_some() { " AND m.harness = ?" } else { "" };
-            let cwd_clause = if cwd.is_some() {
-                // The directory itself or anything beneath it, whichever separator the recording
-                // machine used (`\` on Windows).
-                " AND m.session IN (SELECT id FROM sessions \
-                 WHERE cwd = ? OR substr(cwd, 1, length(?) + 1) IN (? || '/', ? || '\\'))"
+            let (filter_clause, binds) = Self::filter_clause(&filter);
+            let (group_harness, group_session) = if filter.roots_only {
+                ("s.root_harness", "s.root_session_id")
             } else {
-                ""
+                ("s.harness", "s.session_id")
+            };
+            let (group_select, recency) = if filter.roots_only {
+                (
+                    group_columns!(),
+                    "(SELECT max(c.updated_at) FROM sessions c WHERE c.root_harness = g.harness \
+                     AND c.root_session_id = g.session_id)",
+                )
+            } else {
+                (no_group_columns!(), "g.updated_at")
             };
             let limit_clause = if limit == 0 { "" } else { " LIMIT ?" };
 
             // messages_fts is contentless: it can rank (bm25) but cannot render highlight() or
             // snippet(), so the query returns the best message's stored content and the marking
-            // happens in Rust below.
+            // happens in Rust below. `best` takes the rowid of each group's top-scoring message
+            // (SQLite fills bare columns from the max() row).
             let sql = format!(
                 "WITH ranked AS MATERIALIZED (\
-                 SELECT messages_fts.rowid AS rowid, m.session AS sid, \
-                 -bm25(messages_fts) AS score \
+                 SELECT messages_fts.rowid AS rowid, {group_harness} AS gh, {group_session} AS gs, \
+                 -bm25(messages_fts, {TITLE_WEIGHT:?}, 1.0) AS score \
                  FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid \
-                 WHERE messages_fts MATCH ?{harness_clause}{cwd_clause}), \
-                 best AS (SELECT rowid, max(score) AS score FROM ranked \
-                 GROUP BY sid ORDER BY score DESC{limit_clause}) \
-                 SELECT s.harness, s.session_id, s.parent_harness, s.parent_session_id, s.cwd, \
-                 s.git_branch, s.model, s.started_at, s.updated_at, s.message_count, \
-                 s.usage_input, s.usage_output, s.usage_cache_read, s.usage_cache_write, \
-                 s.usage_reasoning, s.title, s.title_source, \
-                 s.preview, s.last_reply, s.parent_kind, \
-                 m.content AS match_content, m.content_z AS match_content_z, \
+                 JOIN sessions s ON s.id = m.session \
+                 WHERE messages_fts MATCH ?{filter_clause}), \
+                 best AS (SELECT rowid, gh, gs, max(score) AS score FROM ranked GROUP BY gh, gs), \
+                 scored AS (SELECT best.rowid AS rowid, best.gh AS gh, best.gs AS gs, \
+                 best.score / (1.0 + max(0, ? - {recency}) / {DAY_MILLIS:?} / {RECENCY_DAYS:?}) \
+                 AS score FROM best JOIN sessions g ON g.harness = best.gh AND g.session_id = \
+                 best.gs ORDER BY score DESC, g.updated_at DESC, g.session_id{limit_clause}) \
+                 SELECT {}, {group_select}, m.content AS match_content, \
+                 m.content_z AS match_content_z, \
                  (SELECT count(*) FROM messages p WHERE p.session = m.session \
                  AND (p.timestamp < m.timestamp \
                  OR (p.timestamp = m.timestamp AND p.id < m.id))) AS match_index, \
-                 best.score AS score FROM best \
-                 JOIN messages m ON m.rowid = best.rowid \
-                 JOIN sessions s ON s.id = m.session \
-                 ORDER BY best.score DESC, s.updated_at DESC, s.session_id",
+                 ms.harness AS match_harness, ms.session_id AS match_session_id, \
+                 ms.title AS match_title, scored.score AS score FROM scored \
+                 JOIN messages m ON m.rowid = scored.rowid \
+                 JOIN sessions ms ON ms.id = m.session \
+                 JOIN sessions s ON s.harness = scored.gh AND s.session_id = scored.gs \
+                 ORDER BY scored.score DESC, s.updated_at DESC, s.session_id",
+                session_columns!(),
             );
 
             let mut stmt = db::query_as::<_, SearchRow>(sqlx::AssertSqlSafe(sql)).bind(expr);
-            if let Some(harness) = harness {
-                stmt = stmt.bind(harness as i64);
+            for bind in binds {
+                stmt = bind.apply_as(stmt);
             }
-            if let Some(cwd) = cwd {
-                stmt = stmt.bind(cwd.clone()).bind(cwd.clone()).bind(cwd.clone()).bind(cwd);
-            }
+            stmt = stmt.bind(Self::millis(OffsetDateTime::now_utc()));
             if limit != 0 {
                 stmt = stmt.bind(i64::from(limit));
             }
 
-            let highlighter = TextHighlighter::default();
+            let terms = QueryTerms::parse(&query, terms);
             let mut rows = stmt.fetch(&pool);
             while let Some(row) = rows.try_next().await? {
-                let title = row.session.title.clone().unwrap_or_default();
+                let session = Self::session_from_row(row.session)?;
+                let title = session.title.clone().unwrap_or_default();
                 // Index the metadata (cwd, branch, model) but leave it out of the preview: callers
                 // show it separately, and appended it only reads as noise at the end of a snippet.
                 let body = Self::body_from_parts(row.match_content, row.match_content_z, None, None, None)
@@ -746,141 +1076,49 @@ impl AiSessionDatabase {
                     warn!(?err, "failed to decode matched ai-session message; empty preview");
                     String::new()
                 });
-                let preview = Self::preview_snippet(&body, &query, SNIPPET_TOKENS, any_term);
+                let preview = Self::preview_snippet(&body, &terms, SNIPPET_TOKENS);
 
-                // No highlight spans are produced: consumers only render the plain text, so the
-                // marker machinery isn't worth its keep. sanitize() strips any stray marker
-                // codepoints in stored data so they can't masquerade as spans downstream.
+                // A match in a session grouped under the root returned: the root's title is
+                // highlighted only when it matches the query itself, and the matched session's
+                // title is given with what matched in it.
+                let matched_handle = HarnessSession {
+                    harness: Self::harness_from_repr(row.match_harness)?,
+                    session: NativeSessionId::from(row.match_session_id),
+                };
+                let (title, matched) = if matched_handle == session.handle {
+                    (terms.highlight(highlighter, &title), None)
+                } else {
+                    let title = if terms.matched_by(&title) {
+                        terms.highlight(highlighter, &title)
+                    } else {
+                        highlighter.as_highlighted(highlighter.sanitize(&title).into_owned())
+                    };
+                    let matched_title = row.match_title.unwrap_or_default();
+                    (title, Some(MatchedSession {
+                        handle: matched_handle,
+                        title: terms.highlight(highlighter, &matched_title),
+                    }))
+                };
+
                 yield SessionMatch {
-                    session: Self::session_from_row(row.session)?,
-                    title: highlighter.as_highlighted(highlighter.sanitize(&title).into_owned()),
-                    preview: highlighter
-                        .as_highlighted(highlighter.sanitize(&preview).into_owned()),
+                    session,
+                    title,
+                    preview: terms.highlight(highlighter, &preview),
                     message_index: u64::try_from(row.match_index).unwrap_or(0),
+                    matched,
                     score: row.score,
                 };
             }
         }
     }
 
-    pub async fn reindex(&self) -> Result<(), DbError> {
-        let pool = self.db.pool();
-        // messages_fts rowids are always a contiguous prefix of messages rowids: append writes the
-        // message and its FTS row in one tx, and this backfill (the only other writer, running
-        // under open() before the daemon serves) walks rowids ascending. So the highest indexed
-        // rowid alone determines coverage — gate on max(rowid) (O(log N)) rather than counting
-        // both tables. This also repopulates the index from scratch after a migration rebuilds
-        // messages_fts.
-        let mut watermark: i64 =
-            db::query_scalar("SELECT coalesce(max(rowid), 0) FROM messages_fts")
-                .fetch_one(pool)
-                .await?;
-        let last_message: i64 = db::query_scalar("SELECT coalesce(max(rowid), 0) FROM messages")
-            .fetch_one(pool)
-            .await?;
-        if watermark >= last_message {
-            return Ok(());
-        }
-
-        loop {
-            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-            let rows: Vec<ReindexRow> = db::query_as::<_, ReindexRow>(
-                "SELECT m.rowid AS rowid, m.id, m.harness, s.session_id, m.source_id, \
-                 m.parent_harness, m.parent_session_id, m.parent_source_id, m.timestamp, m.role, \
-                 m.content, m.content_z, m.cwd, m.git_branch, m.model, m.usage_input, \
-                 m.usage_output, m.usage_cache_read, m.usage_cache_write, m.usage_reasoning, \
-                 m.stop_reason, m.usage_present, m.turn_id, m.title_change, s.title AS \
-                 session_title FROM messages m JOIN sessions s ON s.id = m.session WHERE m.rowid \
-                 > ? ORDER BY m.rowid LIMIT ?",
-            )
-            .bind(watermark)
-            .bind(REINDEX_CHUNK)
-            .fetch_all(&mut *tx)
-            .await?;
-
-            let Some(last) = rows.last() else {
-                break;
-            };
-            watermark = last.rowid;
-
-            for row in rows {
-                let rowid = row.rowid;
-                let title = row.session_title.unwrap_or_default();
-                let body = match Self::message_from_row(row.message) {
-                    Ok(msg) => Self::searchable_body(&msg),
-                    Err(err) => {
-                        warn!(?err, rowid, "failed to decode ai-session message; indexing empty");
-                        String::new()
-                    }
-                };
-                db::query(
-                    "INSERT OR REPLACE INTO messages_fts(rowid, title, body) VALUES (?, ?, ?)",
-                )
-                .bind(rowid)
-                .bind(&title)
-                .bind(&body)
-                .execute(&mut *tx)
-                .await?;
-            }
-            tx.commit().await?;
-        }
-        Ok(())
-    }
-
-    /// Fold text the way the index's `unicode61` tokenizer does — lowercase with combining marks
-    /// stripped — so preview placement agrees with what FTS5 actually matched (e.g. a query for
-    /// `cafe` matches a stored `café`).
-    fn fts_fold(text: &str) -> String {
-        use unicode_normalization::UnicodeNormalization as _;
-        use unicode_normalization::char::is_combining_mark;
-        text.nfd().filter(|c| !is_combining_mark(*c)).flat_map(char::to_lowercase).collect()
-    }
-
-    /// The folded `unicode61`-style tokens (alphanumeric runs) of `text`.
-    fn fts_tokens(text: &str) -> impl Iterator<Item = String> + '_ {
-        Self::fts_fold(text)
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-            .into_iter()
-    }
-
     /// The index of the first whitespace word where a query term matches the way the FTS index
-    /// matched it: each term is a phrase of folded tokens that must appear consecutively in the
-    /// body's token stream (so `app` matches the token `app`, not the word `apple`, and `foo-bar`
-    /// matches `foo bar` across words).
-    /// With `prefix`, each term's last token matches any token it starts, as the any-term
-    /// fallback's `"term"*` does in FTS5, so the window lands on `deployment` for `deploy`.
-    fn preview_hit(words: &[&str], query: &str, prefix: bool) -> Option<usize> {
-        let phrases: Vec<Vec<String>> = query
-            .split_whitespace()
-            .map(|term| Self::fts_tokens(term).collect())
-            .filter(|p: &Vec<String>| !p.is_empty())
-            .collect();
-        if phrases.is_empty() {
-            return None;
-        }
-
+    /// matched it (see [`QueryTerms`]).
+    fn preview_hit(words: &[&str], terms: &QueryTerms) -> Option<usize> {
         // (word index, folded token) stream over the whole body.
-        let tokens: Vec<(usize, String)> = words
-            .iter()
-            .enumerate()
-            .flat_map(|(i, w)| Self::fts_tokens(w).map(move |t| (i, t)))
-            .collect();
-
-        phrases
-            .iter()
-            .filter_map(|phrase| {
-                let last = phrase.len() - 1;
-                (0..tokens.len().saturating_sub(last)).find(|&i| {
-                    phrase.iter().zip(&tokens[i..]).enumerate().all(|(k, (p, (_, t)))| {
-                        p == t || (prefix && k == last && t.starts_with(p.as_str()))
-                    })
-                })
-            })
-            .min()
-            .map(|i| tokens[i].0)
+        let (word_of, tokens): (Vec<usize>, Vec<String>) =
+            words.iter().enumerate().flat_map(|(i, w)| fts_tokens(w).map(move |t| (i, t))).unzip();
+        terms.matches(&tokens).map(|(at, _)| at).min().map(|at| word_of[at])
     }
 
     /// `s` cut to at most `max` bytes on a char boundary.
@@ -897,7 +1135,7 @@ impl AiSessionDatabase {
     /// truncation. Bounded by a char budget so whitespace-free blobs (minified output) cannot
     /// blow up the preview. The replacement for FTS5's `snippet()`, which the contentless index
     /// cannot render.
-    fn preview_snippet(body: &str, query: &str, max_tokens: usize, prefix: bool) -> String {
+    fn preview_snippet(body: &str, terms: &QueryTerms, max_tokens: usize) -> String {
         const MAX_CHARS: usize = 400;
         const LEAD_CHARS: usize = 80;
 
@@ -906,7 +1144,7 @@ impl AiSessionDatabase {
             return String::new();
         }
 
-        let hit = Self::preview_hit(&words, query, prefix).unwrap_or(0);
+        let hit = Self::preview_hit(&words, terms).unwrap_or(0);
 
         // Lead-in: a little context before the match, capped in words and chars so a giant
         // preceding blob cannot push the match itself out of the char budget.
@@ -1054,10 +1292,21 @@ impl AiSessionDatabase {
                 out.push('\n');
                 Self::push_json_text(out, &tool.input);
             }
-            Content::ToolResult(result) => Self::push_json_text(out, &result.output),
             Content::Other(value) => Self::push_json_text(out, value),
-            // Activity metadata is not conversational text and adds no useful search terms.
-            Content::ReasoningSummary { .. } => {}
+            // The files a call changed are what a search for them looks for; their lines are
+            // tool output like any other.
+            Content::Patch(patch) => {
+                for file in &patch.files {
+                    for path in std::iter::once(&file.path).chain(&file.moved_to) {
+                        out.push_str(path);
+                        out.push('\n');
+                    }
+                }
+            }
+            // Tool output (with `ai.capture_tools`) is most of a session's bytes, and would grow
+            // the index as much, with files and logs rather than what was said or done. Activity
+            // metadata is not conversational text and adds no useful search terms.
+            Content::ToolResult(_) | Content::ReasoningSummary { .. } => {}
         }
     }
 
@@ -1097,160 +1346,51 @@ impl AiSessionDatabase {
             .map(|n| i64::try_from(n.unwrap_or(0)).unwrap_or(i64::MAX))
     }
 
-    /// What decides a session's claim on a shared model call (see [`Self::attribute_call`]),
-    /// plus its title, read before and after an append.
-    async fn session_key(
-        conn: &mut SqliteConnection,
-        harness: i64,
-        session_id: &str,
-    ) -> Result<Option<SessionKey>, DbError> {
-        Ok(db::query_as(
-            "SELECT started_at, parent_harness, parent_session_id, title FROM sessions WHERE \
-             harness = ? AND session_id = ?",
-        )
-        .bind(harness)
-        .bind(session_id)
-        .fetch_optional(conn)
-        .await?)
-    }
-
-    /// Add `sign * tokens` to a session's usage totals.
-    async fn add_usage(
-        conn: &mut SqliteConnection,
-        harness: i64,
-        session_id: &str,
-        tokens: Tokens,
-        sign: i64,
-    ) -> Result<(), DbError> {
-        let [input, output, cache_read, cache_write, reasoning] =
-            tokens.map(|n| n.saturating_mul(sign));
-        db::query(
-            "UPDATE sessions SET usage_input = usage_input + ?, usage_output = usage_output + ?, \
-             usage_cache_read = usage_cache_read + ?, usage_cache_write = usage_cache_write + ?, \
-             usage_reasoning = usage_reasoning + ? WHERE harness = ? AND session_id = ?",
-        )
-        .bind(input)
-        .bind(output)
-        .bind(cache_read)
-        .bind(cache_write)
-        .bind(reasoning)
-        .bind(harness)
-        .bind(session_id)
-        .execute(conn)
-        .await?;
-        Ok(())
-    }
-
-    /// Count model call `turn` once, whichever sessions its rows were copied into (forks,
-    /// subagent replays): its usage is the field-wise max over every row reporting it (streamed
-    /// rows grow), and it belongs to one session, the owner.
+    /// Delete every session holding a row `host` captured, whole, for a reprojection that replays
+    /// that host's records from scratch because its record series was rewritten or deleted: what
+    /// the old series projected may be gone from the store. Model calls the sessions claimed are
+    /// attributed afresh among the claimants left, and groups they headed are regrouped.
     ///
-    /// The owner is the earliest-started claimant (ties broken by session id), ignoring any
-    /// claimant descended from another -- a fork's copies can carry the parent's own timestamps,
-    /// so start times alone may tie. That depends only on the rows and sessions stored, never on
-    /// the order they arrived in, so capture, import and a rebuild from records on any host all
-    /// agree; [`Self::append`] calls this again whenever a claimant's start or parent moves.
-    async fn attribute_call(
-        conn: &mut SqliteConnection,
-        harness: i64,
-        turn: &str,
-    ) -> Result<(), DbError> {
-        let claimants: Vec<Claimant> = db::query_as(
-            "SELECT s.session_id AS session_id, s.started_at AS started_at, s.parent_harness AS \
-             parent_harness, s.parent_session_id AS parent_session_id, MAX(m.usage_input) AS \
-             usage_input, MAX(m.usage_output) AS usage_output, MAX(m.usage_cache_read) AS \
-             usage_cache_read, MAX(m.usage_cache_write) AS usage_cache_write, \
-             COALESCE(MAX(m.usage_reasoning), 0) AS usage_reasoning FROM messages m JOIN sessions \
-             s ON s.id = m.session WHERE m.harness = ? AND m.turn_id = ? AND m.usage_present = 1 \
-             GROUP BY m.session",
-        )
-        .bind(harness)
-        .bind(turn)
-        .fetch_all(&mut *conn)
-        .await?;
-
-        let tokens = claimants.iter().fold([0; 5], |acc: Tokens, c| {
-            let row = c.tokens();
-            std::array::from_fn(|i| acc[i].max(row[i]))
-        });
-        let ids: HashSet<&str> = claimants.iter().map(|c| c.session_id.as_str()).collect();
-        let mut eligible = Vec::with_capacity(claimants.len());
-        for claimant in &claimants {
-            if claimants.len() == 1
-                || !Self::descends_from(&mut *conn, harness, claimant, &ids).await?
-            {
-                eligible.push(claimant);
-            }
-        }
-        // Only a parent cycle leaves nobody; fall back to the plain ranking.
-        if eligible.is_empty() {
-            eligible.extend(&claimants);
-        }
-        let Some(owner) = eligible
-            .into_iter()
-            .min_by(|a, b| (a.started_at, &a.session_id).cmp(&(b.started_at, &b.session_id)))
-        else {
-            return Ok(());
-        };
-
-        let previous: Option<CallRow> = db::query_as(
-            "SELECT session_id, usage_input, usage_output, usage_cache_read, usage_cache_write, \
-             usage_reasoning FROM calls WHERE harness = ? AND turn_id = ?",
-        )
-        .bind(harness)
-        .bind(turn)
-        .fetch_optional(&mut *conn)
-        .await?;
-        if let Some(previous) = &previous {
-            if previous.session_id == owner.session_id && previous.tokens() == tokens {
-                return Ok(());
-            }
-            Self::add_usage(&mut *conn, harness, &previous.session_id, previous.tokens(), -1)
-                .await?;
-        }
-        Self::add_usage(&mut *conn, harness, &owner.session_id, tokens, 1).await?;
-
-        let [input, output, cache_read, cache_write, reasoning] = tokens;
-        db::query(
-            "INSERT OR REPLACE INTO calls (harness, turn_id, session_id, usage_input, \
-             usage_output, usage_cache_read, usage_cache_write, usage_reasoning) VALUES (?, ?, ?, \
-             ?, ?, ?, ?, ?)",
-        )
-        .bind(harness)
-        .bind(turn)
-        .bind(&owner.session_id)
-        .bind(input)
-        .bind(output)
-        .bind(cache_read)
-        .bind(cache_write)
-        .bind(reasoning)
-        .execute(conn)
-        .await?;
-        Ok(())
+    /// That is the sessions `host` captured (their first row's host), and the sessions other
+    /// hosts captured that `host` added rows to: rows the old series projected there may be gone
+    /// too, and a session's counts, usage, times, title, preview and last reply cannot be worked
+    /// out again from the rows left (titles are only on the records). So they go whole, and the
+    /// other hosts with rows in them are replayed: their records are still in the store, so their
+    /// watermarks are forgotten along with `host`'s, and the next reprojection restores their rows
+    /// exactly, without `host`'s but for what its series still holds. (A row of unknown host, from
+    /// before hosts were tracked, forgets every watermark.) All of this is one invalidation: it
+    /// bumps the [`Generation`].
+    ///
+    /// Returns whether it forgot the watermarks of hosts other than `host`, which a reprojection
+    /// in progress must replay again.
+    pub async fn forget_host(&self, host: HostId) -> Result<bool, DbError> {
+        let forgot = self.forget_host_sparing(host, None).await?;
+        Ok(forgot.expect("nothing is spared"))
     }
 
-    /// Whether another of `claimants` is an ancestor of `claimant`, following stored parent
-    /// links within the harness.
-    async fn descends_from(
-        conn: &mut SqliteConnection,
-        harness: i64,
-        claimant: &Claimant,
-        claimants: &HashSet<&str>,
-    ) -> Result<bool, DbError> {
-        let mut seen = HashSet::from([claimant.session_id.clone()]);
-        let mut next = claimant.parent_of(harness);
-        while let Some(parent) = next {
-            if claimants.contains(parent.as_str()) {
-                return Ok(true);
-            }
-            if !seen.insert(parent.clone()) {
-                return Ok(false);
-            }
-            next = Self::session_key(&mut *conn, harness, &parent).await?.and_then(|key| {
-                key.parent_session_id.filter(|_| key.parent_harness == Some(harness))
-            });
-        }
-        Ok(false)
+    /// [`Self::forget_host`], unless `host` is `spare` or that would delete a row of `spare` (or
+    /// of unknown host, which may be `spare`'s): then it does nothing, and returns None. In one
+    /// transaction, so a row of `spare` appended meanwhile is either seen, or appended after the
+    /// deletes.
+    ///
+    /// For forgetting another host while this one's capture runs: capture dedups a line it
+    /// captured again against the row it pushed for it, a row of this host, so deleting none of
+    /// this host's rows keeps every line it pushed deduplicated.
+    pub async fn forget_host_sparing(
+        &self,
+        host: HostId,
+        spare: Option<HostId>,
+    ) -> Result<Option<bool>, DbError> {
+        self.write(move |conn| Self::forget_host_in(conn, host, spare)).await
+    }
+
+    fn host_repr(host: HostId) -> String {
+        host.as_hyphenated().to_string()
+    }
+
+    fn host_from_repr(host: Option<String>) -> Option<HostId> {
+        // A malformed id reads as unknown rather than failing the whole row.
+        host.and_then(|h| uuid::Uuid::parse_str(&h).ok()).map(HostId)
     }
 
     fn millis(ts: OffsetDateTime) -> i64 {
@@ -1302,6 +1442,8 @@ impl AiSessionDatabase {
     fn message_from_row(row: MessageRow) -> Result<Message, DbError> {
         let harness = Self::harness_from_repr(row.harness)?;
         let parent = Self::optional_session(row.parent_harness, row.parent_session_id)?;
+        let parent_kind =
+            parent.as_ref().and(row.parent_kind).and_then(Self::parent_kind_from_repr);
         let content = Self::read_content(row.content, row.content_z)?;
         let role: Role = serde_json::from_str(&row.role)?;
         let stop_reason = row.stop_reason.map(|s| serde_json::from_str(&s)).transpose()?;
@@ -1315,6 +1457,7 @@ impl AiSessionDatabase {
             })
             .source_id(SourceId::from(row.source_id))
             .parent(parent)
+            .parent_kind(parent_kind)
             .parent_source_id(row.parent_source_id.map(SourceId::from))
             .timestamp(Self::time_from_millis(row.timestamp)?)
             .role(role)
@@ -1334,36 +1477,8 @@ impl AiSessionDatabase {
             .title_change(
                 row.title_change.as_deref().and_then(|json| serde_json::from_str(json).ok()),
             )
+            .host(Self::host_from_repr(row.host_id))
             .build())
-    }
-
-    fn render_transcript_chunk(message: &Message) -> String {
-        let role = match &message.role {
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::System => "system",
-            Role::Tool => "tool",
-            Role::Other(other) => other.as_str(),
-        };
-
-        let body = message
-            .content
-            .iter()
-            .filter_map(|content| match content {
-                Content::Text(text) | Content::Reasoning(text) => Some(text.clone()),
-                Content::ReasoningSummary { tokens } => {
-                    Some(atuin_common::harnesstools::session::model::reasoning_label(
-                        tokens.or(message.usage.and_then(|u| u.reasoning)),
-                    ))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Trailing newline: chunks are concatenated verbatim by consumers, so the separator has
-        // to live in the chunk or every message would run together on one line.
-        format!("{role}: {body}\n")
     }
 
     const fn parent_kind_repr(kind: ParentKind) -> i64 {
@@ -1405,17 +1520,39 @@ impl AiSessionDatabase {
     fn session_from_row(row: SessionRow) -> Result<Session, DbError> {
         let harness = Self::harness_from_repr(row.harness)?;
         let parent = Self::optional_session(row.parent_harness, row.parent_session_id)?;
+        let root = Self::optional_session(row.root_harness, row.root_session_id)?
+            .filter(|root| root.harness != harness || root.session.as_ref() != row.session_id);
+        let group_updated_at = row.group_updated_at.map(Self::time_from_millis).transpose()?;
+        let copy_of = row.copy_of_session_id.map(|session| HarnessSession {
+            harness,
+            session: NativeSessionId::from(session),
+        });
+        let handle = HarnessSession {
+            harness,
+            session: NativeSessionId::from(row.session_id),
+        };
+        let started_at = Self::time_from_millis(row.started_at)?;
+        let atuin_id = Uuid::from_slice(&row.atuin_id).map_err(|_| DbError::InvalidAtuinId)?.into();
+        // A link whose session is not stored yet (or has no stored id) resolves to nothing.
+        let linked = |bytes: Option<&[u8]>| {
+            bytes.and_then(|bytes| Uuid::from_slice(bytes).ok()).map(AtuinSessionId::from)
+        };
+        let parent_atuin_id = parent.as_ref().and(linked(row.parent_atuin_id.as_deref()));
+        let root_atuin_id = root.as_ref().and(linked(row.root_atuin_id.as_deref()));
+        let mut child_atuin_ids: Vec<AtuinSessionId> = row
+            .child_atuin_ids
+            .as_deref()
+            .map_or_else(Vec::new, |ids| ids.split(',').filter_map(|id| id.parse().ok()).collect());
+        // UUIDv7s order by time: oldest first.
+        child_atuin_ids.sort_unstable();
 
         Ok(Session::builder()
-            .handle(HarnessSession {
-                harness,
-                session: NativeSessionId::from(row.session_id),
-            })
+            .handle(handle)
             .parent(parent)
             .cwd(row.cwd.map(PathBuf::from))
             .git_branch(row.git_branch)
             .model(row.model)
-            .started_at(Self::time_from_millis(row.started_at)?)
+            .started_at(started_at)
             .updated_at(Self::time_from_millis(row.updated_at)?)
             .message_count(u64::try_from(row.message_count).unwrap_or(0))
             .usage(Usage {
@@ -1430,25 +1567,238 @@ impl AiSessionDatabase {
             .preview(row.preview)
             .last_reply(row.last_reply)
             .parent_kind(row.parent_kind.and_then(Self::parent_kind_from_repr))
+            .host(Self::host_from_repr(row.host_id))
+            .root(root)
+            .copy_of(copy_of)
+            .child_count(u64::try_from(row.child_count).unwrap_or(0))
+            .group_updated_at(group_updated_at)
+            .atuin_id(atuin_id)
+            .parent_atuin_id(parent_atuin_id)
+            .root_atuin_id(root_atuin_id)
+            .child_atuin_ids(child_atuin_ids)
             .build())
+    }
+}
+
+/// A value bound into a query built at runtime.
+#[derive(Clone)]
+enum Bind {
+    Text(String),
+    Int(i64),
+}
+
+type QueryAs<'q, O> =
+    sqlx::query::QueryAs<'q, sqlx::Sqlite, O, <sqlx::Sqlite as sqlx::Database>::Arguments>;
+
+impl Bind {
+    fn apply_as<O>(self, query: QueryAs<'_, O>) -> QueryAs<'_, O> {
+        match self {
+            Self::Text(text) => query.bind(text),
+            Self::Int(n) => query.bind(n),
+        }
+    }
+}
+
+/// Conversation text: text and summaries, not tool calls, reasoning or errors.
+fn is_conversation_text(content: &Content) -> bool {
+    matches!(content, Content::Text(t) | Content::Summary(t) if !t.trim().is_empty())
+}
+
+/// The smallest string greater than every string starting with `prefix`, or `None` when there is
+/// none (an empty prefix, or one of only `char::MAX`).
+fn prefix_successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        // The next code point, skipping the surrogates, which no string holds.
+        let next = (u32::from(last) + 1..=u32::from(char::MAX)).find_map(char::from_u32);
+        if let Some(next) = next {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+/// Fold text the way the index's `unicode61` tokenizer does — lowercase with combining marks
+/// stripped — so preview placement and highlights agree with what FTS5 actually matched (e.g. a
+/// query for `cafe` matches a stored `café`).
+fn fts_fold(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    use unicode_normalization::char::is_combining_mark;
+    text.nfd().filter(|c| !is_combining_mark(*c)).flat_map(char::to_lowercase).collect()
+}
+
+/// The folded `unicode61`-style tokens (alphanumeric runs) of `text`.
+fn fts_tokens(text: &str) -> impl Iterator<Item = String> + use<> {
+    fts_fold(text)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+/// The byte ranges of `text`'s tokens, each with its folded form.
+fn fts_token_spans(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    use unicode_normalization::char::is_combining_mark;
+    let is_token = |c: char| c.is_alphanumeric() || is_combining_mark(c);
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (i, c) in text.char_indices().chain(std::iter::once((text.len(), ' '))) {
+        match (start, is_token(c)) {
+            (None, true) => start = Some(i),
+            (Some(from), false) => {
+                start = None;
+                let folded = fts_fold(&text[from..i]);
+                if !folded.is_empty() {
+                    spans.push((from..i, folded));
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
+/// A search query's terms as the index matches them (see [`SearchTerms`]): each
+/// whitespace-separated term is a phrase of folded tokens that must appear consecutively (so
+/// `app` matches the token `app`, not the word `apple`, and `foo-bar` matches `foo bar` across
+/// words). A phrase's last token also matches as a prefix: every phrase's for
+/// [`SearchTerms::Any`], and the last term's for [`SearchTerms::Typed`] when
+/// [`Self::prefixes_last`].
+struct QueryTerms {
+    /// Each phrase, and whether its last token is a prefix.
+    phrases: Vec<(Vec<String>, bool)>,
+    /// Whether a row matches holding any phrase ([`SearchTerms::Any`]), rather than every one.
+    any: bool,
+}
+
+impl QueryTerms {
+    fn parse(query: &str, mode: SearchTerms) -> Self {
+        let terms: Vec<&str> = query.split_whitespace().collect();
+        let prefix = |i: usize| match mode {
+            SearchTerms::All => false,
+            SearchTerms::Typed => i + 1 == terms.len() && Self::prefixes_last(query),
+            SearchTerms::Any => true,
+        };
+        let phrases = terms
+            .iter()
+            .enumerate()
+            .map(|(i, term)| (fts_tokens(term).collect::<Vec<_>>(), prefix(i)))
+            .filter(|(phrase, _)| !phrase.is_empty())
+            .collect();
+        Self {
+            phrases,
+            any: mode == SearchTerms::Any,
+        }
+    }
+
+    /// Whether the last term of `query` matches as a prefix: it is still being typed (no
+    /// whitespace after it), and is at least [`MIN_PREFIX_CHARS`] long.
+    fn prefixes_last(query: &str) -> bool {
+        !query.ends_with(char::is_whitespace)
+            && query
+                .split_whitespace()
+                .last()
+                .is_some_and(|t| t.chars().count() >= MIN_PREFIX_CHARS)
+    }
+
+    /// Where a phrase matches in `tokens`: its first token's index and its length.
+    fn matches<'a>(&'a self, tokens: &'a [String]) -> impl Iterator<Item = (usize, usize)> + 'a {
+        self.phrases
+            .iter()
+            .flat_map(move |(phrase, prefix)| Self::phrase_matches(phrase, *prefix, tokens))
+    }
+
+    /// Where `phrase` matches in `tokens`: its first token's index and its length.
+    fn phrase_matches<'a>(
+        phrase: &'a [String],
+        prefix: bool,
+        tokens: &'a [String],
+    ) -> impl Iterator<Item = (usize, usize)> + 'a {
+        (0..=tokens.len().saturating_sub(phrase.len()))
+            .filter(move |&at| {
+                tokens.len() >= phrase.len()
+                    && phrase.iter().zip(&tokens[at..]).enumerate().all(|(i, (p, t))| {
+                        if prefix && i + 1 == phrase.len() {
+                            t.starts_with(p.as_str())
+                        } else {
+                            p == t
+                        }
+                    })
+            })
+            .map(move |at| (at, phrase.len()))
+    }
+
+    /// Whether `text` alone holds what a row must to match the query, as the index tells it:
+    /// every phrase, or with [`SearchTerms::Any`] any of them.
+    fn matched_by(&self, text: &str) -> bool {
+        let tokens: Vec<String> = fts_tokens(text).collect();
+        let mut found = self.phrases.iter().map(|(phrase, prefix)| {
+            Self::phrase_matches(phrase, *prefix, &tokens).next().is_some()
+        });
+        if self.any {
+            found.any(|f| f)
+        } else {
+            !self.phrases.is_empty() && found.all(|f| f)
+        }
+    }
+
+    /// `text` with every token the query matches marked by `highlighter`.
+    fn highlight(&self, highlighter: TextHighlighter, text: &str) -> HighlightedString {
+        let text = highlighter.sanitize(text);
+        let spans = fts_token_spans(&text);
+        let tokens: Vec<String> = spans.iter().map(|(_, t)| t.clone()).collect();
+        let mut marked = vec![false; tokens.len()];
+        for (at, len) in self.matches(&tokens) {
+            marked[at..at + len].fill(true);
+        }
+
+        let [open, close] = highlighter.markers();
+        let mut out = String::with_capacity(text.len());
+        let mut copied = 0;
+        for ((range, _), _) in spans.iter().zip(&marked).filter(|(_, m)| **m) {
+            out.push_str(&text[copied..range.start]);
+            out.push(open);
+            out.push_str(&text[range.clone()]);
+            out.push(close);
+            copied = range.end;
+        }
+        out.push_str(&text[copied..]);
+        highlighter.as_highlighted(out)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use atuin_common::db;
+    use atuin_common::db::sqlite::Sqlite;
+    use atuin_common::db::sqlite::fts::TextHighlighter;
     use atuin_common::harnesstools::session::{
         Checkpoint, Content, ParentKind, Role, ToolCallId, ToolResult, ToolUse, Usage,
     };
-    use atuin_domain::record::RecordId;
+    use atuin_domain::record::{HostId, RecordId};
     use futures::TryStreamExt;
-    use rstest::rstest;
+    use rstest::{fixture, rstest};
     use time::OffsetDateTime;
 
-    use super::{AiSessionDatabase, Appended, COMPRESS_THRESHOLD, TitleSource};
-    use crate::ai_session::{
-        HarnessKind, HarnessSession, Message, NativeSessionId, SessionMatch, SourceId,
+    use super::{
+        AiSessionDatabase, Appended, AtuinSessionId, COMPRESS_THRESHOLD, DbError, QueryTerms,
+        SCHEMA_VERSION, TitleSource, Uuid, prefix_successor,
     };
+    use crate::ai_session::{
+        HarnessKind, HarnessSession, Message, NativeSessionId, SearchTerms, Session, SessionFilter,
+        SessionMatch, SourceId,
+    };
+
+    fn harness_filter(harness: HarnessKind) -> SessionFilter {
+        SessionFilter {
+            harness: Some(harness),
+            ..SessionFilter::default()
+        }
+    }
 
     fn sample_message() -> Message {
         Message::builder()
@@ -1477,38 +1827,6 @@ mod tests {
         assert_eq!(s.message_count, 1);
         let got: Vec<_> = db.messages(&m.session).try_collect().await.unwrap();
         assert_eq!(got[0].turn_id.as_deref(), Some("msg_01"));
-    }
-
-    /// Upgrading keeps each message's rowid, which its contentless messages_fts row is keyed by.
-    #[rstest]
-    #[tokio::test]
-    async fn interning_sessions_keeps_the_search_index_aligned() {
-        let sqlite = atuin_common::db::sqlite::Sqlite::builder_in_memory().open().await.unwrap();
-        let pool = sqlite.pool();
-        sqlx::raw_sql(include_str!("migrations/0001_init.sql")).execute(pool).await.unwrap();
-        sqlx::raw_sql(
-            "INSERT INTO sessions (harness, session_id, started_at, updated_at) VALUES (1, 's', \
-             0, 0);
-            INSERT INTO messages (rowid, id, harness, session_id, source_id, timestamp, role, \
-             content)
-                VALUES (7, x'01', 1, 's', 'a', 0, '\"User\"', '[{\"Text\":\"hello\"}]');
-            INSERT INTO messages_fts (rowid, title, body) VALUES (7, '', 'hello');",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-
-        sqlx::raw_sql(include_str!("migrations/0002_intern_sessions.sql"))
-            .execute(pool)
-            .await
-            .unwrap();
-        sqlx::raw_sql(include_str!("migrations/0003_last_reply.sql")).execute(pool).await.unwrap();
-        sqlx::raw_sql(include_str!("migrations/0004_parent_kind.sql")).execute(pool).await.unwrap();
-
-        let db = AiSessionDatabase { db: sqlite };
-        let hits: Vec<SessionMatch> = db.search("hello", None, 0).try_collect().await.unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].session.handle.session.as_ref(), "s");
     }
 
     /// Rows that carry only usage, a title or session context are stored, but are no messages.
@@ -1544,28 +1862,21 @@ mod tests {
         let db = AiSessionDatabase::in_memory().await.unwrap();
         let session = sample_handle();
         assert_eq!(db.checkpoint(&session).await.unwrap(), None);
-        db.set_checkpoint(&session, Checkpoint { at: 42, digest: 1 }).await.unwrap();
-        // A digest with its top bit set survives the signed column.
+        db.set_checkpoint(&session, Checkpoint {
+            at: 42,
+            digest: 1,
+            generation: 0,
+        })
+        .await
+        .unwrap();
+        // An offset and a digest with their top bits set survive the signed columns.
         let latest = Checkpoint {
-            at: 4096,
+            at: 1 << 63 | 4096,
             digest: u64::MAX - 1,
+            generation: 0,
         };
         db.set_checkpoint(&session, latest).await.unwrap();
         assert_eq!(db.checkpoint(&session).await.unwrap(), Some(latest));
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn a_checkpoint_without_a_digest_reads_as_none() {
-        let db = AiSessionDatabase::in_memory().await.unwrap();
-        let session = sample_handle();
-        db::query("INSERT INTO checkpoints (harness, session_id, \"offset\") VALUES (?, ?, 42)")
-            .bind(session.harness as i64)
-            .bind(session.session.as_ref())
-            .execute(db.db.pool())
-            .await
-            .unwrap();
-        assert_eq!(db.checkpoint(&session).await.unwrap(), None);
     }
 
     #[rstest]
@@ -1623,7 +1934,7 @@ mod tests {
             db.append(&m).await.unwrap();
         }
 
-        let sessions = db.list_sessions(None, None).await.unwrap();
+        let sessions = db.list_sessions(&SessionFilter::default()).await.unwrap();
         assert_eq!(sessions.len(), 3);
         assert!(sessions.windows(2).all(|w| w[0].updated_at >= w[1].updated_at));
     }
@@ -1640,7 +1951,13 @@ mod tests {
         }
 
         let since = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(since);
-        let sessions = db.list_sessions(None, Some(since)).await.unwrap();
+        let sessions = db
+            .list_sessions(&SessionFilter {
+                updated_since: Some(since),
+                ..SessionFilter::default()
+            })
+            .await
+            .unwrap();
         let ids: Vec<_> = sessions.iter().map(|s| s.handle.session.as_ref()).collect();
         assert_eq!(ids, want);
     }
@@ -1849,11 +2166,12 @@ mod tests {
         ]
     }
 
-    proptest::proptest! {
-        #[test]
-        fn shared_calls_are_attributed_the_same_in_any_order(
-            rows in proptest::strategy::Strategy::prop_shuffle(proptest::strategy::Just(shared_call_rows()))
-        ) {
+    #[rstest]
+    fn shared_calls_are_attributed_the_same_in_any_order() {
+        let shuffled = proptest::strategy::Strategy::prop_shuffle(proptest::strategy::Just(
+            shared_call_rows(),
+        ));
+        proptest::proptest!(|(rows in shuffled)| {
             let totals = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1872,7 +2190,7 @@ mod tests {
             // The fork starts at the parent's copied timestamp and "fork" < "parent", so only
             // ancestry keeps call A with the parent.
             proptest::prop_assert_eq!(totals, [40, 3, 1]);
-        }
+        });
     }
 
     /// Without ancestry, the earliest-started claimant owns the call, then the smallest id.
@@ -1914,20 +2232,6 @@ mod tests {
         ]);
     }
 
-    #[rstest]
-    #[tokio::test]
-    async fn transcript_separates_messages() {
-        let db = AiSessionDatabase::in_memory().await.unwrap();
-        let session = sample_handle();
-        for m in ordered_messages(&session) {
-            db.append(&m).await.unwrap();
-        }
-
-        let chunks: Vec<String> = db.transcript(&session).try_collect().await.unwrap();
-        assert!(chunks.iter().all(|c| c.ends_with('\n')), "each chunk must be newline-terminated");
-        assert_eq!(chunks.concat().lines().count(), 3, "messages must not run together");
-    }
-
     fn handle(harness: HarnessKind, id: &str) -> HarnessSession {
         HarnessSession {
             harness,
@@ -1951,8 +2255,40 @@ mod tests {
             .build()
     }
 
+    async fn search_with(
+        db: &AiSessionDatabase,
+        query: &str,
+        filter: &SessionFilter,
+        limit: u32,
+    ) -> Vec<SessionMatch> {
+        db.search(query, SearchTerms::Typed, filter, limit).try_collect().await.unwrap()
+    }
+
+    /// A search as the MCP tools make one: every term as a whole word, or with `any_term` any
+    /// term as a prefix, in the sessions at or under `cwd` when given.
+    fn search_in(
+        db: &AiSessionDatabase,
+        query: &str,
+        cwd: Option<&str>,
+        any_term: bool,
+    ) -> impl futures::Stream<Item = Result<SessionMatch, DbError>> + use<> {
+        let terms = if any_term {
+            SearchTerms::Any
+        } else {
+            SearchTerms::All
+        };
+        let filter = SessionFilter {
+            workspace: cwd.map(std::path::PathBuf::from),
+            ..SessionFilter::default()
+        };
+        db.search(query, terms, &filter, 0)
+    }
+
     async fn search(db: &AiSessionDatabase, query: &str) -> Vec<SessionMatch> {
-        db.search(query, None, 0).try_collect().await.unwrap()
+        db.search(query, SearchTerms::Typed, &SessionFilter::default(), 0)
+            .try_collect()
+            .await
+            .unwrap()
     }
 
     #[rstest]
@@ -1969,7 +2305,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn search_matches_reasoning_tool_calls_results_and_metadata() {
+    async fn search_matches_reasoning_tool_calls_and_metadata() {
         let db = AiSessionDatabase::in_memory().await.unwrap();
         let session = sample_handle();
         let mut message = message_with(&session, 0, Role::Assistant, vec![
@@ -1996,7 +2332,6 @@ mod tests {
             "tradeoffs",             // reasoning
             "execute_shell_command", // tool name
             "nextest",               // tool input
-            "ENOSPC",                // tool result output
             "peculiar",              // Content::Other
             "atuin",                 // cwd
             "feat",                  // git branch
@@ -2005,6 +2340,41 @@ mod tests {
         ] {
             assert_eq!(search(&db, query).await.len(), 1, "query {query:?} should match");
         }
+        assert!(search(&db, "ENOSPC").await.is_empty(), "tool output is not indexed");
+    }
+
+    /// A session is found by the files its calls changed, a moved file by both its names; not
+    /// by the lines changed.
+    #[rstest]
+    #[tokio::test]
+    async fn search_matches_the_files_a_patch_changed() {
+        use atuin_common::harnesstools::session::{Change, FilePatch, Hunk, Patch};
+
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let session = sample_handle();
+        let moved = FilePatch {
+            path: "src/renamed_from.rs".to_owned(),
+            change: Change::Update,
+            moved_to: Some("src/renamed_to.rs".to_owned()),
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec!["-quokka".to_owned(), "+wombat".to_owned()],
+            }],
+        };
+        db.append(&message_with(&session, 0, Role::Tool, vec![Content::Patch(Patch {
+            call: ToolCallId::from("call-1".to_owned()),
+            files: vec![moved],
+        })]))
+        .await
+        .unwrap();
+
+        for query in ["renamed_from", "renamed_to"] {
+            assert_eq!(search(&db, query).await.len(), 1, "query {query:?} should match");
+        }
+        assert!(search(&db, "wombat").await.is_empty(), "changed lines are not indexed");
     }
 
     #[rstest]
@@ -2016,11 +2386,18 @@ mod tests {
         db.append(&message_in(&claude, 0, "shared keyword")).await.unwrap();
         db.append(&message_in(&codex, 1, "shared keyword")).await.unwrap();
 
-        let all: Vec<_> = db.search("shared", None, 0).try_collect().await.unwrap();
+        let all: Vec<_> = db
+            .search("shared", SearchTerms::Typed, &SessionFilter::default(), 0)
+            .try_collect()
+            .await
+            .unwrap();
         assert_eq!(all.len(), 2);
 
-        let only_codex: Vec<_> =
-            db.search("shared", Some(HarnessKind::Codex), 0).try_collect().await.unwrap();
+        let only_codex: Vec<_> = db
+            .search("shared", SearchTerms::Typed, &harness_filter(HarnessKind::Codex), 0)
+            .try_collect()
+            .await
+            .unwrap();
         assert_eq!(only_codex.len(), 1);
         assert_eq!(only_codex[0].session.handle, codex);
     }
@@ -2051,17 +2428,13 @@ mod tests {
         let session = sample_handle();
         let parent = handle(HarnessKind::ClaudeCode, "parent");
         let mut first = message_in(&session, 0, "copied from the parent");
-        first.parent = Some(parent.clone());
+        first.parent = Some(parent);
         first.parent_kind = Some(ParentKind::Fork);
         db.append(&first).await.unwrap();
-        // A record from an older build carries the parent but not the kind: it must not erase it.
-        let mut older = message_in(&session, 1, "carried on");
-        older.parent = Some(parent);
-        db.append(&older).await.unwrap();
 
         let s = db.get_session(&session).await.unwrap().unwrap();
         assert_eq!(s.parent_kind, Some(ParentKind::Fork));
-        let listed = db.list_sessions(None, None).await.unwrap();
+        let listed = db.list_sessions(&SessionFilter::default()).await.unwrap();
         assert_eq!(listed[0].parent_kind, Some(ParentKind::Fork));
     }
 
@@ -2087,7 +2460,7 @@ mod tests {
             .await
             .unwrap();
 
-        let hits: Vec<_> = db.search_in("deploy", None, None, true, 0).try_collect().await.unwrap();
+        let hits: Vec<_> = search_in(&db, "deploy", None, true).try_collect().await.unwrap();
         let preview = hits[0].preview.to_plain().text.into_owned();
         assert!(preview.contains("deployment failed"), "{preview}");
     }
@@ -2099,10 +2472,10 @@ mod tests {
         db.append(&message_in(&sample_handle(), 0, "the deployment failed")).await.unwrap();
 
         let strict: Vec<_> =
-            db.search_in("deploy broken", None, None, false, 0).try_collect().await.unwrap();
+            search_in(&db, "deploy broken", None, false).try_collect().await.unwrap();
         assert!(strict.is_empty(), "no message has both whole words");
         let loose: Vec<_> =
-            db.search_in("deploy broken", None, None, true, 0).try_collect().await.unwrap();
+            search_in(&db, "deploy broken", None, true).try_collect().await.unwrap();
         assert_eq!(loose.len(), 1, "`deploy` matches `deployment` as a prefix");
     }
 
@@ -2123,8 +2496,7 @@ mod tests {
             db.append(&msg).await.unwrap();
         }
 
-        let mut found: Vec<String> = db
-            .search_in("shared", None, Some("/work/atuin/"), false, 0)
+        let mut found: Vec<String> = search_in(&db, "shared", Some("/work/atuin/"), false)
             .map_ok(|m| m.session.handle.session.as_ref().to_owned())
             .try_collect()
             .await
@@ -2143,8 +2515,7 @@ mod tests {
             db.append(&msg).await.unwrap();
         }
 
-        let found: Vec<String> = db
-            .search_in("shared", None, Some(r"C:\work\atuin\"), false, 0)
+        let found: Vec<String> = search_in(&db, "shared", Some(r"C:\work\atuin\"), false)
             .map_ok(|m| m.session.handle.session.as_ref().to_owned())
             .try_collect()
             .await
@@ -2163,11 +2534,8 @@ mod tests {
         db.append(&meta).await.unwrap();
         db.append(&message_in(&session, 1, "osc hyperlink bug")).await.unwrap();
 
-        let hits: Vec<_> = db
-            .search_in("hyperlink", None, Some("/work/terminal"), false, 0)
-            .try_collect()
-            .await
-            .unwrap();
+        let hits: Vec<_> =
+            search_in(&db, "hyperlink", Some("/work/terminal"), false).try_collect().await.unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -2208,15 +2576,21 @@ mod tests {
             db.append(&message_in(&session, i, "common term")).await.unwrap();
         }
 
-        let two: Vec<_> = db.search("common", None, 2).try_collect().await.unwrap();
+        let two: Vec<_> = db
+            .search("common", SearchTerms::Typed, &SessionFilter::default(), 2)
+            .try_collect()
+            .await
+            .unwrap();
         assert_eq!(two.len(), 2);
-        let all: Vec<_> = db.search("common", None, 0).try_collect().await.unwrap();
+        let all: Vec<_> = db
+            .search("common", SearchTerms::Typed, &SessionFilter::default(), 0)
+            .try_collect()
+            .await
+            .unwrap();
         assert_eq!(all.len(), 5);
     }
 
     #[rstest]
-    #[case::empty("")]
-    #[case::whitespace("   \t\n ")]
     #[case::punctuation_only("()")]
     #[case::operator_soup("***")]
     #[tokio::test]
@@ -2290,7 +2664,11 @@ mod tests {
         let quiet = handle(HarnessKind::ClaudeCode, "quiet");
         db.append(&message_in(&quiet, 100, "shared keyword")).await.unwrap();
 
-        let two: Vec<_> = db.search("keyword", None, 2).try_collect().await.unwrap();
+        let two: Vec<_> = db
+            .search("keyword", SearchTerms::Typed, &SessionFilter::default(), 2)
+            .try_collect()
+            .await
+            .unwrap();
         assert_eq!(two.len(), 2, "ranking is per session: one chatty session takes one slot");
         assert!(
             two.iter().any(|m| m.session.handle == quiet),
@@ -2338,7 +2716,8 @@ mod tests {
             .await
             .unwrap();
 
-        let hits = search(&db, "app").await;
+        // A trailing space finishes the term, so it is not a prefix of `apple`.
+        let hits = search(&db, "app ").await;
         assert_eq!(hits.len(), 1);
         let preview = hits[0].preview.to_plain().text.into_owned();
         assert!(preview.contains("app end"), "the token match must be visible: {preview:?}");
@@ -2405,48 +2784,57 @@ mod tests {
         assert!(!preview.contains("filler-000"), "the window must not span the whole body");
     }
 
+    /// A replayed page is appended only under the generation its replay read: one that outlives
+    /// a wipe (or any invalidation) must not land in the sidecar after it.
     #[rstest]
     #[tokio::test]
-    async fn reindex_backfills_messages_indexed_before_the_fts_row_existed() {
+    async fn a_page_appends_nothing_after_an_invalidation() {
         let db = AiSessionDatabase::in_memory().await.unwrap();
         let session = sample_handle();
-        let long: String = (0..64).map(|i| format!("chunk-{i:03}-buried ")).collect();
-        assert!(long.len() >= COMPRESS_THRESHOLD);
-        db.append(&message_in(&session, 0, &long)).await.unwrap();
-        db.append(&message_in(&session, 1, "plain buried token")).await.unwrap();
+        let page = |range: std::ops::Range<i64>| {
+            range
+                .map(|i| super::PreparedMessage::new(message_in(&session, i, "text")).unwrap())
+                .collect()
+        };
 
-        // Simulate a sidecar upgraded to the FTS migration with no index rows yet.
-        atuin_common::db::query("DELETE FROM messages_fts").execute(db.db.pool()).await.unwrap();
-        assert!(search(&db, "buried").await.is_empty());
+        let stale = db.projection_generation().await.unwrap();
+        db.reset().await.unwrap();
+        assert!(!db.append_all(page(0..2), stale).await.unwrap());
+        let first = message_in(&session, 0, "text");
+        assert!(!db.contains_message(&first.session, &first.source_id).await.unwrap());
 
-        db.reindex().await.unwrap();
-        assert_eq!(search(&db, "buried").await.len(), 1);
-
-        // A second pass must not duplicate the index or change results.
-        db.reindex().await.unwrap();
-        assert_eq!(search(&db, "buried").await.len(), 1);
+        let current = db.projection_generation().await.unwrap();
+        assert!(db.append_all(page(0..2), current).await.unwrap());
+        assert!(db.contains_message(&first.session, &first.source_id).await.unwrap());
     }
 
+    /// Text interned by a page that failed is gone with the rest of it: a later row with the
+    /// same text stores it afresh rather than pointing at the id the failed page gave it.
     #[rstest]
     #[tokio::test]
-    async fn reindex_resumes_from_an_interrupted_backfill() {
+    async fn text_interned_by_a_failed_page_is_stored_again() {
         let db = AiSessionDatabase::in_memory().await.unwrap();
         let session = sample_handle();
-        db.append(&message_in(&session, 0, "alpha unique-a")).await.unwrap();
-        db.append(&message_in(&session, 1, "beta unique-b")).await.unwrap();
-        db.append(&message_in(&session, 2, "gamma unique-c")).await.unwrap();
-
-        atuin_common::db::query(
-            "DELETE FROM messages_fts WHERE rowid = (SELECT max(rowid) FROM messages_fts)",
+        let in_dir = |index| {
+            let mut msg = message_in(&session, index, "text");
+            msg.cwd = Some(std::path::PathBuf::from("/only/here"));
+            msg
+        };
+        db::query(
+            "CREATE TRIGGER fail_second BEFORE INSERT ON messages WHEN NEW.source_id = 'source-1' \
+             BEGIN SELECT RAISE(ABORT, 'fail'); END",
         )
         .execute(db.db.pool())
         .await
         .unwrap();
-        assert!(search(&db, "unique-c").await.is_empty(), "the highest-rowid row is unindexed");
-        assert_eq!(search(&db, "unique-a").await.len(), 1, "the prefix stays indexed");
+        let page = [0, 1].map(|i| super::PreparedMessage::new(in_dir(i)).unwrap());
+        let generation = db.projection_generation().await.unwrap();
+        db.append_all(page.into(), generation).await.expect_err("the trigger fails the page");
 
-        db.reindex().await.unwrap();
-        assert_eq!(search(&db, "unique-c").await.len(), 1, "reindex fills the suffix gap");
+        db.append(&in_dir(2)).await.unwrap();
+        let stored: Vec<Message> = db.messages(&session).try_collect().await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].cwd, Some(std::path::PathBuf::from("/only/here")));
     }
 
     #[rstest]
@@ -2528,5 +2916,1826 @@ mod tests {
         db.append(&again).await.unwrap();
         assert_eq!(indexed_with_title("GammaTitle").await, 3);
         assert_eq!(search(&db, "GammaTitle").await.len(), 1);
+    }
+
+    // --- search as you type, highlights, ranking -----------------------------------------------
+
+    /// A query without terms lists sessions, newest first.
+    #[rstest]
+    #[case::empty("")]
+    #[case::whitespace("   \t\n ")]
+    #[tokio::test]
+    async fn an_empty_query_lists_sessions_newest_first(#[case] query: &str) {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        for m in three_sessions_oldest_first() {
+            db.append(&m).await.unwrap();
+        }
+        let hits = search(&db, query).await;
+        let ids: Vec<_> = hits.iter().map(|m| m.session.handle.session.to_string()).collect();
+        assert_eq!(ids, ["session-2", "session-1", "session-0"]);
+        assert!(hits.iter().all(|m| !m.title.has_match() && !m.preview.has_match()));
+        assert_eq!(search_with(&db, query, &SessionFilter::default(), 2).await.len(), 2);
+    }
+
+    /// The last term matches as a prefix while it is being typed, and whole once finished.
+    #[rstest]
+    #[case::partial_last_term("refac", 1)]
+    #[case::partial_after_a_whole_term("cargo tes", 1)]
+    #[case::finished_term("refac ", 0)]
+    #[case::only_the_last_term_is_a_prefix("carg test", 0)]
+    #[case::partial_phrase("foo-ba", 1)]
+    #[case::a_lone_character_is_a_whole_token("r", 0)]
+    #[case::two_characters_are_a_prefix("re", 1)]
+    #[tokio::test]
+    async fn the_last_term_matches_as_a_prefix(#[case] query: &str, #[case] hits: usize) {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        db.append(&message_in(&sample_handle(), 0, "refactor the cargo testsuite foo-bar"))
+            .await
+            .unwrap();
+        assert_eq!(search(&db, query).await.len(), hits, "query {query:?}");
+    }
+
+    /// The highlighted text of `h`, with matches in brackets.
+    fn marked(h: &atuin_common::string::highlighted::HighlightedString) -> String {
+        h.display_subs(['[', ']']).to_string()
+    }
+
+    /// The byte ranges of `h`'s matches in its plain text, as the gRPC API and CLI JSON give them.
+    fn spans(h: &atuin_common::string::highlighted::HighlightedString) -> Vec<(usize, usize)> {
+        h.to_plain().ranges.iter().map(|r| (r.start, r.end)).collect()
+    }
+
+    #[rstest]
+    #[case::whole_token(
+        SearchTerms::All,
+        "error",
+        "An Error and an error.",
+        "An [Error] and an [error]."
+    )]
+    #[case::no_substring_matches(SearchTerms::All, "app", "apple app", "apple [app]")]
+    #[case::folded_like_the_index(SearchTerms::All, "cafe", "the café opens", "the [café] opens")]
+    #[case::phrase_across_words(
+        SearchTerms::All,
+        "foo-bar",
+        "foo bar foo baz",
+        "[foo] [bar] foo baz"
+    )]
+    #[case::every_term(
+        SearchTerms::All,
+        "build failed",
+        "the build failed",
+        "the [build] [failed]"
+    )]
+    #[case::stray_markers_are_stripped(SearchTerms::All, "x", "a\u{E000}b x", "ab [x]")]
+    #[case::typed_prefix_marks_the_whole_token(
+        SearchTerms::Typed,
+        "refac",
+        "Refactoring it",
+        "[Refactoring] it"
+    )]
+    #[case::typed_only_the_last_term_a_prefix(
+        SearchTerms::Typed,
+        "build fail",
+        "the build failed",
+        "the [build] [failed]"
+    )]
+    #[case::typed_finished_term_is_whole(SearchTerms::Typed, "app ", "apple app", "apple [app]")]
+    #[case::any_prefix_marks_the_whole_token(
+        SearchTerms::Any,
+        "refac",
+        "Refactoring it",
+        "[Refactoring] it"
+    )]
+    #[case::any_term(SearchTerms::Any, "build nothing", "the build failed", "the [build] failed")]
+    #[case::any_every_term_a_prefix(
+        SearchTerms::Any,
+        "build fail",
+        "the builder failed",
+        "the [builder] [failed]"
+    )]
+    #[case::any_phrase_last_token_a_prefix(
+        SearchTerms::Any,
+        "foo-ba",
+        "foo bar fob",
+        "[foo] [bar] fob"
+    )]
+    fn highlights_mark_what_the_index_matched(
+        #[case] mode: SearchTerms,
+        #[case] query: &str,
+        #[case] text: &str,
+        #[case] expected: &str,
+    ) {
+        let highlighted =
+            QueryTerms::parse(query, mode).highlight(TextHighlighter::default(), text);
+        assert_eq!(marked(&highlighted), expected);
+    }
+
+    /// A search's title and snippet carry the spans of what the query matched, which the gRPC
+    /// API and `atuin ai session search --format json` pass on.
+    #[rstest]
+    #[case::all(
+        SearchTerms::All,
+        "parser",
+        "[Parser] refactor",
+        (0, 6),
+        "we refactored the [parser]",
+        "parser"
+    )]
+    #[case::any(
+        SearchTerms::Any,
+        "refac nothing",
+        "Parser [refactor]",
+        (7, 15),
+        "we [refactored] the parser",
+        "refactored"
+    )]
+    #[case::typed(
+        SearchTerms::Typed,
+        "refac",
+        "Parser [refactor]",
+        (7, 15),
+        "we [refactored] the parser",
+        "refactored"
+    )]
+    #[tokio::test]
+    async fn search_highlights_the_title_and_snippet(
+        #[case] mode: SearchTerms,
+        #[case] query: &str,
+        #[case] title: &str,
+        #[case] title_span: (usize, usize),
+        #[case] snippet: &str,
+        #[case] snippet_match: &str,
+    ) {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let filler: String = (0..200).map(|i| format!("filler-{i:03} ")).collect();
+        let mut m = message_in(&sample_handle(), 0, &format!("{filler}we refactored the parser"));
+        m.session_title = Some("Parser refactor".to_owned());
+        db.append(&m).await.unwrap();
+
+        let hits: Vec<SessionMatch> =
+            db.search(query, mode, &SessionFilter::default(), 0).try_collect().await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(marked(&hits[0].title), title);
+        assert_eq!(spans(&hits[0].title), [title_span]);
+        let preview = marked(&hits[0].preview);
+        assert!(preview.contains(snippet), "{preview:?}");
+        assert!(!preview.contains("filler-000"), "{preview:?}");
+        let plain = hits[0].preview.to_plain();
+        let [span] = plain.ranges.as_slice() else {
+            panic!("one match in the snippet: {plain:?}");
+        };
+        assert_eq!(&plain.text[span.clone()], snippet_match);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_title_match_outranks_a_body_match() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let body = handle(HarnessKind::ClaudeCode, "body");
+        let titled = handle(HarnessKind::ClaudeCode, "titled");
+        db.append(&message_in(&body, 0, "we talked about the tokenizer at length")).await.unwrap();
+        let mut m = message_in(&titled, 0, "unrelated words entirely here");
+        m.session_title = Some("tokenizer".to_owned());
+        db.append(&m).await.unwrap();
+
+        let hits = search(&db, "tokenizer").await;
+        assert_eq!(hits[0].session.handle, titled);
+    }
+
+    /// Equally relevant sessions rank newest first.
+    #[rstest]
+    #[tokio::test]
+    async fn recency_breaks_equal_relevance() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        for (id, age_days) in [("old", 90), ("new", 1), ("mid", 30)] {
+            let mut m = message_in(&handle(HarnessKind::Pi, id), 0, "same words here");
+            m.timestamp = OffsetDateTime::from_unix_timestamp(now - age_days * 86_400).unwrap();
+            db.append(&m).await.unwrap();
+        }
+        let ids: Vec<_> = search(&db, "words")
+            .await
+            .iter()
+            .map(|m| m.session.handle.session.to_string())
+            .collect();
+        assert_eq!(ids, ["new", "mid", "old"]);
+    }
+
+    // --- hosts ----------------------------------------------------------------------------------
+
+    fn host(n: u128) -> HostId {
+        HostId(uuid::Uuid::from_u128(n))
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn the_capturing_host_is_kept_on_rows_and_sessions() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let mut m = sample_message();
+        m.host = Some(host(1));
+        db.append(&m).await.unwrap();
+
+        let session = db.get_session(&m.session).await.unwrap().unwrap();
+        assert_eq!(session.host, Some(host(1)));
+        let rows: Vec<_> = db.messages(&m.session).try_collect().await.unwrap();
+        assert_eq!(rows[0].host, Some(host(1)));
+    }
+
+    /// A row stored before hosts were tracked learns its host when its record is replayed, and
+    /// a known host is never overwritten.
+    #[rstest]
+    #[tokio::test]
+    async fn a_replayed_row_fills_in_a_missing_host() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let m = sample_message();
+        db.append(&m).await.unwrap();
+        assert_eq!(db.get_session(&m.session).await.unwrap().unwrap().host, None);
+
+        let mut replayed = m.clone();
+        replayed.host = Some(host(1));
+        assert_eq!(db.append(&replayed).await.unwrap(), Appended::Duplicate);
+        replayed.host = Some(host(2));
+        db.append(&replayed).await.unwrap();
+
+        assert_eq!(db.get_session(&m.session).await.unwrap().unwrap().host, Some(host(1)));
+        let rows: Vec<_> = db.messages(&m.session).try_collect().await.unwrap();
+        assert_eq!(rows[0].host, Some(host(1)));
+    }
+
+    /// Forgetting a host removes its sessions, index rows and usage claims, and nothing else:
+    /// a call it shared goes to the claimant left, and a group it headed regroups.
+    #[rstest]
+    #[tokio::test]
+    async fn forgetting_a_host_removes_only_its_sessions() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let on = |mut m: Message, n| {
+            m.host = Some(host(n));
+            m
+        };
+        // `gone` (host 1) heads a group holding `kept-child` (host 2); both claim call A.
+        db.append(&on(call_row("gone", None, "g1", 0, Some("A"), 10), 1)).await.unwrap();
+        db.append(&on(call_row("kept-child", Some("gone"), "k1", 1, Some("A"), 10), 2))
+            .await
+            .unwrap();
+        db.append(&on(call_row("kept", None, "k2", 2, None, 5), 2)).await.unwrap();
+        let pi = |id: &str| handle(HarnessKind::Pi, id);
+        assert_eq!(output_of(&db, "kept-child").await, 0, "the parent owns the shared call");
+        assert_eq!(
+            db.get_session(&pi("kept-child")).await.unwrap().unwrap().root,
+            Some(pi("gone"))
+        );
+
+        db.forget_host(host(1)).await.unwrap();
+
+        assert!(db.get_session(&pi("gone")).await.unwrap().is_none());
+        let rows: Vec<_> = db.messages(&pi("gone")).try_collect().await.unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(output_of(&db, "kept-child").await, 10, "the call moves to the claimant left");
+        assert_eq!(output_of(&db, "kept").await, 5);
+        let child = db.get_session(&pi("kept-child")).await.unwrap().unwrap();
+        assert!(child.is_root(), "a group whose root went regroups");
+        assert_eq!(search(&db, "x").await.len(), 2, "only the forgotten rows leave the index");
+
+        // Replaying the host's records restores it.
+        db.append(&on(call_row("gone", None, "g1", 0, Some("A"), 10), 1)).await.unwrap();
+        assert_eq!(output_of(&db, "gone").await, 10);
+        assert_eq!(output_of(&db, "kept-child").await, 0);
+        let child = db.get_session(&pi("kept-child")).await.unwrap().unwrap();
+        assert_eq!(child.root, Some(pi("gone")));
+    }
+
+    // --- grouping -------------------------------------------------------------------------------
+
+    /// A row of session `id` with parent `parent`, at `seconds`, saying `text`. Like Claude
+    /// Code's, an `agent-*` child is a subagent and any other a fork.
+    fn tree_row(id: &str, parent: Option<&str>, seconds: i64, text: &str) -> Message {
+        let mut m = message_in(&handle(HarnessKind::ClaudeCode, id), seconds, text);
+        m.source_id = SourceId::from(format!("{id}-{seconds}"));
+        m.parent = parent.map(|p| handle(HarnessKind::ClaudeCode, p));
+        m.parent_kind = m.parent.as_ref().map(|_| {
+            if id.starts_with("agent-") {
+                ParentKind::Subagent
+            } else {
+                ParentKind::Fork
+            }
+        });
+        m
+    }
+
+    /// Two trees and an orphan whose parent is never stored: `root` with a fork, a subagent
+    /// and the fork's own subagent; `other` with a fork; `orphan` naming a missing `ghost`, with a
+    /// child of its own. Every session's first row names its parent except `late`, which only
+    /// learns it on its second row.
+    fn forest() -> Vec<Message> {
+        vec![
+            tree_row("root", None, 0, "root words"),
+            tree_row("fork", Some("root"), 10, "fork words"),
+            tree_row("agent-a", Some("root"), 11, "subagent words"),
+            tree_row("agent-b", Some("fork"), 12, "nested needle words"),
+            tree_row("late", None, 13, "late words"),
+            tree_row("late", Some("fork"), 14, "late words again"),
+            tree_row("other", None, 20, "other words"),
+            tree_row("other-fork", Some("other"), 21, "other fork words"),
+            tree_row("orphan", Some("ghost"), 30, "orphan words"),
+            tree_row("orphan-child", Some("orphan"), 31, "orphan child words"),
+        ]
+    }
+
+    async fn roots_of(db: &AiSessionDatabase) -> Vec<(String, String)> {
+        let mut roots: Vec<_> = db
+            .list_sessions(&SessionFilter::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.handle.session.to_string(), s.group().session.to_string()))
+            .collect();
+        roots.sort();
+        roots
+    }
+
+    /// The root every session of [`forest`] groups under, sorted.
+    fn forest_roots() -> Vec<(String, String)> {
+        [
+            ("agent-a", "root"),
+            ("agent-b", "root"),
+            ("fork", "root"),
+            ("late", "root"),
+            ("orphan", "orphan"),
+            ("orphan-child", "orphan"),
+            ("other", "other"),
+            ("other-fork", "other"),
+            ("root", "root"),
+        ]
+        .map(|(id, root)| (id.to_owned(), root.to_owned()))
+        .to_vec()
+    }
+
+    /// Every session groups under its top-most stored ancestor whatever order its rows (and
+    /// its ancestors') arrive in: children before parents, parents learned late.
+    #[rstest]
+    fn grouping_does_not_depend_on_arrival_order() {
+        let shuffled =
+            proptest::strategy::Strategy::prop_shuffle(proptest::strategy::Just(forest()));
+        proptest::proptest!(|(rows in shuffled)| {
+            let roots = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let db = AiSessionDatabase::in_memory().await.unwrap();
+                    for m in &rows {
+                        db.append(m).await.unwrap();
+                    }
+                    roots_of(&db).await
+                });
+            proptest::prop_assert_eq!(roots, forest_roots());
+        });
+    }
+
+    /// The missing parent arriving at last adopts the group that waited for it.
+    #[rstest]
+    #[tokio::test]
+    async fn a_late_parent_adopts_its_waiting_children() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        db.append(&tree_row("child", Some("parent"), 1, "x")).await.unwrap();
+        db.append(&tree_row("grandchild", Some("child"), 2, "x")).await.unwrap();
+        let child = db.get_session(&handle(HarnessKind::ClaudeCode, "child")).await.unwrap();
+        assert!(child.unwrap().is_root(), "a session whose parent is not stored is a root");
+
+        db.append(&tree_row("parent", Some("grandparent"), 0, "x")).await.unwrap();
+        db.append(&tree_row("grandparent", None, 0, "x")).await.unwrap();
+        let roots = roots_of(&db).await;
+        assert!(roots.iter().all(|(_, root)| root == "grandparent"), "{roots:?}");
+    }
+
+    /// Sessions continued in other harnesses group under the session
+    /// they continue, in whichever order their rows arrive (as a reprojection from the synced
+    /// records replays them), and are its continuations.
+    #[rstest]
+    #[tokio::test]
+    async fn continuations_in_other_harnesses_group_under_the_original(
+        #[values(false, true)] reversed: bool,
+    ) {
+        let row = |harness, id: &str, parent: Option<(HarnessKind, &str)>, seconds| {
+            let mut m = message_in(&handle(harness, id), seconds, "words");
+            m.source_id = SourceId::from(format!("{id}-{seconds}"));
+            m.parent = parent.map(|(h, p)| handle(h, p));
+            m.parent_kind = m.parent.as_ref().map(|_| ParentKind::Continuation);
+            m
+        };
+        let mut rows = vec![
+            row(HarnessKind::Codex, "orig", None, 0),
+            // The parent is named after a line naming nothing (Pi's header, Codex's
+            // session_meta).
+            row(HarnessKind::ClaudeCode, "in-claude", None, 10),
+            row(HarnessKind::ClaudeCode, "in-claude", Some((HarnessKind::Codex, "orig")), 11),
+            row(HarnessKind::Pi, "in-pi", Some((HarnessKind::ClaudeCode, "in-claude")), 20),
+        ];
+        if reversed {
+            rows.reverse();
+        }
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        for m in &rows {
+            db.append(m).await.unwrap();
+        }
+        let original = handle(HarnessKind::Codex, "orig");
+        for (harness, id) in [(HarnessKind::ClaudeCode, "in-claude"), (HarnessKind::Pi, "in-pi")] {
+            let s = db.get_session(&handle(harness, id)).await.unwrap().unwrap();
+            assert_eq!(s.group(), &original, "{id}");
+            assert_eq!(s.parent_kind, Some(ParentKind::Continuation), "{id}");
+        }
+        let children: Vec<String> = db
+            .children(&original)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.handle.session.to_string())
+            .collect();
+        assert_eq!(children, ["in-pi", "in-claude"]);
+    }
+
+    /// A cycle of parent links (`a` → `b` → `c` → `a`, with `x` hanging off it) cannot loop, and
+    /// has no top: it and what hangs off it group under its least member, whatever order its
+    /// rows arrive in, and as a regroup of everything decides.
+    #[rstest]
+    #[tokio::test]
+    async fn a_parent_cycle_groups_under_its_least_member(
+        #[values([0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2], [2, 0, 3, 1])] order: [usize; 4],
+    ) {
+        let rows = [
+            tree_row("x", Some("a"), 0, "x"),
+            tree_row("a", Some("b"), 1, "x"),
+            tree_row("b", Some("c"), 2, "x"),
+            tree_row("c", Some("a"), 3, "x"),
+        ];
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        for i in order {
+            db.append(&rows[i]).await.unwrap();
+        }
+        let expected: Vec<_> =
+            ["a", "b", "c", "x"].map(|id| (id.to_owned(), "a".to_owned())).to_vec();
+        assert_eq!(roots_of(&db).await, expected);
+
+        db.write(|conn| AiSessionDatabase::regroup_all(conn)).await.unwrap();
+        assert_eq!(roots_of(&db).await, expected);
+    }
+
+    /// `s000` ← `s001` ← … ← `s{n-1}`: a chain of parents `n` long.
+    fn chain_ids(n: usize) -> Vec<(String, Option<String>)> {
+        (0..n).map(|i| (format!("s{i:03}"), i.checked_sub(1).map(|p| format!("s{p:03}")))).collect()
+    }
+
+    /// However long a chain of forks, it is one group, whether placed as its rows arrive or
+    /// regrouped all at once.
+    #[rstest]
+    #[tokio::test]
+    async fn a_deep_chain_is_one_group() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        for (i, (id, parent)) in chain_ids(100).iter().enumerate() {
+            let seconds = i64::try_from(i).unwrap();
+            db.append(&tree_row(id, parent.as_deref(), seconds, "x")).await.unwrap();
+        }
+        let one_group = |roots: Vec<(String, String)>| roots.iter().all(|(_, r)| r == "s000");
+        assert!(one_group(roots_of(&db).await));
+
+        db.write(|conn| AiSessionDatabase::regroup_all(conn)).await.unwrap();
+        assert!(one_group(roots_of(&db).await), "{:?}", roots_of(&db).await);
+    }
+
+    // --- copies ---------------------------------------------------------------------------------
+
+    /// A line of Claude Code session `id`: its own uuid `source`, and for an assistant line the
+    /// API message id `turn`, with the call's usage.
+    fn claude_row(
+        id: &str,
+        parent: Option<&str>,
+        source: &str,
+        seconds: i64,
+        turn: Option<&str>,
+        output: u64,
+    ) -> Message {
+        let mut m = tree_row(id, parent, seconds, "words");
+        m.source_id = SourceId::from(source.to_owned());
+        if let Some(turn) = turn {
+            m.role = Role::Assistant;
+            m.turn_id = Some(turn.to_owned());
+            m.usage = Some(Usage {
+                input: Some(1),
+                output: Some(output),
+                cache_read: Some(0),
+                cache_write: Some(0),
+                reasoning: None,
+            });
+        }
+        m
+    }
+
+    /// Sessions as `claude --resume <id> --fork-session` (or a `--resume` Claude Code turns into
+    /// a fork) leave them. `resumed` starts with a copy of `original`'s lines (their uuids,
+    /// timestamps and API message ids) under its own session id, naming `original` nowhere, then
+    /// goes on; `original` goes on too. `twice` is a copy of `resumed` in turn. `agent-x` is a
+    /// subagent of `resumed` and `branch` a `/branch` fork of `original`, both naming their
+    /// parent, and `zeta` shares nothing.
+    fn copies() -> Vec<Message> {
+        let history = [
+            ("u1", 0, None, 0),
+            ("a1", 1, Some("msg_A"), 10),
+            ("u2", 2, None, 0),
+            ("a2", 3, Some("msg_B"), 20),
+        ];
+        let mut rows = Vec::new();
+        for id in ["original", "resumed", "twice"] {
+            for (source, seconds, turn, output) in history {
+                rows.push(claude_row(id, None, source, seconds, turn, output));
+            }
+        }
+        for id in ["resumed", "twice"] {
+            rows.push(claude_row(id, None, "u3", 100, None, 0));
+            rows.push(claude_row(id, None, "a3", 101, Some("msg_C"), 7));
+        }
+        rows.extend([
+            claude_row("original", None, "a9", 50, Some("msg_D"), 5),
+            claude_row("twice", None, "a4", 200, Some("msg_G"), 3),
+            claude_row("agent-x", Some("resumed"), "x1", 102, Some("msg_E"), 2),
+            claude_row("branch", Some("original"), "u1", 0, None, 0),
+            claude_row("branch", Some("original"), "a1", 1, Some("msg_A"), 10),
+            claude_row("branch", Some("original"), "b1", 60, Some("msg_F"), 4),
+            claude_row("zeta", None, "z1", 0, Some("msg_Z"), 1),
+        ]);
+        rows
+    }
+
+    /// Every session's group, and the session it was found to be a copy of.
+    async fn copy_links(db: &AiSessionDatabase) -> Vec<(String, String, Option<String>)> {
+        let mut links: Vec<_> = db
+            .list_sessions(&SessionFilter::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| {
+                let copy_of = s.copy_of.as_ref().map(|c| c.session.to_string());
+                (s.handle.session.to_string(), s.group().session.to_string(), copy_of)
+            })
+            .collect();
+        links.sort();
+        links
+    }
+
+    fn copies_links() -> Vec<(String, String, Option<String>)> {
+        [
+            ("agent-x", "original", None),
+            ("branch", "original", None),
+            ("original", "original", None),
+            ("resumed", "original", Some("original")),
+            ("twice", "original", Some("original")),
+            ("zeta", "zeta", None),
+        ]
+        .map(|(id, root, copy_of)| (id.to_owned(), root.to_owned(), copy_of.map(str::to_owned)))
+        .to_vec()
+    }
+
+    /// Each session's attributed output, from [`copies`].
+    async fn copies_output(db: &AiSessionDatabase) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        for s in db.list_sessions(&SessionFilter::default()).await.unwrap() {
+            out.push((s.handle.session.to_string(), s.usage.output.unwrap()));
+        }
+        out.sort();
+        out
+    }
+
+    /// A copy groups under the session it was copied from, which names it nowhere, whatever
+    /// order the rows arrive in: copied lines before the original's, a start that moves
+    /// earlier, a copy of a copy. Each shared call still counts once, with the group's root.
+    #[rstest]
+    fn copies_group_under_their_original_in_any_order() {
+        let shuffled =
+            proptest::strategy::Strategy::prop_shuffle(proptest::strategy::Just(copies()));
+        proptest::proptest!(|(rows in shuffled)| {
+            let (links, output) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let db = AiSessionDatabase::in_memory().await.unwrap();
+                    for m in &rows {
+                        db.append(m).await.unwrap();
+                    }
+                    (copy_links(&db).await, copies_output(&db).await)
+                });
+            proptest::prop_assert_eq!(links, copies_links());
+            let expected: Vec<_> = [
+                ("agent-x", 2),
+                ("branch", 4),
+                ("original", 35),
+                ("resumed", 7),
+                ("twice", 3),
+                ("zeta", 1),
+            ]
+            .map(|(id, out)| (id.to_owned(), out))
+            .to_vec();
+            proptest::prop_assert_eq!(output, expected);
+        });
+    }
+
+    /// An assistant row of `harness` session `id` holding model call `turn`.
+    fn turn_row(harness: HarnessKind, id: &str, seconds: i64, turn: &str) -> Message {
+        let mut m = message_in(&handle(harness, id), seconds, "words");
+        m.source_id = SourceId::from(format!("{id}-{seconds}"));
+        m.role = Role::Assistant;
+        m.turn_id = Some(turn.to_owned());
+        m
+    }
+
+    /// The turn ids of each harness's form: whether the harness gave it, so that two sessions
+    /// holding it were copied one from the other, or capture derived it from the line's content,
+    /// which unrelated sessions can share.
+    fn turn_forms() -> Vec<(HarnessKind, &'static str, bool)> {
+        vec![
+            (HarnessKind::ClaudeCode, "msg_01ABC", true),
+            (HarnessKind::Codex, "resp_0123abcd", true),
+            (HarnessKind::Codex, "token_count:12000.0.40.0.12040", false),
+            (HarnessKind::Codex, "token_count:2026-09-18T10:00:00.000Z:12000.0.40.0.12040", false),
+            (HarnessKind::Codex, "thread:12000.0.40.0.12040", false),
+            (HarnessKind::Pi, "entry:a1b2c3d4:2026-09-18T10:00:00.000Z", true),
+            (HarnessKind::Pi, "line:message:2026-09-18T10:00:00.000Z:1758189600000:10:5::", false),
+            (HarnessKind::Opencode, "1758189600000:anthropic/claude-sonnet-4", false),
+            (HarnessKind::Opencode, "1758189600000:anthropic/claude#10/5/0/0/0", false),
+        ]
+    }
+
+    /// Two parentless sessions holding one call are linked, the later a copy of the earlier,
+    /// only when the harness gave the call its id.
+    #[rstest]
+    #[tokio::test]
+    async fn only_a_harness_given_turn_id_links_copies() {
+        for (harness, turn, links) in turn_forms() {
+            let db = AiSessionDatabase::in_memory().await.unwrap();
+            db.append(&turn_row(harness, "first", 0, turn)).await.unwrap();
+            db.append(&turn_row(harness, "second", 10, turn)).await.unwrap();
+            let second = db.get_session(&handle(harness, "second")).await.unwrap().unwrap();
+            let expected = links.then(|| handle(harness, "first"));
+            assert_eq!(second.copy_of, expected, "{harness:?} {turn}");
+            assert_eq!(second.is_root(), !links, "{harness:?} {turn}");
+        }
+    }
+
+    /// [`turn_row`] reporting `output` tokens, in a session naming `parent` (if any).
+    fn usage_row(
+        harness: HarnessKind,
+        id: &str,
+        parent: Option<&str>,
+        seconds: i64,
+        turn: &str,
+        output: u64,
+    ) -> Message {
+        let mut m = turn_row(harness, id, seconds, turn);
+        m.parent = parent.map(|p| handle(harness, p));
+        m.usage = Some(Usage {
+            input: Some(1),
+            output: Some(output),
+            cache_read: Some(0),
+            cache_write: Some(0),
+            reasoning: None,
+        });
+        m
+    }
+
+    async fn output_in(db: &AiSessionDatabase, harness: HarnessKind, id: &str) -> u64 {
+        let session = db.get_session(&handle(harness, id)).await.unwrap().unwrap();
+        session.usage.output.unwrap()
+    }
+
+    /// Two unrelated sessions holding one call count it once, with the earlier, only when the
+    /// harness gave the call its id: one derived from content (two fresh Codex sessions sent the
+    /// same first prompt report the same `token_count:` totals) is each session's own call.
+    #[rstest]
+    #[tokio::test]
+    async fn only_a_harness_given_turn_id_shares_usage_across_unrelated_sessions() {
+        for (harness, turn, shared) in turn_forms() {
+            for reversed in [false, true] {
+                let db = AiSessionDatabase::in_memory().await.unwrap();
+                let mut rows = vec![
+                    usage_row(harness, "first", None, 0, turn, 10),
+                    usage_row(harness, "second", None, 10, turn, 7),
+                ];
+                if reversed {
+                    rows.reverse();
+                }
+                for row in &rows {
+                    db.append(row).await.unwrap();
+                }
+                let got = [
+                    output_in(&db, harness, "first").await,
+                    output_in(&db, harness, "second").await,
+                ];
+                let expected = if shared {
+                    [10, 0]
+                } else {
+                    [10, 7]
+                };
+                assert_eq!(got, expected, "{harness:?} {turn} reversed={reversed}");
+            }
+        }
+    }
+
+    /// A row of session `id` holding no call, naming `parent` (if any).
+    fn plain_row(harness: HarnessKind, id: &str, parent: Option<&str>, seconds: i64) -> Message {
+        let mut m = message_in(&handle(harness, id), seconds, "words");
+        m.parent = parent.map(|p| handle(harness, p));
+        m
+    }
+
+    /// A content-derived call a fork copied from its parent (a Codex fork copies the parent's
+    /// `token_count` lines) still counts once, with the parent, while an unrelated session
+    /// holding the same id keeps its own, in any arrival order: also when a parent link arrives
+    /// after the session's first row, or runs through a session holding no copy (`mid`).
+    #[rstest]
+    fn a_content_derived_call_counts_once_per_lineage() {
+        let turn = "token_count:12000.0.40.0.12040";
+        let rows = vec![
+            usage_row(HarnessKind::Codex, "parent", None, 10, turn, 40),
+            plain_row(HarnessKind::Codex, "fork", None, 21),
+            usage_row(HarnessKind::Codex, "fork", Some("parent"), 20, turn, 40),
+            plain_row(HarnessKind::Codex, "mid", None, 25),
+            plain_row(HarnessKind::Codex, "mid", Some("fork"), 26),
+            usage_row(HarnessKind::Codex, "forkfork", Some("mid"), 30, turn, 40),
+            usage_row(HarnessKind::Codex, "stranger", None, 5, turn, 9),
+        ];
+        let shuffled = proptest::strategy::Strategy::prop_shuffle(proptest::strategy::Just(rows));
+        proptest::proptest!(|(rows in shuffled)| {
+            let totals = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let db = AiSessionDatabase::in_memory().await.unwrap();
+                    for m in &rows {
+                        db.append(m).await.unwrap();
+                    }
+                    let mut totals = Vec::new();
+                    for id in ["parent", "fork", "forkfork", "stranger"] {
+                        totals.push(output_in(&db, HarnessKind::Codex, id).await);
+                    }
+                    totals
+                });
+            proptest::prop_assert_eq!(totals, vec![40, 0, 0, 9]);
+        });
+    }
+
+    /// Two sessions holding a content-derived call, `a` and `b` (under `c`), are unrelated and
+    /// count it each, until `c`, which holds none, learns it was forked from `a`: then it is
+    /// one call, counted once with `a`, whichever holder arrived first.
+    #[rstest]
+    #[tokio::test]
+    async fn a_parent_learned_late_by_a_non_holder_joins_the_holders_counts(
+        #[values(false, true)] reversed: bool,
+    ) {
+        let codex = HarnessKind::Codex;
+        let turn = "token_count:12000.0.40.0.12040";
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        db.append(&plain_row(codex, "c", None, 15)).await.unwrap();
+        let mut holders = [
+            usage_row(codex, "a", None, 10, turn, 40),
+            usage_row(codex, "b", Some("c"), 20, turn, 40),
+        ];
+        if reversed {
+            holders.reverse();
+        }
+        for m in &holders {
+            db.append(m).await.unwrap();
+        }
+        let mut got = Vec::new();
+        for id in ["a", "b", "c"] {
+            got.push(output_in(&db, codex, id).await);
+        }
+        assert_eq!(got, [40, 40, 0]);
+
+        db.append(&plain_row(codex, "c", Some("a"), 16)).await.unwrap();
+        let mut got = Vec::new();
+        for id in ["a", "b", "c"] {
+            got.push(output_in(&db, codex, id).await);
+        }
+        assert_eq!(got, [40, 0, 0]);
+    }
+
+    /// A parent cycle (`p` → `q` → `r` → `p`) holding no copy of a content-derived call has no
+    /// top, but is one group: sessions forked from different members of it (`x` from `p`, `y`
+    /// from `q`) count the call once, with the earlier, whatever order the rows arrive in.
+    #[rstest]
+    #[tokio::test]
+    async fn holders_entering_a_parent_cycle_at_different_members_count_once(
+        #[values([0, 1, 2, 3, 4], [4, 3, 2, 1, 0], [3, 0, 4, 1, 2], [1, 4, 0, 3, 2])] order: [usize;
+            5],
+    ) {
+        let codex = HarnessKind::Codex;
+        let turn = "token_count:12000.0.40.0.12040";
+        let rows = [
+            plain_row(codex, "p", Some("q"), 1),
+            plain_row(codex, "q", Some("r"), 2),
+            plain_row(codex, "r", Some("p"), 3),
+            usage_row(codex, "x", Some("p"), 10, turn, 40),
+            usage_row(codex, "y", Some("q"), 20, turn, 40),
+        ];
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        for i in order {
+            db.append(&rows[i]).await.unwrap();
+        }
+        let mut got = Vec::new();
+        for id in ["x", "y"] {
+            got.push(output_in(&db, codex, id).await);
+        }
+        assert_eq!(got, [40, 0]);
+    }
+
+    /// A Claude Code `--resume` copy holds the original's calls under their API message ids:
+    /// each counts once, with the earliest holder, whichever arrives first.
+    #[rstest]
+    #[tokio::test]
+    async fn a_resumed_copy_counts_shared_calls_once() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        for m in [
+            claude_row("resumed", None, "a1", 1, Some("msg_A"), 10),
+            claude_row("resumed", None, "a2", 5, Some("msg_B"), 3),
+            claude_row("original", None, "a1", 1, Some("msg_A"), 10),
+            claude_row("original", None, "u0", 0, None, 0),
+        ] {
+            db.append(&m).await.unwrap();
+        }
+        assert_eq!(output_in(&db, HarnessKind::ClaudeCode, "original").await, 10);
+        assert_eq!(output_in(&db, HarnessKind::ClaudeCode, "resumed").await, 3);
+    }
+
+    /// One roots-only row for the lot, with the copies counted as its children and shown as
+    /// forks (the copy's subagent is grouped under it too, but is no child a person carried on).
+    #[rstest]
+    #[tokio::test]
+    async fn a_copy_is_listed_under_its_original() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        for m in copies() {
+            db.append(&m).await.unwrap();
+        }
+        let groups: Vec<_> = db
+            .list_sessions(&roots_only())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.handle.session.to_string(), s.child_count))
+            .collect();
+        assert_eq!(groups, [("original".to_owned(), 3), ("zeta".to_owned(), 0)]);
+        let resumed = db.get_session(&handle(HarnessKind::ClaudeCode, "resumed")).await.unwrap();
+        assert_eq!(resumed.unwrap().inferred_parent_kind(), Some(ParentKind::Fork));
+    }
+
+    /// A copy that learns its parent after all groups by it, and its own copies find another
+    /// original.
+    #[rstest]
+    #[tokio::test]
+    async fn a_parent_learned_late_outranks_a_copy_link() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        // The copies take up from the original's second line, so start after it.
+        db.append(&claude_row("original", None, "u1", 0, None, 0)).await.unwrap();
+        db.append(&claude_row("original", None, "a1", 1, Some("msg_A"), 1)).await.unwrap();
+        db.append(&claude_row("copy", None, "a1", 1, Some("msg_A"), 1)).await.unwrap();
+        db.append(&claude_row("copy2", None, "a1", 1, Some("msg_A"), 1)).await.unwrap();
+        db.append(&claude_row("other", None, "o1", 0, None, 0)).await.unwrap();
+        assert!(
+            copy_links(&db).await.iter().all(|(id, root, _)| id == "other" || root == "original")
+        );
+
+        db.append(&claude_row("original", Some("other"), "a2", 5, None, 0)).await.unwrap();
+
+        let links = copy_links(&db).await;
+        assert_eq!(
+            links,
+            [
+                ("copy", "copy", None),
+                ("copy2", "copy", Some("copy")),
+                ("original", "other", None),
+                ("other", "other", None),
+            ]
+            .map(|(id, root, copy_of): (&str, &str, Option<&str>)| {
+                (id.to_owned(), root.to_owned(), copy_of.map(str::to_owned))
+            })
+        );
+    }
+
+    /// Forgetting the host that captured an original leaves its copies linked to the best
+    /// original left.
+    #[rstest]
+    #[tokio::test]
+    async fn forgetting_an_original_relinks_its_copies() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        for (id, n) in [("original", 1), ("resumed", 2), ("twice", 2)] {
+            let mut m = claude_row(id, None, "a1", 0, Some("msg_A"), 1);
+            m.host = Some(host(n));
+            db.append(&m).await.unwrap();
+        }
+        db.forget_host(host(1)).await.unwrap();
+
+        let links = copy_links(&db).await;
+        assert_eq!(links, [
+            ("resumed".to_owned(), "resumed".to_owned(), None),
+            ("twice".to_owned(), "resumed".to_owned(), Some("resumed".to_owned())),
+        ]);
+    }
+
+    fn roots_only() -> SessionFilter {
+        SessionFilter {
+            roots_only: true,
+            ..SessionFilter::default()
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn roots_only_lists_each_group_once_with_its_size() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        for m in forest() {
+            db.append(&m).await.unwrap();
+        }
+        let groups: Vec<_> = db
+            .list_sessions(&roots_only())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| {
+                assert!(s.is_root());
+                (s.handle.session.to_string(), s.child_count, s.group_updated_at.unwrap())
+            })
+            .collect();
+        let at = |seconds| OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds);
+        // Newest activity in the group first: `root`'s newest is `late`, at 14. Its size counts
+        // `fork` and `late`, not the subagents grouped under it.
+        assert_eq!(groups, [
+            ("orphan".to_owned(), 1, at(31)),
+            ("other".to_owned(), 1, at(21)),
+            ("root".to_owned(), 2, at(14)),
+        ]);
+    }
+
+    /// How capture recorded a child relates to its parent decides, whatever its harness or id: a
+    /// Codex subagent is not counted in its root's group size, a Codex fork is, and so is a
+    /// Claude Code child named like a subagent that is a fork.
+    #[rstest]
+    #[case::codex_subagent(HarnessKind::Codex, "t2", ParentKind::Subagent)]
+    #[case::codex_fork(HarnessKind::Codex, "t2", ParentKind::Fork)]
+    #[case::opencode_fork(HarnessKind::Opencode, "ses_2", ParentKind::Fork)]
+    #[case::claude_fork(HarnessKind::ClaudeCode, "agent-z", ParentKind::Fork)]
+    #[case::claude_subagent(HarnessKind::ClaudeCode, "sub", ParentKind::Subagent)]
+    #[case::codex_continuation(HarnessKind::Codex, "t2", ParentKind::Continuation)]
+    #[tokio::test]
+    async fn a_recorded_parent_kind_decides_the_kind_and_the_group_size(
+        #[case] harness: HarnessKind,
+        #[case] child: &str,
+        #[case] kind: ParentKind,
+    ) {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        db.append(&message_in(&handle(harness, "root"), 0, "root words")).await.unwrap();
+        let mut m = message_in(&handle(harness, child), 1, "child words");
+        m.parent = Some(handle(harness, "root"));
+        m.parent_kind = Some(kind);
+        db.append(&m).await.unwrap();
+
+        let stored = db.get_session(&handle(harness, child)).await.unwrap().unwrap();
+        assert_eq!(stored.inferred_parent_kind(), Some(kind));
+        let groups = db.list_sessions(&roots_only()).await.unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].child_count, u64::from(kind != ParentKind::Subagent));
+    }
+
+    /// A child of a kind this build does not know (a newer build's) is grouped under its root
+    /// but, like a subagent, not counted in its size.
+    #[rstest]
+    #[tokio::test]
+    async fn a_child_of_unknown_kind_is_not_counted() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let root = handle(HarnessKind::Codex, "root");
+        db.append(&message_in(&root, 0, "root words")).await.unwrap();
+        let mut m = message_in(&handle(HarnessKind::Codex, "child"), 1, "child words");
+        m.parent = Some(root.clone());
+        db.append(&m).await.unwrap();
+
+        let stored = db.get_session(&handle(HarnessKind::Codex, "child")).await.unwrap().unwrap();
+        assert_eq!(stored.inferred_parent_kind(), None);
+        assert_eq!(stored.root, Some(root));
+        let groups = db.list_sessions(&roots_only()).await.unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].child_count, 0);
+    }
+
+    /// A match in a nested child is its root's, snippet included.
+    #[rstest]
+    #[tokio::test]
+    async fn a_childs_match_counts_toward_its_root() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        for m in forest() {
+            db.append(&m).await.unwrap();
+        }
+        let hits = search_with(&db, "needle", &roots_only(), 0).await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session.handle, handle(HarnessKind::ClaudeCode, "root"));
+        assert_eq!(hits[0].session.child_count, 2);
+        assert!(marked(&hits[0].preview).contains("[needle]"));
+
+        // Every session of a group matching counts once, as its root.
+        let hits = search_with(&db, "words", &roots_only(), 0).await;
+        assert_eq!(hits.len(), 3);
+        let all = search(&db, "words").await;
+        assert_eq!(all.len(), 9);
+    }
+
+    /// A root whose group matches only in a child names that child, with the matched message's
+    /// place in it and the child's title highlighted; the root's title, which only shares a word
+    /// with the query, is not highlighted as if it matched.
+    #[rstest]
+    #[tokio::test]
+    async fn a_match_in_a_child_names_the_child() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let titled = |mut m: Message, title: &str| {
+            m.session_title = Some(title.to_owned());
+            m
+        };
+        for m in [
+            titled(tree_row("root", None, 0, "root words"), "haystack plans"),
+            titled(tree_row("fork", Some("root"), 10, "fork words"), "needle hunt"),
+            titled(tree_row("fork", Some("root"), 11, "a haystack in the fork"), "needle hunt"),
+        ] {
+            db.append(&m).await.unwrap();
+        }
+
+        let hits = search_with(&db, "needle haystack", &roots_only(), 0).await;
+        assert_eq!(hits.len(), 1);
+        let hit = &hits[0];
+        assert_eq!(hit.session.handle, handle(HarnessKind::ClaudeCode, "root"));
+        let matched = hit.matched.as_ref().expect("the match is the child's");
+        assert_eq!(matched.handle, handle(HarnessKind::ClaudeCode, "fork"));
+        assert_eq!(marked(&matched.title), "[needle] hunt");
+        assert_eq!(spans(&matched.title), [(0, 6)]);
+        assert_eq!(marked(&hit.title), "haystack plans", "the root's title did not match");
+        assert_eq!(hit.message_index, 1, "the message's place in the child");
+        assert!(marked(&hit.preview).contains("[haystack]"));
+
+        // Without grouping, the child is returned itself, and names nothing else.
+        let hits = search_with(&db, "needle haystack", &SessionFilter::default(), 0).await;
+        assert_eq!(hits[0].session.handle, handle(HarnessKind::ClaudeCode, "fork"));
+        assert!(hits[0].matched.is_none());
+        assert_eq!(hits[0].message_index, 1);
+        assert_eq!(marked(&hits[0].title), "[needle] hunt");
+
+        // With any term, the root's title holds one, so it is highlighted too.
+        let hits: Vec<SessionMatch> = db
+            .search("needle haystack", SearchTerms::Any, &roots_only(), 0)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(marked(&hits[0].title), "[haystack] plans");
+        let matched = hits[0].matched.as_ref().expect("the match is the child's");
+        assert_eq!(marked(&matched.title), "[needle] hunt");
+    }
+
+    /// Whether a title alone matches the query as the index would: every term, or any with
+    /// [`SearchTerms::Any`], each as a prefix, or the last as a prefix while typing.
+    #[rstest]
+    #[case::every_term("needle haystack", SearchTerms::All, "a haystack needle", true)]
+    #[case::one_term_short("needle haystack", SearchTerms::All, "haystack plans", false)]
+    #[case::whole_word("needle hay", SearchTerms::All, "needle haystack", false)]
+    #[case::any_term("needle haystack", SearchTerms::Any, "haystack plans", true)]
+    #[case::any_prefix("nee hay", SearchTerms::Any, "haystack plans", true)]
+    #[case::typed_prefix("needle hay", SearchTerms::Typed, "needle haystack", true)]
+    #[case::no_term("needle haystack", SearchTerms::Any, "other plans", false)]
+    fn a_title_matches_the_query_alone(
+        #[case] query: &str,
+        #[case] mode: SearchTerms,
+        #[case] title: &str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(QueryTerms::parse(query, mode).matched_by(title), expected);
+    }
+
+    // --- filters --------------------------------------------------------------------------------
+
+    fn filtered_row(id: &str, cwd: &str, branch: &str, model: &str, host_n: u128) -> Message {
+        let mut m = message_in(&handle(HarnessKind::Codex, id), 0, "shared words");
+        m.cwd = Some(std::path::PathBuf::from(cwd));
+        m.git_branch = Some(branch.to_owned());
+        m.model = Some(model.to_owned());
+        m.host = Some(host(host_n));
+        m
+    }
+
+    #[rstest]
+    #[case::host(SessionFilter { host: Some(host(2)), ..SessionFilter::default() }, &["b"])]
+    #[case::workspace_is_a_path_prefix(
+        SessionFilter { workspace: Some("/work/atuin/".into()), ..SessionFilter::default() },
+        &["a", "b"]
+    )]
+    #[case::root_workspace(
+        SessionFilter { workspace: Some("/".into()), ..SessionFilter::default() },
+        &["a", "b", "c", "d"]
+    )]
+    #[case::directory_is_exact(
+        SessionFilter { directory: Some("/work/atuin".into()), ..SessionFilter::default() },
+        &["a"]
+    )]
+    #[case::branch(SessionFilter { branch: Some("main".into()), ..SessionFilter::default() }, &["a", "c"])]
+    #[case::model_substring_any_case(
+        SessionFilter { model: Some("OPUS".into()), ..SessionFilter::default() },
+        &["a", "d"]
+    )]
+    #[case::harness(harness_filter(HarnessKind::Pi), &[])]
+    #[case::all_must_hold(
+        SessionFilter {
+            workspace: Some("/work/atuin".into()),
+            branch: Some("main".into()),
+            ..SessionFilter::default()
+        },
+        &["a"]
+    )]
+    #[tokio::test]
+    async fn filters_select_sessions(#[case] filter: SessionFilter, #[case] expected: &[&str]) {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        for m in [
+            filtered_row("a", "/work/atuin", "main", "claude-opus-4", 1),
+            filtered_row("b", "/work/atuin/crates/x", "feat", "gpt-5", 2),
+            // A sibling sharing the workspace's name as a string prefix is not under it.
+            filtered_row("c", "/work/atuin2", "main", "gpt-5", 1),
+            filtered_row("d", "/home/me", "dev", "opus", 1),
+        ] {
+            db.append(&m).await.unwrap();
+        }
+
+        let ids = |sessions: Vec<Session>| {
+            let mut ids: Vec<_> = sessions.iter().map(|s| s.handle.session.to_string()).collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids(db.list_sessions(&filter).await.unwrap()), expected, "listing");
+        let hits = search_with(&db, "shared", &filter, 0).await;
+        assert_eq!(ids(hits.into_iter().map(|m| m.session).collect()), expected, "search");
+    }
+
+    /// A host filter, before the limit. Sessions with no recorded host (`e`) count only with
+    /// [`SessionFilter::or_unrecorded`].
+    #[rstest]
+    #[case::one(2, false, 0, &["b"])]
+    #[case::several_sessions(1, false, 0, &["a", "c"])]
+    #[case::before_the_limit(3, false, 1, &["d"])]
+    #[case::with_the_unrecorded(2, true, 0, &["b", "e"])]
+    #[case::the_unrecorded_before_the_limit(1, true, 1, &["e"])]
+    #[tokio::test]
+    async fn a_host_filter_selects_sessions(
+        #[case] only: u128,
+        #[case] or_unrecorded: bool,
+        #[case] limit: u32,
+        #[case] expected: &[&str],
+    ) {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let mut e = filtered_row("e", "/work/atuin", "main", "opus", 0);
+        e.host = None;
+        e.timestamp += time::Duration::seconds(1);
+        for m in [
+            filtered_row("a", "/work/atuin", "main", "opus", 1),
+            filtered_row("b", "/work/atuin", "main", "opus", 2),
+            filtered_row("c", "/work/atuin", "main", "opus", 1),
+            filtered_row("d", "/work/atuin", "main", "opus", 3),
+            e,
+        ] {
+            db.append(&m).await.unwrap();
+        }
+        let filter = SessionFilter {
+            host: Some(host(only)),
+            or_unrecorded,
+            ..SessionFilter::default()
+        };
+        let sorted = |mut ids: Vec<String>| {
+            ids.sort();
+            ids
+        };
+
+        if limit == 0 {
+            let listed = db.list_sessions(&filter).await.unwrap();
+            let listed = listed.iter().map(|s| s.handle.session.to_string()).collect();
+            assert_eq!(sorted(listed), expected, "listing");
+        }
+        for query in ["shared", ""] {
+            let hits: Vec<SessionMatch> =
+                db.search(query, SearchTerms::Typed, &filter, limit).try_collect().await.unwrap();
+            let hits = hits.iter().map(|m| m.session.handle.session.to_string()).collect();
+            assert_eq!(sorted(hits), expected, "search {query:?}");
+        }
+    }
+
+    /// With roots only, a group passes when any of its sessions does, and shows as its root.
+    #[rstest]
+    #[tokio::test]
+    async fn a_child_passing_the_filter_brings_its_root() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let mut root = tree_row("root", None, 0, "words");
+        root.model = Some("claude-opus".to_owned());
+        let mut agent = tree_row("agent-a", Some("root"), 1, "words");
+        agent.model = Some("claude-haiku".to_owned());
+        db.append(&root).await.unwrap();
+        db.append(&agent).await.unwrap();
+
+        let filter = SessionFilter {
+            model: Some("haiku".to_owned()),
+            roots_only: true,
+            ..SessionFilter::default()
+        };
+        let listed = db.list_sessions(&filter).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].handle, handle(HarnessKind::ClaudeCode, "root"));
+        assert_eq!(search_with(&db, "words", &filter, 0).await.len(), 1);
+    }
+
+    // --- lookups by id and group ----------------------------------------------------------------
+
+    #[rstest]
+    #[case::plain("ab", &["ab", "ab%c", "ab_c", "abc", "abxc"])]
+    #[case::percent_is_literal("ab%", &["ab%c"])]
+    #[case::underscore_is_literal("ab_", &["ab_c"])]
+    #[case::exact("abc", &["abc"])]
+    #[case::case_matters("AB", &["AB"])]
+    #[case::nothing("abz", &[])]
+    #[case::empty("", &["AB", "ab", "ab%c", "ab_c", "abc", "abxc", "ac", "é\u{10FFFF}x"])]
+    #[case::the_last_code_point("é\u{10FFFF}", &["é\u{10FFFF}x"])]
+    #[tokio::test]
+    async fn an_id_prefix_is_not_a_pattern(#[case] prefix: &str, #[case] expected: &[&str]) {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let ids = ["ab", "ab%c", "ab_c", "abc", "abxc", "ac", "AB", "é\u{10FFFF}x"];
+        for (i, id) in ids.into_iter().enumerate() {
+            // Across harnesses: an id prefix doesn't say which.
+            let harness = if i % 2 == 0 {
+                HarnessKind::ClaudeCode
+            } else {
+                HarnessKind::Codex
+            };
+            db.append(&message_in(&handle(harness, id), 0, "words")).await.unwrap();
+        }
+
+        let mut found: Vec<String> = db
+            .sessions_with_id_prefix(prefix)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.handle.session.to_string())
+            .collect();
+        found.sort();
+        assert_eq!(found, expected);
+    }
+
+    #[rstest]
+    #[case::whole(32, 1)]
+    #[case::past_the_timestamp(16, 1)]
+    #[case::only_the_timestamp(12, 2)]
+    #[case::odd_length(9, 2)]
+    #[tokio::test]
+    async fn an_atuin_id_or_its_prefix_finds_a_session(#[case] len: usize, #[case] found: usize) {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let wanted = handle(HarnessKind::ClaudeCode, "wanted");
+        // The same start, so the ids share their timestamp digits (the first 12).
+        let id = |n: u128| {
+            AtuinSessionId::from(Uuid::from_u128(
+                0x0199_6dc4_0800_7000_8000_0000_0000_0000 | n << 64,
+            ))
+        };
+        for (session, n) in [(&wanted, 1), (&handle(HarnessKind::Pi, "other"), 2)] {
+            let mut msg = message_in(session, 1_790_000_000, "words");
+            msg.atuin_id = Some(id(n));
+            db.append(&msg).await.unwrap();
+        }
+
+        let id = id(1);
+        let sessions = db.sessions_with_id_prefix(&id.to_string()[..len]).await.unwrap();
+        assert_eq!(sessions.len(), found);
+        assert!(sessions.iter().any(|s| s.handle == wanted));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn rows_disagreeing_on_the_id_settle_on_the_smaller(
+        #[values(false, true)] reversed: bool,
+    ) {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let session = sample_handle();
+        let mut rows = [message_in(&session, 0, "one"), message_in(&session, 1, "two")];
+        rows[0].atuin_id = Some(AtuinSessionId::from(Uuid::from_u128(2)));
+        rows[1].atuin_id = Some(AtuinSessionId::from(Uuid::from_u128(1)));
+        if reversed {
+            rows.reverse();
+        }
+        for row in &rows {
+            db.append(row).await.unwrap();
+        }
+
+        assert_eq!(
+            db.get_session(&session).await.unwrap().unwrap().atuin_id,
+            AtuinSessionId::from(Uuid::from_u128(1))
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_duplicate_row_settles_on_the_smaller_id() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let session = sample_handle();
+        let mut row = message_in(&session, 0, "one");
+        row.atuin_id = Some(AtuinSessionId::from(Uuid::from_u128(2)));
+        db.append(&row).await.unwrap();
+        row.id = RecordId(atuin_common::utils::uuid_v7());
+        row.atuin_id = Some(AtuinSessionId::from(Uuid::from_u128(1)));
+
+        assert!(matches!(db.append(&row).await.unwrap(), Appended::Duplicate));
+        assert_eq!(
+            db.get_session(&session).await.unwrap().unwrap().atuin_id,
+            AtuinSessionId::from(Uuid::from_u128(1))
+        );
+    }
+
+    /// Links stay (harness, native id): their atuin ids are looked up when read, so a child
+    /// stored before its parent names the parent's id once the parent arrives.
+    #[rstest]
+    #[tokio::test]
+    async fn links_resolve_to_atuin_ids_when_read() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let (root, child, grandchild) = (
+            handle(HarnessKind::Codex, "root"),
+            handle(HarnessKind::Codex, "child"),
+            handle(HarnessKind::Codex, "grandchild"),
+        );
+        let id = |s: &HarnessSession| {
+            let n = ["root", "child", "grandchild"].iter().position(|n| *n == s.session.as_ref());
+            AtuinSessionId::from(Uuid::from_u128(n.unwrap() as u128 + 1))
+        };
+        let store = |session: &HarnessSession, parent: Option<&HarnessSession>, index| {
+            let mut m = message_in(session, index, "words");
+            m.parent = parent.cloned();
+            m.atuin_id = Some(id(session));
+            m
+        };
+
+        db.append(&store(&grandchild, Some(&child), 2)).await.unwrap();
+        let alone = db.get_session(&grandchild).await.unwrap().unwrap();
+        assert_eq!(
+            (alone.parent_atuin_id, alone.root_atuin_id),
+            (None, None),
+            "parent not stored yet"
+        );
+
+        db.append(&store(&child, Some(&root), 1)).await.unwrap();
+        db.append(&store(&root, None, 0)).await.unwrap();
+        let (r, c, g) = (
+            db.get_session(&root).await.unwrap().unwrap(),
+            db.get_session(&child).await.unwrap().unwrap(),
+            db.get_session(&grandchild).await.unwrap().unwrap(),
+        );
+        assert_eq!(
+            (r.parent_atuin_id, r.root_atuin_id, &r.child_atuin_ids),
+            (None, None, &vec![id(&child)])
+        );
+        assert_eq!(
+            (c.parent_atuin_id, c.root_atuin_id, &c.child_atuin_ids),
+            (Some(id(&root)), Some(id(&root)), &vec![id(&grandchild)])
+        );
+        assert_eq!(
+            (g.parent_atuin_id, g.root_atuin_id, g.child_atuin_ids.is_empty()),
+            (Some(id(&child)), Some(id(&root)), true)
+        );
+
+        // Lists resolve them the same way.
+        let listed = db.list_sessions(&SessionFilter::default()).await.unwrap();
+        let listed_child = listed.iter().find(|s| s.handle == child).unwrap();
+        assert_eq!(listed_child, &c);
+    }
+
+    #[rstest]
+    #[case::ascii("ab", Some("ac"))]
+    #[case::empty("", None)]
+    #[case::last_code_point("a\u{10FFFF}", Some("b"))]
+    #[case::only_the_last_code_point("\u{10FFFF}", None)]
+    #[case::skips_surrogates("\u{D7FF}", Some("\u{E000}"))]
+    fn prefix_successors(#[case] prefix: &str, #[case] expected: Option<&str>) {
+        assert_eq!(prefix_successor(prefix).as_deref(), expected);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn children_are_the_group_under_a_root() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        for m in forest() {
+            db.append(&m).await.unwrap();
+        }
+        let children = |id: &'static str| {
+            let db = db.clone();
+            async move {
+                db.children(&handle(HarnessKind::ClaudeCode, id))
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.handle.session.to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+        // Newest first, nested ones included, the root itself not.
+        assert_eq!(children("root").await, ["late", "agent-b", "agent-a", "fork"]);
+        assert_eq!(children("other").await, ["other-fork"]);
+        // Only roots have groups.
+        assert!(children("fork").await.is_empty());
+        assert!(children("missing").await.is_empty());
+    }
+
+    // --- previews -------------------------------------------------------------------------------
+
+    fn text(t: &str) -> Content {
+        Content::Text(t.to_owned())
+    }
+
+    fn tool_use() -> Content {
+        Content::ToolUse(ToolUse {
+            id: ToolCallId::from("call".to_owned()),
+            name: "bash".to_owned(),
+            input: serde_json::json!({ "command": "ls" }),
+        })
+    }
+
+    /// Break the stored content of `session`'s message at `index`, so reading it fails.
+    async fn corrupt(db: &AiSessionDatabase, session: &HarnessSession, index: i64) {
+        db::query(
+            "UPDATE messages SET content = '', content_z = x'00' WHERE session = (SELECT id FROM \
+             sessions WHERE session_id = ?) AND source_id = ?",
+        )
+        .bind(session.session.as_ref())
+        .bind(format!("source-{index}"))
+        .execute(db.db.pool())
+        .await
+        .unwrap();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn preview_parts_read_only_the_first_prompt_and_the_last_reply_with_text() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let s = sample_handle();
+        let long = "a long reply ".repeat(COMPRESS_THRESHOLD);
+        let messages = [
+            message_with(&s, 0, Role::System, vec![text("system prompt")]),
+            message_with(&s, 1, Role::User, vec![text("first prompt")]),
+            message_with(&s, 2, Role::Assistant, vec![text("an early reply")]),
+            message_with(&s, 3, Role::User, vec![text("second prompt")]),
+            message_with(&s, 4, Role::Assistant, vec![text(&long), tool_use()]),
+            // The tail: nothing to show.
+            message_with(&s, 5, Role::Assistant, vec![tool_use()]),
+            message_with(&s, 6, Role::Tool, vec![text("tool output")]),
+            message_with(&s, 7, Role::Assistant, vec![Content::Reasoning("hmm".to_owned())]),
+            message_with(&s, 8, Role::Assistant, vec![text("  \n "), tool_use()]),
+            message_with(&s, 9, Role::Assistant, vec![Content::Error("overloaded".to_owned())]),
+        ];
+        for m in &messages {
+            db.append(m).await.unwrap();
+        }
+        // Content the preview must not need: reading it would fail. Nor are the other messages'
+        // roles read: these two aren't JSON.
+        for index in [0, 2, 3, 6] {
+            corrupt(&db, &s, index).await;
+        }
+        db::query("INSERT INTO interned (value) VALUES ('not json')")
+            .execute(db.db.pool())
+            .await
+            .unwrap();
+        for index in [0, 6] {
+            db::query(
+                "UPDATE messages SET role = (SELECT id FROM interned WHERE value = 'not json') \
+                 WHERE session = (SELECT id FROM sessions WHERE session_id = ?) AND source_id = ?",
+            )
+            .bind(s.session.as_ref())
+            .bind(format!("source-{index}"))
+            .execute(db.db.pool())
+            .await
+            .unwrap();
+        }
+
+        let parts = db.preview_parts(&s).await.unwrap();
+        assert_eq!(parts.first_user, Some(vec![text("first prompt")]));
+        // Compressed, and with a tool call beside the text: the whole content, for the caller
+        // to render.
+        assert_eq!(parts.last_assistant, Some(vec![text(&long), tool_use()]));
+    }
+
+    /// Messages at the same time are in the order they were recorded (their ids'), and the walk
+    /// back to a reply with text passes over the newer ones at that time, and only those.
+    #[rstest]
+    #[tokio::test]
+    async fn preview_parts_order_messages_at_one_time_by_id() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let s = sample_handle();
+        let at = |index, role, content, source: &str| {
+            let mut m = message_with(&s, index, role, content);
+            m.source_id = SourceId::from(source.to_owned());
+            m
+        };
+        // Ids are UUIDv7s, so these are recorded in this order.
+        for m in [
+            at(1, Role::User, vec![text("the first prompt")], "a"),
+            at(1, Role::User, vec![text("a later prompt, at the same time")], "b"),
+            at(2, Role::Assistant, vec![text("an older reply")], "c"),
+            at(3, Role::Assistant, vec![text("the reply")], "d"),
+            at(3, Role::Assistant, vec![tool_use()], "e"),
+            at(3, Role::Assistant, vec![Content::Reasoning("hmm".to_owned())], "f"),
+        ] {
+            db.append(&m).await.unwrap();
+        }
+        let parts = db.preview_parts(&s).await.unwrap();
+        assert_eq!(parts.first_user, Some(vec![text("the first prompt")]));
+        assert_eq!(parts.last_assistant, Some(vec![text("the reply")]));
+    }
+
+    /// The preview's queries walk the session's messages by time through the index, rather
+    /// than scanning the table.
+    #[rstest]
+    #[tokio::test]
+    async fn preview_parts_use_the_session_time_index() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        for sql in [
+            "SELECT content, content_z FROM messages WHERE session = 1 AND role = (SELECT id FROM \
+             interned WHERE value = '\"User\"') ORDER BY timestamp, id LIMIT 1",
+            "SELECT timestamp, id, content, content_z FROM messages WHERE session = 1 AND role = \
+             (SELECT id FROM interned WHERE value = '\"Assistant\"') AND (timestamp < 5 OR \
+             (timestamp = 5 AND id < x'00')) ORDER BY timestamp DESC, id DESC LIMIT 1",
+        ] {
+            let plan: Vec<(i64, i64, i64, String)> =
+                db::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                    .fetch_all(db.db.pool())
+                    .await
+                    .unwrap();
+            let plan: Vec<&str> = plan.iter().map(|(_, _, _, detail)| detail.as_str()).collect();
+            assert!(
+                plan.iter().any(|d| d.contains("USING INDEX messages_session_timestamp")),
+                "{plan:?}"
+            );
+        }
+    }
+
+    /// A stored session comes back as its harness can write it out: every message, in
+    /// transcript order, with what a transcript line needs, to resume in the directory given.
+    #[rstest]
+    #[tokio::test]
+    async fn a_session_converts_to_one_to_rehydrate() {
+        use std::path::PathBuf;
+
+        use atuin_common::harnesstools::session::StopReason;
+
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let s = sample_handle();
+        let mut prompt = message_with(&s, 0, Role::User, vec![text("first prompt")]);
+        prompt.cwd = Some(PathBuf::from("/remote/proj"));
+        prompt.git_branch = Some("main".to_owned());
+        let mut reply = message_with(&s, 1, Role::Assistant, vec![text("reply"), tool_use()]);
+        reply.parent_source_id = Some(SourceId::from("source-0".to_owned()));
+        reply.turn_id = Some("msg_1".to_owned());
+        // The newest row's title is the session's.
+        reply.session_title = Some("the title".to_owned());
+        reply.session_title_source = Some(TitleSource::Named);
+        reply.model = Some("claude-opus-5".to_owned());
+        reply.stop_reason = Some(StopReason::ToolUse);
+        reply.usage = Some(Usage {
+            input: Some(3),
+            output: Some(5),
+            cache_read: Some(7),
+            cache_write: Some(11),
+            reasoning: Some(2),
+        });
+        // Stored out of order: the transcript's order is the timestamps'.
+        db.append(&reply).await.unwrap();
+        db.append(&prompt).await.unwrap();
+
+        let here = PathBuf::from("/local/proj");
+        let session = db.rehydrate_session(&s, here.clone()).await.unwrap().unwrap();
+        assert_eq!(session.id, "ordered-session");
+        assert_eq!(session.title.as_deref(), Some("the title"));
+        assert_eq!(session.cwd, here);
+        assert_eq!(session.original_cwd, Some(PathBuf::from("/remote/proj")));
+        assert_eq!(session.git_branch.as_deref(), Some("main"));
+        assert_eq!(session.started_at, prompt.timestamp);
+
+        let ids: Vec<&str> = session.messages.iter().map(|m| m.source_id.as_str()).collect();
+        assert_eq!(ids, ["source-0", "source-1"]);
+        let m = &session.messages[1];
+        assert_eq!(m.parent_source_id.as_deref(), Some("source-0"));
+        assert_eq!((m.role.clone(), m.content.clone()), (Role::Assistant, reply.content.clone()));
+        assert_eq!(m.turn_id.as_deref(), Some("msg_1"));
+        assert_eq!(m.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(m.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(m.usage, reply.usage);
+        assert_eq!(m.timestamp, reply.timestamp);
+        assert_eq!(session.messages[0].cwd, Some(PathBuf::from("/remote/proj")));
+
+        let missing = HarnessSession {
+            harness: HarnessKind::Pi,
+            session: NativeSessionId::from("nope".to_owned()),
+        };
+        assert!(db.rehydrate_session(&missing, here).await.unwrap().is_none());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_summary_is_reply_text() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let s = sample_handle();
+        db.append(&message_with(&s, 0, Role::Assistant, vec![text("before")])).await.unwrap();
+        let summary = vec![Content::Summary("compacted".to_owned())];
+        db.append(&message_with(&s, 1, Role::Assistant, summary.clone())).await.unwrap();
+
+        let parts = db.preview_parts(&s).await.unwrap();
+        assert_eq!(parts.last_assistant, Some(summary));
+        assert_eq!(parts.first_user, None, "no user message");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn preview_parts_without_a_reply_or_a_session() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let s = sample_handle();
+        // The first user message is the first prompt, even without text.
+        db.append(&message_with(&s, 0, Role::User, vec![tool_use()])).await.unwrap();
+        db.append(&message_with(&s, 1, Role::Assistant, vec![tool_use()])).await.unwrap();
+        db.append(&message_with(&s, 2, Role::User, vec![text("second")])).await.unwrap();
+
+        let parts = db.preview_parts(&s).await.unwrap();
+        assert_eq!(parts.first_user, Some(vec![tool_use()]));
+        assert_eq!(parts.last_assistant, None);
+
+        let missing = handle(HarnessKind::Codex, "missing");
+        assert_eq!(db.preview_parts(&missing).await.unwrap(), super::PreviewParts::default());
+    }
+
+    // --- schema ---------------------------------------------------------------------------------
+
+    /// [`SCHEMA_VERSION`] is the newest migration's version.
+    #[rstest]
+    fn the_schema_version_is_the_newest_migration() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ai_session/migrations");
+        let newest = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                name.split('_').next()?.parse::<i64>().ok()
+            })
+            .max();
+        assert_eq!(newest, Some(SCHEMA_VERSION));
+    }
+
+    // --- read-only open -------------------------------------------------------------------------
+
+    #[fixture]
+    fn dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_read_only_open_reads_beside_the_writer(dir: tempfile::TempDir) {
+        let path = dir.path().join("sidecar.db");
+        let writer = AiSessionDatabase::open(&path).await.unwrap();
+        writer.append(&message_in(&sample_handle(), 0, "first words")).await.unwrap();
+
+        let reader = AiSessionDatabase::open_read_only(&path).await.unwrap();
+        assert_eq!(reader.list_sessions(&SessionFilter::default()).await.unwrap().len(), 1);
+
+        // The writer keeps writing, and the reader sees it.
+        writer.append(&message_in(&sample_handle(), 1, "second words")).await.unwrap();
+        assert_eq!(search(&reader, "second").await.len(), 1);
+
+        assert!(
+            reader.append(&message_in(&sample_handle(), 2, "x")).await.is_err(),
+            "a read-only sidecar refuses writes"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_read_only_open_never_creates_the_file(dir: tempfile::TempDir) {
+        let path = dir.path().join("missing.db");
+        assert!(matches!(AiSessionDatabase::open_read_only(&path).await, Err(DbError::Open(_))));
+        assert!(!path.exists());
+    }
+
+    #[rstest]
+    #[case::uninitialized(None)]
+    #[case::outdated(Some(SCHEMA_VERSION - 1))]
+    #[case::unknown(Some(99))]
+    #[tokio::test]
+    async fn a_read_only_open_refuses_another_schema(
+        dir: tempfile::TempDir,
+        #[case] version: Option<i64>,
+    ) {
+        let path = dir.path().join("sidecar.db");
+        {
+            let db = Sqlite::builder(path.as_os_str()).open().await.unwrap();
+            if let Some(version) = version {
+                #[allow(clippy::disallowed_macros)]
+                sqlx::migrate!("./src/ai_session/migrations").run(db.pool()).await.unwrap();
+                db::query("UPDATE _sqlx_migrations SET version = ?")
+                    .bind(version)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            db.close().await;
+        }
+
+        let err = AiSessionDatabase::open_read_only(&path).await.expect_err("must refuse");
+        match version {
+            None => assert!(matches!(err, DbError::Uninitialized {
+                expected: SCHEMA_VERSION
+            })),
+            Some(99) => assert!(matches!(err, DbError::UnknownSchema { found: 99, .. })),
+            Some(found) => {
+                assert!(matches!(err, DbError::OutdatedSchema { found: f, .. } if f == found));
+            }
+        }
+        // Each says what to do about it, which always involves the daemon.
+        assert!(err.to_string().contains("atuin daemon"), "{err}");
+    }
+
+    // --- sidecars from other builds -------------------------------------------------------------
+
+    /// A sidecar another build migrated past this one: this build's migration, then others it
+    /// does not know.
+    async fn dev_build_sidecar(path: &Path) {
+        let db = Sqlite::builder(path.as_os_str()).open().await.unwrap();
+        #[allow(clippy::disallowed_macros)]
+        sqlx::migrate!("./src/ai_session/migrations").run(db.pool()).await.unwrap();
+        for (version, description) in [(2, "reproject watermark"), (3, "hosts and roots")] {
+            db::query(
+                "INSERT INTO _sqlx_migrations (version, description, success, checksum, \
+                 execution_time) VALUES (?, ?, 1, x'00', 0)",
+            )
+            .bind(version)
+            .bind(description)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        db::query(
+            "INSERT INTO sessions (harness, session_id, atuin_id, started_at, updated_at) VALUES \
+             (1, 'old', x'00', 0, 0)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.close().await;
+    }
+
+    /// A sidecar another build migrated fails to open, left as it is, with an error saying how to
+    /// start it over.
+    #[rstest]
+    #[tokio::test]
+    async fn a_sidecar_from_another_build_is_refused(dir: tempfile::TempDir) {
+        let path = dir.path().join("sidecar.db");
+        dev_build_sidecar(&path).await;
+
+        let err = AiSessionDatabase::open(&path).await.expect_err("must refuse");
+        assert!(matches!(err, DbError::IncompatibleSchema { .. }), "{err}");
+        let message = err.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("delete"), "{message}");
+
+        let reader = Sqlite::builder(path.as_os_str()).read_only().open().await.unwrap();
+        let sessions: i64 = db::query_scalar("SELECT count(*) FROM sessions")
+            .fetch_one(reader.pool())
+            .await
+            .unwrap();
+        assert_eq!(sessions, 1, "the sidecar was touched");
+    }
+
+    /// A newer build's sidecar is left alone: that build owns it, and this one reports it.
+    #[rstest]
+    #[tokio::test]
+    async fn a_newer_builds_sidecar_is_kept(dir: tempfile::TempDir) {
+        let path = dir.path().join("sidecar.db");
+        {
+            let db = AiSessionDatabase::open(&path).await.unwrap();
+            db.append(&message_in(&sample_handle(), 0, "kept")).await.unwrap();
+            db::query(
+                "INSERT INTO _sqlx_migrations (version, description, success, checksum, \
+                 execution_time) VALUES (99, 'future', 1, x'00', 0)",
+            )
+            .execute(db.db.pool())
+            .await
+            .unwrap();
+            db.db.close().await;
+        }
+
+        let err = AiSessionDatabase::open(&path).await.expect_err("must refuse");
+        assert!(matches!(err, DbError::IncompatibleSchema { .. }), "{err}");
+        let reader = Sqlite::builder(path.as_os_str()).read_only().open().await.unwrap();
+        let sessions: i64 = db::query_scalar("SELECT count(*) FROM sessions")
+            .fetch_one(reader.pool())
+            .await
+            .unwrap();
+        assert_eq!(sessions, 1);
     }
 }

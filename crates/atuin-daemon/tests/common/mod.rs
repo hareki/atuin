@@ -30,7 +30,7 @@ use atuin_daemon::grpc::history::pb;
 use atuin_daemon::grpc::history::pb::history_server::HistoryServer;
 use atuin_daemon::search::{IndexFilterMode, SearchIndex};
 use atuin_daemon::{
-    Daemon, DaemonEvent, DaemonHandle, HistoryJournal, OutputCaptureEngine, SearchComponent,
+    Daemon, DaemonEvent, DaemonHandle, HistoryJournal, Octavo, OutputCaptureEngine, SearchComponent,
 };
 use atuin_domain::record::{CmdOrigin, HostId, RecordTag};
 use corpus::{HistoryGen, Seeded};
@@ -188,6 +188,7 @@ impl TestEnvBuilder {
             history_db.clone(),
             index.clone(),
             output_capture,
+            Octavo::nop(),
         ));
         let history_service =
             HistoryServer::new(HistoryService::new(journal.clone(), handle.clone()));
@@ -344,7 +345,7 @@ impl TestEnv {
 
     pub async fn active_ids(&self) -> HashSet<HistoryId> {
         let mut ids = HashSet::new();
-        let mut pager = self.history_db.all_paged(corpus::SEED_BATCH, false, false);
+        let mut pager = self.history_db.all_paged(corpus::SEED_BATCH, false);
         while let Some(page) = pager.next().await.unwrap() {
             ids.extend(page.into_iter().map(|h| h.id));
         }

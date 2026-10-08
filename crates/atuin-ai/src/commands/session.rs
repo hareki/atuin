@@ -8,7 +8,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 
-use atuin_client::ai_session::{HarnessKind, HarnessSession, Message, Session, SessionMatch};
+use atuin_client::ai_session::{
+    HarnessKind, HarnessSession, Message, SearchTerms, Session, SessionFilter, SessionMatch,
+};
 use atuin_client::settings::Settings;
 use atuin_common::harnesstools::session::model::reasoning_label;
 use atuin_common::harnesstools::session::{Content, ParentKind, Role, StopReason, Usage};
@@ -40,13 +42,6 @@ enum SubCmd {
 
     /// Show a session and its messages. Accepts a session id or `latest`.
     Show {
-        /// Session id (a unique prefix is enough), or `latest` for the most recently active session.
-        #[arg(value_name = "ID|latest")]
-        session: String,
-    },
-
-    /// Print a session's rendered transcript. Accepts a session id or `latest`.
-    Transcript {
         /// Session id (a unique prefix is enough), or `latest` for the most recently active session.
         #[arg(value_name = "ID|latest")]
         session: String,
@@ -141,12 +136,21 @@ pub async fn run(cmd: Cmd, settings: &Settings) -> Result<()> {
     let style = cmd.style.resolve();
     let mut client = AiClient::from_settings(settings).await?;
 
-    // Right after the daemon starts it rebuilds its AI sessions and refuses reads until done,
-    // rather than answer from a partial set. Tail only streams what happens from now on.
+    // Right after the daemon starts, and when a store command asks it to, it rebuilds its AI
+    // sessions and refuses reads until done, rather than answer from a partial set. Tail only
+    // streams what happens from now on.
     if !matches!(cmd.cmd, SubCmd::Tail) {
+        let mut reported = None;
         client
-            .wait_for_sessions(|| {
-                eprintln!("AI sessions are being rebuilt after the daemon started; waiting...");
+            .wait_for_sessions(|progress| {
+                if reported.is_none() {
+                    eprintln!("AI sessions are being rebuilt from the record store; waiting...");
+                }
+                let (replayed, pending) = progress;
+                if reported != Some(progress) && pending > 0 {
+                    eprintln!("  {replayed} of {pending} records replayed");
+                }
+                reported = Some(progress);
             })
             .await?;
     }
@@ -154,7 +158,6 @@ pub async fn run(cmd: Cmd, settings: &Settings) -> Result<()> {
     let result = match cmd.cmd {
         SubCmd::List => list(&mut client, style).await,
         SubCmd::Show { session } => show(&mut client, &session, style).await,
-        SubCmd::Transcript { session } => transcript(&mut client, &session, style).await,
         SubCmd::Search {
             query,
             harness,
@@ -254,10 +257,10 @@ async fn show(client: &mut AiClient, selector: &str, style: Style) -> Result<()>
             writeln!(out)?;
         }
         Style::Ndjson => {
-            serde_json::to_writer(&mut out, &ShowEventJson::Session(session_json(&session)))?;
+            serde_json::to_writer(&mut out, &ShowEventJson::Session(&session_json(&session)))?;
             writeln!(out)?;
             for m in &messages {
-                serde_json::to_writer(&mut out, &ShowEventJson::Message(message_json(m)))?;
+                serde_json::to_writer(&mut out, &ShowEventJson::Message(&message_json(m)))?;
                 writeln!(out)?;
             }
         }
@@ -272,36 +275,6 @@ async fn show(client: &mut AiClient, selector: &str, style: Style) -> Result<()>
     Ok(())
 }
 
-async fn transcript(client: &mut AiClient, selector: &str, style: Style) -> Result<()> {
-    let session = resolve(client, selector).await?;
-
-    let mut stream = client.get_transcript(session.clone()).await?;
-    let mut text = String::new();
-    while let Some(chunk) = stream.next().await {
-        text.push_str(&chunk?.chunk);
-    }
-
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-
-    if style.is_json() {
-        let record = TranscriptJson {
-            harness: harness_name(session.harness).to_owned(),
-            session_id: session.session.into(),
-            transcript: text,
-        };
-        serde_json::to_writer(&mut out, &record)?;
-        writeln!(out)?;
-    } else {
-        write!(out, "{}", sanitize(&text))?;
-        if !text.ends_with('\n') {
-            writeln!(out)?;
-        }
-    }
-
-    Ok(())
-}
-
 async fn search(
     client: &mut AiClient,
     query: &str,
@@ -310,7 +283,15 @@ async fn search(
     style: Style,
 ) -> Result<()> {
     let matches: Vec<SessionMatch> = client
-        .search_sessions(query, harness, None, false, limit)
+        .search_sessions(
+            query,
+            SearchTerms::All,
+            &SessionFilter {
+                harness,
+                ..SessionFilter::default()
+            },
+            limit,
+        )
         .await?
         .map(|m| Ok::<_, eyre::Report>(SessionMatch::try_from(m?)?))
         .try_collect()
@@ -543,7 +524,7 @@ async fn import(client: &mut AiClient, harness: Option<HarnessKind>, style: Styl
 /// (the harness is only known from the listing, so an id alone cannot address a session).
 async fn resolve(client: &mut AiClient, selector: &str) -> Result<HarnessSession> {
     let mut stream = client
-        .list_sessions(None, None)
+        .list_sessions(&SessionFilter::default())
         .await?
         .map(|session| Ok::<_, eyre::Report>(Session::try_from(session?)?));
     // `latest` only needs the newest session, which the daemon streams first, so take a single
@@ -583,8 +564,9 @@ pub fn select_session(
     }
 
     // `list` prints ids truncated to 12 chars, so accept a unique id prefix as well as a full id.
-    let mut matches =
-        sessions.into_iter().filter(|s| s.handle.session.as_ref().starts_with(selector));
+    let mut matches = sessions.into_iter().filter(|s| {
+        s.handle.session.as_ref().starts_with(selector) || s.atuin_id.has_prefix(selector)
+    });
     let first = matches.next().ok_or_else(|| SelectError::NotFound(selector.to_owned()))?;
     if matches.next().is_some() {
         return Err(SelectError::Ambiguous(selector.to_owned()));
@@ -596,6 +578,7 @@ pub fn select_session(
 
 fn write_session_header(out: &mut dyn Write, s: &Session) -> io::Result<()> {
     writeln!(out, "session   {}", sanitize(s.handle.session.as_ref()))?;
+    writeln!(out, "atuin id  {}", s.atuin_id)?;
     writeln!(out, "harness   {}", harness_name(s.handle.harness))?;
     if let Some(title) = &s.title {
         writeln!(out, "title     {}", sanitize(title))?;
@@ -608,6 +591,17 @@ fn write_session_header(out: &mut dyn Write, s: &Session) -> io::Result<()> {
     }
     if let Some(model) = &s.model {
         writeln!(out, "model     {}", sanitize(model))?;
+    }
+    // Links by atuin id, for the stored sessions they name.
+    if let Some(parent) = s.parent_atuin_id {
+        writeln!(out, "parent    {parent}")?;
+    }
+    if let Some(root) = s.root_atuin_id {
+        writeln!(out, "root      {root}")?;
+    }
+    if !s.child_atuin_ids.is_empty() {
+        let children: Vec<String> = s.child_atuin_ids.iter().map(ToString::to_string).collect();
+        writeln!(out, "children  {}", children.join(", "))?;
     }
     writeln!(out, "started   {}", age(s.started_at))?;
     writeln!(out, "updated   {}", age(s.updated_at))?;
@@ -628,8 +622,8 @@ fn write_message_text(out: &mut dyn Write, m: &Message) -> io::Result<()> {
     for block in &m.content {
         match block {
             Content::Text(t) => writeln!(out, "{}", sanitize(t))?,
-            Content::Other(json) => writeln!(out, "{}", sanitize(&json.to_string()))?,
-            Content::Reasoning(t) => writeln!(out, "[thinking] {}", sanitize(t))?,
+            // Capture never stores reasoning text or raw blocks.
+            Content::Reasoning(_) | Content::Other(_) => {}
             Content::ReasoningSummary { tokens } => {
                 let tokens = tokens.or(m.usage.and_then(|u| u.reasoning));
                 writeln!(out, "[thinking] {}", reasoning_label(tokens))?;
@@ -656,6 +650,12 @@ fn write_message_text(out: &mut dyn Write, m: &Message) -> io::Result<()> {
                     write!(out, " {}", sanitize(&output))?;
                 }
                 writeln!(out)?;
+            }
+            Content::Patch(patch) => {
+                writeln!(out, "[patch] {}", sanitize(&patch.summary()))?;
+                for file in patch.files.iter().filter(|file| !file.hunks.is_empty()) {
+                    write!(out, "{}", sanitize(&file.unified()))?;
+                }
             }
         }
     }
@@ -688,6 +688,8 @@ enum Summary {
         is_error: bool,
         body: String,
     },
+    /// The files a tool call changed.
+    Patch(String),
 }
 
 impl Summary {
@@ -698,6 +700,7 @@ impl Summary {
             Self::Thinking(t) => format!("{} {t}", paint("»", Ansi::Dim, color)),
             Self::ToolCall(name) => format!("{} {name}", paint("⚙", Ansi::Blue, color)),
             Self::Error(body) => format!("{} {body}", paint("✗", Ansi::Red, color)),
+            Self::Patch(files) => format!("{} {files}", paint("±", Ansi::Yellow, color)),
             Self::ToolResult { is_error, body } => {
                 let mark = if *is_error {
                     paint("✗", Ansi::Red, color)
@@ -725,18 +728,8 @@ fn message_summary(m: &Message) -> Option<Summary> {
                     return Some(Summary::Text(line));
                 }
             }
-            Content::Other(json) => {
-                let line = one_line(&json.to_string(), SUMMARY_WIDTH);
-                if !line.is_empty() {
-                    return Some(Summary::Text(line));
-                }
-            }
-            Content::Reasoning(t) => {
-                let line = one_line(t, SUMMARY_WIDTH);
-                if !line.is_empty() {
-                    return Some(Summary::Thinking(line));
-                }
-            }
+            // Capture never stores reasoning text or raw blocks.
+            Content::Reasoning(_) | Content::Other(_) => {}
             Content::ReasoningSummary { tokens } => {
                 let tokens = tokens.or(m.usage.and_then(|u| u.reasoning));
                 return Some(Summary::Thinking(reasoning_label(tokens)));
@@ -757,6 +750,9 @@ fn message_summary(m: &Message) -> Option<Summary> {
                         .map(|output| one_line(&output, SUMMARY_WIDTH))
                         .unwrap_or_default(),
                 });
+            }
+            Content::Patch(patch) => {
+                return Some(Summary::Patch(one_line(&patch.summary(), SUMMARY_WIDTH)));
             }
         }
     }
@@ -983,10 +979,18 @@ struct HandleJson {
 struct SessionJson {
     harness: String,
     session_id: String,
+    atuin_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent: Option<HandleJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_kind: Option<&'static str>,
+    /// The atuin ids of the parent, root and children, for those stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_atuin_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_atuin_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    children_atuin_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1032,6 +1036,22 @@ enum ContentJson {
         content: String,
         is_error: bool,
     },
+    Patch {
+        tool_use_id: String,
+        files: Vec<FilePatchJson>,
+    },
+}
+
+#[derive(Serialize)]
+struct FilePatchJson {
+    path: String,
+    change: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_to: Option<String>,
+    additions: usize,
+    deletions: usize,
+    /// The file's hunks as a unified diff; empty when capture kept the file but not its lines.
+    diff: String,
 }
 
 #[derive(Serialize)]
@@ -1060,9 +1080,9 @@ struct SessionDetailJson {
 
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum ShowEventJson {
-    Session(SessionJson),
-    Message(MessageJson),
+enum ShowEventJson<'a> {
+    Session(&'a SessionJson),
+    Message(&'a MessageJson),
 }
 
 #[derive(Serialize)]
@@ -1074,13 +1094,6 @@ enum TailEventJson {
     Lagged {
         dropped: u64,
     },
-}
-
-#[derive(Serialize)]
-struct TranscriptJson {
-    harness: String,
-    session_id: String,
-    transcript: String,
 }
 
 #[derive(Serialize)]
@@ -1096,8 +1109,18 @@ struct SearchMatchJson {
     score: f64,
     title: HighlightJson,
     preview: HighlightJson,
-    /// Position of the best-matching message in the session, as numbered by `show`.
+    /// Position of the best-matching message in the session holding it (`session`, else
+    /// `matched`), as numbered by `show`.
     message_index: u64,
+    /// The session holding the best-matching message, when it is not `session`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched: Option<MatchedJson>,
+}
+
+#[derive(Serialize)]
+struct MatchedJson {
+    session: HandleJson,
+    title: HighlightJson,
 }
 
 impl From<&HighlightedString> for HighlightJson {
@@ -1118,6 +1141,10 @@ impl From<&SessionMatch> for SearchMatchJson {
             title: HighlightJson::from(&m.title),
             preview: HighlightJson::from(&m.preview),
             message_index: m.message_index,
+            matched: m.matched.as_ref().map(|matched| MatchedJson {
+                session: handle_json(&matched.handle),
+                title: HighlightJson::from(&matched.title),
+            }),
         }
     }
 }
@@ -1133,12 +1160,16 @@ fn session_json(s: &Session) -> SessionJson {
     SessionJson {
         harness: harness_name(s.handle.harness).to_owned(),
         session_id: s.handle.session.to_string(),
+        atuin_id: s.atuin_id.to_string(),
         parent: s.parent.as_ref().map(handle_json),
         parent_kind: s.parent_kind.map(|kind| match kind {
             ParentKind::Subagent => "subagent",
             ParentKind::Fork => "fork",
             ParentKind::Continuation => "continuation",
         }),
+        parent_atuin_id: s.parent_atuin_id.map(|id| id.to_string()),
+        root_atuin_id: s.root_atuin_id.map(|id| id.to_string()),
+        children_atuin_ids: s.child_atuin_ids.iter().map(ToString::to_string).collect(),
         cwd: s.cwd.as_ref().map(|cwd| cwd.to_string_lossy().into_owned()),
         git_branch: s.git_branch.clone(),
         model: s.model.clone(),
@@ -1153,13 +1184,11 @@ fn session_json(s: &Session) -> SessionJson {
 }
 
 /// `reasoning` is the message's reasoning token count, for a summary block that lacks its own.
-fn content_json(block: &Content, reasoning: Option<u64>) -> ContentJson {
-    match block {
+/// `None` for what capture never stores (reasoning text, raw blocks).
+fn content_json(block: &Content, reasoning: Option<u64>) -> Option<ContentJson> {
+    Some(match block {
         Content::Text(t) => ContentJson::Text { text: t.clone() },
-        Content::Other(json) => ContentJson::Text {
-            text: json.to_string(),
-        },
-        Content::Reasoning(t) => ContentJson::Thinking { text: t.clone() },
+        Content::Reasoning(_) | Content::Other(_) => return None,
         Content::ReasoningSummary { tokens } => ContentJson::Thinking {
             text: reasoning_label(tokens.or(reasoning)),
         },
@@ -1179,7 +1208,22 @@ fn content_json(block: &Content, reasoning: Option<u64>) -> ContentJson {
             content: tr.output_text().unwrap_or_default().into_owned(),
             is_error: tr.error,
         },
-    }
+        Content::Patch(patch) => ContentJson::Patch {
+            tool_use_id: patch.call.to_string(),
+            files: patch
+                .files
+                .iter()
+                .map(|file| FilePatchJson {
+                    path: file.path.clone(),
+                    change: file.change.as_str(),
+                    moved_to: file.moved_to.clone(),
+                    additions: file.additions(),
+                    deletions: file.deletions(),
+                    diff: file.hunks_text(),
+                })
+                .collect(),
+        },
+    })
 }
 
 fn message_json(m: &Message) -> MessageJson {
@@ -1191,7 +1235,7 @@ fn message_json(m: &Message) -> MessageJson {
         model: m.model.clone(),
         cwd: m.cwd.as_ref().map(|cwd| cwd.to_string_lossy().into_owned()),
         git_branch: m.git_branch.clone(),
-        content: m.content.iter().map(|block| content_json(block, reasoning)).collect(),
+        content: m.content.iter().filter_map(|block| content_json(block, reasoning)).collect(),
         tokens: m.usage,
         stop_reason: match &m.stop_reason {
             Some(StopReason::Other(label)) => label.clone(),
@@ -1202,7 +1246,7 @@ fn message_json(m: &Message) -> MessageJson {
 
 #[cfg(test)]
 mod tests {
-    use atuin_client::ai_session::{NativeSessionId, SourceId};
+    use atuin_client::ai_session::{AtuinSessionId, NativeSessionId, SourceId};
     use atuin_common::harnesstools::session::{ToolCallId, ToolResult, ToolUse};
     use atuin_common::string::highlighted::TextHighlighter;
     use atuin_domain::record::RecordId;
@@ -1221,6 +1265,9 @@ mod tests {
     fn session(harness: HarnessKind, id: &str) -> Session {
         Session::builder()
             .handle(handle(harness, id))
+            .atuin_id(AtuinSessionId::from(uuid::Uuid::from_u128(xxhash_rust::xxh3::xxh3_128(
+                format!("{harness:?}:{id}").as_bytes(),
+            ))))
             .started_at(OffsetDateTime::UNIX_EPOCH)
             .updated_at(OffsetDateTime::UNIX_EPOCH)
             .usage(Usage::default())
@@ -1283,6 +1330,17 @@ mod tests {
     }
 
     #[rstest]
+    #[case::whole(32)]
+    #[case::past_the_timestamp(16)]
+    fn the_atuin_id_resolves_a_session(#[case] len: usize) {
+        let sessions =
+            vec![session(HarnessKind::Codex, "aaa"), session(HarnessKind::ClaudeCode, "bbb")];
+        let id = sessions[1].atuin_id.to_string();
+        let selected = select_session(sessions, &id[..len]).unwrap();
+        assert_eq!(selected, handle(HarnessKind::ClaudeCode, "bbb"));
+    }
+
+    #[rstest]
     fn ambiguous_prefix_is_an_error() {
         let sessions =
             vec![session(HarnessKind::Codex, "abc111"), session(HarnessKind::ClaudeCode, "abc222")];
@@ -1318,6 +1376,7 @@ mod tests {
         let v = serde_json::to_value(session_json(&s)).unwrap();
         assert_eq!(v["harness"], "claude-code");
         assert_eq!(v["session_id"], "abcdef0123456789");
+        assert_eq!(v["atuin_id"], s.atuin_id.to_string());
         assert_eq!(v["message_count"], 3);
         assert_eq!(v["tokens"]["input"], 10);
         assert_eq!(v["tokens"]["output"], 20);
@@ -1344,6 +1403,42 @@ mod tests {
         assert_eq!(v["parent"]["session_id"], "parent");
         assert_eq!(v["parent_kind"], want);
         assert_eq!(v["last_reply"], "done");
+    }
+
+    /// `show` names a session's links by atuin id, in text and JSON, leaving out those unknown.
+    #[rstest]
+    fn show_names_links_by_atuin_id() {
+        let id = |n: u128| AtuinSessionId::from(uuid::Uuid::from_u128(n));
+        let mut s = session(HarnessKind::Codex, "child");
+        s.parent = Some(handle(HarnessKind::Codex, "parent"));
+        s.parent_atuin_id = Some(id(1));
+        s.root_atuin_id = Some(id(2));
+        s.child_atuin_ids = vec![id(3), id(4)];
+
+        let v = serde_json::to_value(session_json(&s)).unwrap();
+        assert_eq!(v["parent_atuin_id"], id(1).to_string());
+        assert_eq!(v["root_atuin_id"], id(2).to_string());
+        assert_eq!(
+            v["children_atuin_ids"],
+            serde_json::json!([id(3).to_string(), id(4).to_string()])
+        );
+
+        let mut out = Vec::new();
+        write_session_header(&mut out, &s).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(&format!("parent    {}\n", id(1))), "{text}");
+        assert!(text.contains(&format!("root      {}\n", id(2))), "{text}");
+        assert!(text.contains(&format!("children  {}, {}\n", id(3), id(4))), "{text}");
+
+        let alone = session(HarnessKind::Codex, "alone");
+        let v = serde_json::to_value(session_json(&alone)).unwrap();
+        for key in ["parent_atuin_id", "root_atuin_id", "children_atuin_ids"] {
+            assert!(v.get(key).is_none(), "{key}");
+        }
+        let mut out = Vec::new();
+        write_session_header(&mut out, &alone).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("parent ") && !text.contains("root ") && !text.contains("children"));
     }
 
     #[rstest]
@@ -1433,8 +1528,8 @@ mod tests {
 
     #[rstest]
     fn summary_marks_thinking() {
-        let m = msg(Role::Assistant, vec![Content::Reasoning("pondering".to_owned())]);
-        assert_eq!(message_summary(&m).unwrap().render(false), "» pondering");
+        let m = msg(Role::Assistant, vec![Content::ReasoningSummary { tokens: Some(7) }]);
+        assert_eq!(message_summary(&m).unwrap().render(false), "» Reasoning · 7 tokens");
     }
 
     #[rstest]
@@ -1529,6 +1624,7 @@ mod tests {
             title: highlighter.as_highlighted("the \u{E000}build\u{E001}".to_owned()),
             preview: highlighter.as_highlighted(String::new()),
             message_index: 4,
+            matched: None,
             score: 2.5,
         };
 
@@ -1539,5 +1635,48 @@ mod tests {
         assert_eq!(v["title"]["text"], "the build");
         assert_eq!(v["title"]["matches"], json!([[4, 9]]));
         assert!(v["preview"].get("matches").is_none(), "no matches are omitted, not empty");
+        assert!(v.get("matched").is_none(), "a match in the session itself names no other");
+
+        let child = SessionMatch {
+            matched: Some(atuin_client::ai_session::MatchedSession {
+                handle: HarnessSession {
+                    harness: HarnessKind::ClaudeCode,
+                    session: "child".to_owned().into(),
+                },
+                title: highlighter.as_highlighted("\u{E000}build\u{E001} fix".to_owned()),
+            }),
+            ..m
+        };
+        let v = serde_json::to_value(SearchMatchJson::from(&child)).unwrap();
+        assert_eq!(v["matched"]["session"]["session_id"], "child");
+        assert_eq!(v["matched"]["title"]["matches"], json!([[0, 5]]));
+    }
+
+    /// The match ranges in the JSON are those of what a real search matched.
+    #[rstest]
+    #[case::all(SearchTerms::All, "build", json!([[8, 13]]), json!([[4, 9]]))]
+    #[case::any(SearchTerms::Any, "build nothing", json!([[8, 13]]), json!([[4, 9]]))]
+    #[tokio::test]
+    async fn search_match_json_ranges_come_from_the_search(
+        #[case] mode: SearchTerms,
+        #[case] query: &str,
+        #[case] title: Value,
+        #[case] preview: Value,
+    ) {
+        let db = atuin_client::ai_session::AiSessionDatabase::in_memory().await.unwrap();
+        let mut m = msg(Role::User, vec![Content::Text("the build broke".to_owned())]);
+        m.session_title = Some("Fix the build".to_owned());
+        db.append(&m).await.unwrap();
+
+        let hits: Vec<SessionMatch> =
+            db.search(query, mode, &SessionFilter::default(), 0).try_collect().await.unwrap();
+        let [hit] = hits.as_slice() else {
+            panic!("one match: {hits:?}");
+        };
+        let v = serde_json::to_value(SearchMatchJson::from(hit)).unwrap();
+        assert_eq!(v["title"]["text"], "Fix the build");
+        assert_eq!(v["title"]["matches"], title);
+        assert_eq!(v["preview"]["text"], "the build broke");
+        assert_eq!(v["preview"]["matches"], preview);
     }
 }

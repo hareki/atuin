@@ -1,6 +1,8 @@
 mod checkpoint;
 pub mod error;
 pub mod model;
+pub mod patch;
+pub mod synthetic;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -11,8 +13,9 @@ pub use error::{CaptureError, MessageError, RuntimeError, WatchError};
 use futures::{Stream, StreamExt, TryStreamExt};
 pub use model::{
     Content, MessageId, ParentKind, Role, SessionEvent, SessionId, StopReason, TitleChange,
-    TitleSource, ToolCallId, ToolResult, ToolUse, Usage,
+    TitleSource, ToolCallId, ToolResult, ToolUse, Usage, is_substantive,
 };
+pub use patch::{Change, FilePatch, Hunk, Patch};
 use time::OffsetDateTime;
 
 use crate::sync::BlockingPool;
@@ -84,6 +87,14 @@ pub trait Message: Send + 'static {
         None
     }
     fn parent_id(&self) -> Option<MessageId> {
+        None
+    }
+    /// The id of the row before this line, for a harness whose lines name none ([`Self::parent_id`]
+    /// is `None` throughout): capture links each of its rows to the row it captured before, and
+    /// this says what that is where capture has seen nothing yet, but the reader knows (a read
+    /// resumed past a checkpoint, a transcript continuing another). Never part of a row's
+    /// content-addressed id, so it can change without minting new rows.
+    fn follows(&self) -> Option<MessageId> {
         None
     }
     /// The session this line says it belongs to, when the harness writes one per line. Differs
@@ -295,9 +306,16 @@ mod tests {
             _from: Option<Checkpoint>,
         ) -> impl Stream<Item = Result<(Checkpoint, StubMsg), MessageError>> + Send + 'static
         {
-            let items = futures::stream::iter(
-                self.offsets.into_iter().map(|at| Ok((Checkpoint { at, digest: 0 }, StubMsg))),
-            );
+            let items = futures::stream::iter(self.offsets.into_iter().map(|at| {
+                Ok((
+                    Checkpoint {
+                        at,
+                        digest: 0,
+                        generation: 0,
+                    },
+                    StubMsg,
+                ))
+            }));
             if self.hang {
                 items.chain(futures::stream::pending()).left_stream()
             } else {

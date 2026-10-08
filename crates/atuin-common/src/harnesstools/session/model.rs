@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use derive_more::{AsRef, Display, From, Into};
 use serde::{Deserialize, Serialize};
 
-use crate::harnesstools::session::Checkpoint;
+use crate::harnesstools::session::{Checkpoint, Patch};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Display, From, Into, AsRef, Serialize, Deserialize)]
 pub struct SessionId(#[as_ref(str)] String);
@@ -43,12 +43,30 @@ pub enum Content {
     Summary(String),
     /// Why a model call failed or was aborted, as the harness reported it.
     Error(String),
+    /// The changes a tool call made to files, as its harness recorded them beside the call's
+    /// result (or, for Codex, after it).
+    Patch(Patch),
 }
 
 /// Human-readable breadcrumb shared by the transcript and `atuin ai session` rendering.
 #[must_use]
 pub fn reasoning_label(tokens: Option<u64>) -> String {
     tokens.map_or_else(|| "Reasoned".to_owned(), |n| format!("Reasoning · {n} tokens"))
+}
+
+/// Whether a row with `role` and `content` is a message that makes a line of conversation worth
+/// telling apart from another: a user prompt, or assistant text. Tool calls, their results,
+/// reasoning, usage and system context are not, so a fork in a session's rows only counts as a
+/// branch where it holds one of these.
+#[must_use]
+pub fn is_substantive(role: &Role, content: &[Content]) -> bool {
+    match role {
+        Role::User => true,
+        Role::Assistant => {
+            content.iter().any(|c| matches!(c, Content::Text(t) if !t.trim().is_empty()))
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,18 +96,29 @@ impl ToolResult {
     }
 }
 
+/// The tokens of a model call (or, summed, of a session).
+///
+/// Every harness's reader fills it the same way, whatever its provider counts: `input` is the
+/// input neither read from nor written to the prompt cache, and `cache_read` and `cache_write`
+/// the rest, so the three add up to the input the model processed ([`Self::total_input`]).
+/// Anthropic counts input this way; OpenAI (and so Codex) counts the cached tokens inside
+/// `input_tokens`, and those readers take them out.
+///
 /// Also the daemon's `ai.agent.Tokens` wire message, so its prost tags are that message's field
 /// numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "proto", derive(prost::Message), prost(skip_debug))]
 #[cfg_attr(not(feature = "proto"), derive(Default))]
 pub struct Usage {
+    /// Input not read from the cache nor written to it.
     #[cfg_attr(feature = "proto", prost(uint64, optional, tag = "1"))]
     pub input: Option<u64>,
     #[cfg_attr(feature = "proto", prost(uint64, optional, tag = "2"))]
     pub output: Option<u64>,
+    /// Input read from the prompt cache.
     #[cfg_attr(feature = "proto", prost(uint64, optional, tag = "3"))]
     pub cache_read: Option<u64>,
+    /// Input written to the prompt cache.
     #[cfg_attr(feature = "proto", prost(uint64, optional, tag = "4"))]
     pub cache_write: Option<u64>,
     /// Reasoning (thinking) tokens of the model call, already included in `output`: a
@@ -97,6 +126,23 @@ pub struct Usage {
     #[serde(default)]
     #[cfg_attr(feature = "proto", prost(uint64, optional, tag = "5"))]
     pub reasoning: Option<u64>,
+}
+
+impl Usage {
+    /// All the input the model processed: uncached, read from the cache and written to it.
+    /// `None` when none of them was reported.
+    #[must_use]
+    pub fn total_input(&self) -> Option<u64> {
+        match (self.input, self.cache_read, self.cache_write) {
+            (None, None, None) => None,
+            (input, read, write) => Some(
+                input
+                    .unwrap_or(0)
+                    .saturating_add(read.unwrap_or(0))
+                    .saturating_add(write.unwrap_or(0)),
+            ),
+        }
+    }
 }
 
 /// How a session relates to the one it names as its parent. Harnesses link several kinds of

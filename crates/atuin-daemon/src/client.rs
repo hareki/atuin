@@ -2,7 +2,7 @@ use std::num::NonZeroU32;
 #[cfg(unix)]
 use std::path::PathBuf;
 
-use atuin_client::ai_session::{HarnessKind, HarnessSession};
+use atuin_client::ai_session::{HarnessKind, HarnessSession, SearchTerms, SessionFilter};
 use atuin_client::database::Context;
 use atuin_client::history::{History, HistoryId};
 use atuin_client::settings::{FilterMode, Settings};
@@ -26,9 +26,9 @@ use tracing::{Level, instrument, span};
 use crate::grpc::ai::agent::pb::Session as AiSession;
 use crate::grpc::ai::session::pb::ai_session_client::AiSessionClient as AiSessionServiceClient;
 use crate::grpc::ai::session::pb::{
-    GetSessionEvent, GetSessionRequest, GetTranscriptChunk, GetTranscriptRequest,
-    ImportSessionsEvent, ImportSessionsRequest, ListSessionsRequest, SearchSessionsMatch,
-    SearchSessionsRequest, TailSessionsEvent, TailSessionsRequest,
+    GetSessionEvent, GetSessionRequest, ImportSessionsEvent, ImportSessionsRequest,
+    ListSessionsRequest, RebuildSessionsRequest, SearchSessionsMatch, SearchSessionsRequest,
+    TailSessionsEvent, TailSessionsRequest,
 };
 use crate::grpc::history::pb::history_client::HistoryClient as HistoryServiceClient;
 use crate::grpc::history::pb::{
@@ -532,53 +532,54 @@ impl AiClient {
     }
 
     /// Wait while the daemon is still rebuilding AI sessions after starting: until then every
-    /// session read but a tail is refused rather than answered partially. Calls `on_wait` once if
-    /// it has to wait, and returns at once otherwise. A rebuild ends only once, so after this the
-    /// daemon keeps serving reads for as long as it runs.
-    pub async fn wait_for_sessions(&mut self, on_wait: impl FnOnce()) -> Result<()> {
-        let mut on_wait = Some(on_wait);
+    /// session read but a tail is refused rather than answered partially. Calls `on_wait` each
+    /// time it finds the daemon rebuilding, with how far it has got (records replayed, and
+    /// roughly how many there are to replay), and returns at once when it is not. After this the
+    /// daemon serves reads until a store command has it rebuild again (`atuin store rebuild
+    /// ai-session`, a purge or a forced pull), which is rare.
+    pub async fn wait_for_sessions(&mut self, mut on_wait: impl FnMut((u64, u64))) -> Result<()> {
         let mut delay = REBUILD_POLL_START;
-        loop {
-            // A listing filtered to the future matches nothing, so the probe costs little beyond
-            // the rebuild check every read makes first.
-            let future = OffsetDateTime::now_utc() + time::Duration::days(365);
-            let probe = ListSessionsRequest {
-                harness: None,
-                updated_since: Some(prost_types::Timestamp {
-                    seconds: future.unix_timestamp(),
-                    nanos: 0,
-                }),
-            };
-            match self.client.list_sessions(probe).await {
-                Err(status) if crate::grpc::ai::session::is_rebuilding(&status) => {
-                    if let Some(on_wait) = on_wait.take() {
-                        on_wait();
-                    }
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(REBUILD_POLL_MAX);
-                }
-                Err(status) => return Err(status.into()),
-                Ok(_) => return Ok(()),
-            }
+        while let Some(progress) = self.rebuild_status().await? {
+            on_wait(progress);
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(REBUILD_POLL_MAX);
+        }
+        Ok(())
+    }
+
+    /// Whether the daemon is rebuilding AI sessions right now (see [`Self::wait_for_sessions`]),
+    /// without waiting for it to finish: `Some` while it is, with how far it has got (records
+    /// replayed, and roughly how many there are to replay); `None` when it serves reads.
+    pub async fn rebuild_status(&mut self) -> Result<Option<(u64, u64)>> {
+        // A listing filtered to the future matches nothing, so the probe costs little beyond the
+        // rebuild check every read makes first.
+        let future = OffsetDateTime::now_utc() + time::Duration::days(365);
+        let filter = SessionFilter {
+            updated_since: Some(future),
+            ..SessionFilter::default()
+        };
+        let probe = ListSessionsRequest {
+            filter: Some((&filter).into()),
+        };
+        match self.client.list_sessions(probe).await {
+            Ok(_) => Ok(None),
+            Err(status) => match crate::grpc::ai::session::rebuild_progress(&status) {
+                Some(progress) => Ok(Some(progress)),
+                None => Err(status.into()),
+            },
         }
     }
 
-    /// Stream captured session summaries, newest first. `harness` filters to a single harness and
-    /// `updated_since` to sessions active at or after that time, when set. The daemon sends one
+    /// Stream captured session summaries passing `filter`, newest first. The daemon sends one
     /// session per message (so a long list never trips the gRPC message-size limit); callers that
     /// want the whole set collect it with `try_collect`, and ones that only want the newest can
     /// take the first item without draining the rest.
     pub async fn list_sessions(
         &mut self,
-        harness: Option<HarnessKind>,
-        updated_since: Option<OffsetDateTime>,
+        filter: &SessionFilter,
     ) -> Result<tonic::Streaming<AiSession>> {
         let request = ListSessionsRequest {
-            harness: harness.map(|h| h as i32),
-            updated_since: updated_since.map(|ts| prost_types::Timestamp {
-                seconds: ts.unix_timestamp(),
-                nanos: ts.nanosecond().cast_signed(),
-            }),
+            filter: Some(filter.into()),
         };
         Ok(self.client.list_sessions(request).await?.into_inner())
     }
@@ -594,17 +595,6 @@ impl AiClient {
         Ok(self.client.get_session(request).await?.into_inner())
     }
 
-    /// Stream a rendered plain-text transcript in chunks; concatenate them in arrival order.
-    pub async fn get_transcript(
-        &mut self,
-        session: HarnessSession,
-    ) -> Result<tonic::Streaming<GetTranscriptChunk>> {
-        let request = GetTranscriptRequest {
-            session: Some(session.into()),
-        };
-        Ok(self.client.get_transcript(request).await?.into_inner())
-    }
-
     /// Follow sessions and messages as they are recorded. `harness` filters to one harness when set.
     pub async fn tail_sessions(
         &mut self,
@@ -616,22 +606,34 @@ impl AiClient {
         Ok(self.client.tail_sessions(request).await?.into_inner())
     }
 
+    /// Stream the sessions matching `query` (its terms matching as `terms` says) and passing
+    /// `filter`, most relevant first, at most `limit` (0 is unbounded). An empty query streams
+    /// them newest first.
+    ///
+    /// The daemon matches every term as a whole word, or with [`SearchTerms::Any`] any term as a
+    /// prefix; [`SearchTerms::Typed`] (search as you type) is searched as [`SearchTerms::All`].
     pub async fn search_sessions(
         &mut self,
         query: &str,
-        harness: Option<HarnessKind>,
-        cwd: Option<&str>,
-        any_term: bool,
+        terms: SearchTerms,
+        filter: &SessionFilter,
         limit: u32,
     ) -> Result<tonic::Streaming<SearchSessionsMatch>> {
         let request = SearchSessionsRequest {
             query: query.to_owned(),
             limit,
-            harness: harness.map(|h| h as i32),
-            cwd: cwd.map(str::to_owned),
-            any_term,
+            any_term: terms == SearchTerms::Any,
+            filter: Some(filter.into()),
         };
         Ok(self.client.search_sessions(request).await?.into_inner())
+    }
+
+    /// Have the daemon rebuild its sessions from the record store, after records were deleted
+    /// under them. Returns once what they projected is gone; the replay goes on in the
+    /// background, and [`Self::wait_for_sessions`] waits it out.
+    pub async fn rebuild_sessions(&mut self) -> Result<()> {
+        self.client.rebuild_sessions(RebuildSessionsRequest {}).await?;
+        Ok(())
     }
 
     pub async fn import_sessions(
@@ -733,7 +735,9 @@ mod rebuild_tests {
         let counter = notices.clone();
         let wait = tokio::spawn(async move {
             client
-                .wait_for_sessions(|| {
+                .wait_for_sessions(|progress| {
+                    // The test's store replays nothing: the daemon reports that it has none to.
+                    assert_eq!(progress, (0, 0));
                     counter.fetch_add(1, Ordering::SeqCst);
                 })
                 .await
@@ -748,7 +752,8 @@ mod rebuild_tests {
             .expect("returns once the rebuild ends")
             .unwrap()
             .unwrap();
-        assert_eq!(notices.load(Ordering::SeqCst), 1, "the wait is announced once");
+        // Probed at once, then after 250ms: each probe that finds it rebuilding reports.
+        assert!(notices.load(Ordering::SeqCst) >= 2, "each wait reports its progress");
     }
 
     #[rstest]
@@ -759,8 +764,20 @@ mod rebuild_tests {
         let (mut client, _state, _dir) = serve(state).await;
 
         let mut announced = false;
-        client.wait_for_sessions(|| announced = true).await.unwrap();
+        client.wait_for_sessions(|_| announced = true).await.unwrap();
 
         assert!(!announced);
+    }
+
+    /// The status a probe reads without waiting: rebuilding (with its progress) until the
+    /// rebuild ends, then not.
+    #[rstest]
+    #[tokio::test]
+    async fn reads_the_rebuild_status_without_waiting() {
+        let (mut client, state, _dir) = serve(StoreState::Recovering).await;
+        // The test's store replays nothing: the daemon reports that it has none to.
+        assert_eq!(client.rebuild_status().await.unwrap(), Some((0, 0)));
+        state.send_replace(StoreState::Ready);
+        assert_eq!(client.rebuild_status().await.unwrap(), None);
     }
 }

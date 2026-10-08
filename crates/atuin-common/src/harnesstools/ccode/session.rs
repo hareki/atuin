@@ -12,13 +12,14 @@ use typed_builder::TypedBuilder;
 
 use crate::fs::tree_watcher::{FileStat, TreeWatcher};
 use crate::harnesstools::ccode::Ccode;
+use crate::harnesstools::resume;
 use crate::harnesstools::session::model::{
     Content, MessageId, ParentKind, Role, StopReason, TitleChange, TitleSource, ToolCallId,
     ToolResult, ToolUse, Usage,
 };
 use crate::harnesstools::session::{
-    Checkpoint, Listener, Message, MessageError, Observable, RuntimeError, Session, SessionId,
-    Sessions, WatchError, scan_sessions,
+    Change, Checkpoint, FilePatch, Hunk, Listener, Message, MessageError, Observable, Patch,
+    RuntimeError, Session, SessionId, Sessions, WatchError, scan_sessions,
 };
 use crate::io::{FollowLines, Line, PathLineReader, PooledReadLines};
 use crate::json::jsonl::JsonlExt;
@@ -35,13 +36,34 @@ pub struct CcodeSessions {
 
 impl CcodeSessions {
     fn resolve_root(&self) -> PathBuf {
-        self.root.clone().unwrap_or_else(|| {
-            env_nonempty("CLAUDE_CONFIG_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home_dir().join(".claude"))
-                .join("projects")
-        })
+        self.root.clone().unwrap_or_else(default_root)
     }
+}
+
+/// Claude Code's projects directory: `$CLAUDE_CONFIG_DIR/projects`, else
+/// `~/.claude/projects`.
+pub(crate) fn default_root() -> PathBuf {
+    env_nonempty("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".claude"))
+        .join("projects")
+}
+
+/// The transcript of session `id` under the projects directory `root`:
+/// `<project>/<id>.jsonl`, in whichever project holds it. `claude --resume <id>` looks in
+/// every project too, and gives up when more than one holds the id; the first found is
+/// returned here. A subagent's transcript, nested under its session, is not looked for.
+pub(crate) fn locate(root: &Path, id: &str) -> Option<PathBuf> {
+    if !resume::is_plain_name(id) {
+        return None;
+    }
+    let name = format!("{id}.jsonl");
+    std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|project| project.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|project| project.path().join(&name))
+        .find(|path| path.is_file())
 }
 
 impl Sessions for CcodeSessions {
@@ -206,31 +228,10 @@ impl CcodeSession {
     /// before it (within the same second, in real sessions, and occasionally long after), so a
     /// followed transcript asks again with each line until it can.
     async fn spawned_by(&self) -> Option<Option<SessionId>> {
-        let Some(name) = self
-            .path
-            .file_name()
-            .and_then(|n| n.to_str()?.strip_suffix(".jsonl"))
-            .map(str::to_owned)
-        else {
+        let Some(meta) = meta_file(&self.path) else {
             return Some(None);
         };
-        if !name.starts_with("agent-") {
-            return Some(None);
-        }
-        let meta = self.path.with_file_name(format!("{name}.meta.json"));
-        self.pool
-            .run(move || {
-                let meta: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(meta).ok()?).ok()?;
-                Some(
-                    meta["parentAgentId"]
-                        .as_str()
-                        .map(|parent| SessionId::from(format!("agent-{parent}"))),
-                )
-            })
-            .await
-            .ok()
-            .flatten()
+        self.pool.run(move || spawner_in(&meta)).await.ok().flatten()
     }
 
     /// The byte offset to read from: `from`'s, if the line ending there is still the one `from`
@@ -264,6 +265,26 @@ impl CcodeSession {
     }
 }
 
+/// The metadata file beside a subagent's transcript at `path` (`agent-<id>.meta.json`); `None`
+/// for any other transcript.
+fn meta_file(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?.strip_suffix(".jsonl")?;
+    name.starts_with("agent-").then(|| path.with_file_name(format!("{name}.meta.json")))
+}
+
+/// The subagent that spawned the one whose metadata file is `meta` (its `parentAgentId`), if
+/// any; `None` while the file can't be read.
+fn spawner_in(meta: &Path) -> Option<Option<SessionId>> {
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(meta).ok()?).ok()?;
+    Some(meta["parentAgentId"].as_str().map(|parent| SessionId::from(format!("agent-{parent}"))))
+}
+
+/// `CcodeSession::spawned_by`, blocking, for the transcript at `path`: the subagent that
+/// spawned it, as capture names it on its lines (none while its metadata can't be read).
+pub(crate) fn spawner_of(path: &Path) -> Option<SessionId> {
+    meta_file(path).and_then(|meta| spawner_in(&meta)).flatten()
+}
+
 impl Session for CcodeSession {
     type Message = CcodeMessage;
 
@@ -282,6 +303,8 @@ impl Session for CcodeSession {
                 Some(from) => self.start(from).await,
                 None => 0,
             };
+            // A checkpoint names a line's end, never 0: read from there, it no longer held.
+            let over = from.is_some() && start == 0;
             let lines = FollowLines::new(PooledReadLines::new(
                 PathLineReader::at(&self.path, start),
                 self.pool,
@@ -291,16 +314,19 @@ impl Session for CcodeSession {
                 None => lines.read_to_end().right_stream(),
             }
             .json_with(CcodeMessage::decode);
+            let mut before = LineBefore::new(&probe, start);
             for await item in messages {
                 if spawner.is_none() && item.is_ok() {
                     spawner = probe.spawned_by().await;
                 }
                 let known = spawner.clone().flatten();
-                yield item
-                    .map(|(line, message)| {
-                        (Checkpoint::new(line.end, &line.bytes), message.with_spawner(known))
-                    })
-                    .map_err(MessageError::from);
+                yield match item {
+                    Ok((line, message)) => {
+                        let message = before.stamp(&line, message).await;
+                        Ok((Checkpoint::after(&line).started_over(over), message.with_spawner(known)))
+                    }
+                    Err(err) => Err(MessageError::from(err)),
+                };
             }
         }
     }
@@ -309,6 +335,7 @@ impl Session for CcodeSession {
         let session = self.clone();
         async_stream::stream! {
             let spawner = session.spawned_by().await.flatten();
+            let mut before = LineBefore::new(&session, 0);
             let messages = FollowLines::new(PooledReadLines::new(
                 PathLineReader::new(&session.path),
                 session.pool,
@@ -316,12 +343,76 @@ impl Session for CcodeSession {
             .read_to_end()
             .json_with(CcodeMessage::decode);
             for await item in messages {
-                yield item
-                    .map(|(_, message)| message.with_spawner(spawner.clone()))
-                    .map_err(MessageError::from);
+                yield match item {
+                    Ok((line, message)) => {
+                        Ok(before.stamp(&line, message).await.with_spawner(spawner.clone()))
+                    }
+                    Err(err) => Err(MessageError::from(err)),
+                };
             }
         }
     }
+}
+
+/// The id of the last line read that has one, which a `compact_boundary` that kept messages
+/// follows (see [`CcodeMessage::kept_messages`]).
+struct LineBefore {
+    path: PathBuf,
+    pool: BlockingPool,
+    /// Where reading started: lines before it were never seen, so the one with an id is looked
+    /// up in the file, once, when a boundary needs it.
+    start: u64,
+    generation: u32,
+    uuid: Option<String>,
+}
+
+impl LineBefore {
+    fn new(session: &CcodeSession, start: u64) -> Self {
+        Self {
+            path: session.path.clone(),
+            pool: session.pool.clone(),
+            start,
+            generation: 0,
+            uuid: None,
+        }
+    }
+
+    async fn stamp(&mut self, line: &Line, mut message: CcodeMessage) -> CcodeMessage {
+        // Started over from the file's first byte: nothing before this line counts.
+        if line.generation != self.generation {
+            self.generation = line.generation;
+            self.start = 0;
+            self.uuid = None;
+        }
+        if message.kept_messages() {
+            if self.uuid.is_none() && self.start > 0 {
+                let (path, start) = (self.path.clone(), self.start);
+                self.uuid =
+                    self.pool.run(move || last_uuid_before(&path, start)).await.ok().flatten();
+                self.start = 0;
+            }
+            message.line_before.clone_from(&self.uuid);
+        }
+        if message.uuid.is_some() {
+            self.uuid.clone_from(&message.uuid);
+        }
+        message
+    }
+}
+
+/// The id of the last line with one in the transcript at `path` ending before byte `end`.
+fn last_uuid_before(path: &Path, mut end: u64) -> Option<String> {
+    let file = File::open(path).ok()?;
+    while let Some(line) = Line::ending_at(&file, end).ok()? {
+        if let Ok(CcodeMessage {
+            uuid: Some(uuid), ..
+        }) = CcodeMessage::decode(&line.bytes)
+        {
+            return Some(uuid);
+        }
+        end = line.end.checked_sub(line.bytes.len() as u64 + 1)?;
+    }
+    None
 }
 
 /// One line of a Claude Code transcript (`~/.claude/projects/<project>/<session>.jsonl`).
@@ -348,6 +439,9 @@ pub struct CcodeMessage {
     parent_uuid: Option<String>,
     /// The predecessor of a line written with a null `parentUuid`: a `compact_boundary`.
     logical_parent_uuid: Option<String>,
+    /// On a `compact_boundary`: what it replaced, and the recent messages it kept, if any
+    /// (`preservedSegment`, `preservedMessages`).
+    compact_metadata: Option<Box<serde_json::Value>>,
     session_id: Option<String>,
     /// `{sessionId, messageUuid}` on every line `/branch` copied. `--fork-session` (and a
     /// `--resume` Claude Code turns into a fork) copies lines without it: only `sessionId` is
@@ -362,13 +456,143 @@ pub struct CcodeMessage {
     /// The error class of an API error line (`rate_limit`, `unknown`, ...).
     error: Option<Box<serde_json::Value>>,
     /// Present on the user lines that carry a tool's result (the tool's own record of it).
-    tool_use_result: Option<IgnoredAny>,
+    tool_use_result: Option<ToolUseResult>,
     /// What the user typed when rejecting a tool call, on the line with its `tool_result`.
     user_feedback: Option<Box<serde_json::Value>>,
     /// The subagent that spawned a nested subagent, from its transcript's metadata file (see
     /// `CcodeSession::spawned_by`): no line names it.
     #[serde(skip)]
     spawner: Option<SessionId>,
+    /// The id of the transcript's last line with one before this, from its reader: set on a
+    /// `compact_boundary` that kept messages (see [`Self::kept_messages`]).
+    #[serde(skip)]
+    line_before: Option<String>,
+}
+
+/// What capture reads of a tool's own record of its result (`toolUseResult`): the file an edit or
+/// write changed and its diff (`structuredPatch`), and nothing else. The rest of the record can
+/// hold the whole file before and after (`originalFile`, `content`), which is never parsed.
+#[derive(Debug, Clone, Default)]
+struct ToolUseResult {
+    /// `create` or `update`, on a `Write`'s record.
+    kind: Option<String>,
+    file_path: Option<String>,
+    /// Kept as JSON until read: a record whose patch has a shape this build doesn't know still
+    /// leaves the line readable.
+    structured_patch: Option<Box<serde_json::Value>>,
+}
+
+impl<'de> Deserialize<'de> for ToolUseResult {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Fields;
+
+        impl<'de> serde::de::Visitor<'de> for Fields {
+            type Value = ToolUseResult;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a tool's record of its result")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<ToolUseResult, A::Error> {
+                let mut out = ToolUseResult::default();
+                let text = |value: serde_json::Value| value.as_str().map(str::to_owned);
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "type" => out.kind = text(map.next_value()?),
+                        "filePath" => out.file_path = text(map.next_value()?),
+                        "structuredPatch" => out.structured_patch = Some(map.next_value()?),
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(out)
+            }
+
+            // Any other record (a string, a list) says nothing of a patch.
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<ToolUseResult, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(ToolUseResult::default())
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<ToolUseResult, E> {
+                Ok(ToolUseResult::default())
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<ToolUseResult, E> {
+                Ok(ToolUseResult::default())
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<ToolUseResult, E> {
+                Ok(ToolUseResult::default())
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<ToolUseResult, E> {
+                Ok(ToolUseResult::default())
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<ToolUseResult, E> {
+                Ok(ToolUseResult::default())
+            }
+
+            fn visit_unit<E>(self) -> Result<ToolUseResult, E> {
+                Ok(ToolUseResult::default())
+            }
+        }
+
+        deserializer.deserialize_any(Fields)
+    }
+}
+
+/// A hunk of a `structuredPatch` (jsdiff's `structuredPatch`).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StructuredHunk {
+    old_start: u64,
+    old_lines: u64,
+    new_start: u64,
+    new_lines: u64,
+    lines: Vec<String>,
+}
+
+impl ToolUseResult {
+    /// The file the call `call` changed, when the record has a diff of it (`Edit`, `MultiEdit`,
+    /// `Write`). A new file's diff is empty: its content is the call's input.
+    fn patch(&self, call: &ToolCallId) -> Option<Patch> {
+        let path = self.file_path.clone()?;
+        let hunks: Vec<StructuredHunk> =
+            serde_json::from_value((**self.structured_patch.as_ref()?).clone()).ok()?;
+        let change = if self.kind.as_deref() == Some("create") {
+            Change::Add
+        } else {
+            Change::Update
+        };
+        let hunks = hunks
+            .into_iter()
+            .map(|h| Hunk {
+                old_start: h.old_start,
+                old_lines: h.old_lines,
+                new_start: h.new_start,
+                new_lines: h.new_lines,
+                lines: h.lines,
+            })
+            .collect();
+        Some(Patch {
+            call: call.clone(),
+            files: vec![FilePatch {
+                path,
+                change,
+                moved_to: None,
+                hunks,
+            }],
+        })
+    }
 }
 
 /// The model Claude Code names on the assistant lines it writes itself (API errors, canned
@@ -545,7 +769,7 @@ impl CcodeMessage {
     /// 2.1.281): as `JSON.parse` would (see [`crate::json::js`]; its 2.1.132 changelog notes
     /// sessions holding a lone surrogate from a tool error cut mid-emoji), and without a leading
     /// byte order mark. The error is the original line's.
-    fn decode(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         crate::json::js::from_slice(bytes).or_else(|err| {
             match bytes.strip_prefix(b"\xef\xbb\xbf") {
                 Some(rest) => crate::json::js::from_slice(rest).map_err(|_| err),
@@ -567,8 +791,20 @@ impl CcodeMessage {
             .map(|parent| (parent, ParentKind::Subagent))
     }
 
-    fn with_spawner(self, spawner: Option<SessionId>) -> Self {
+    pub(crate) fn with_spawner(self, spawner: Option<SessionId>) -> Self {
         Self { spawner, ..self }
+    }
+
+    /// A `compact_boundary` that kept recent messages verbatim, which Claude Code hangs after the
+    /// summary (as its loader tells, in CC 2.1.291). Its `logicalParentUuid` names the last of
+    /// them, which Claude Code writes after the summary when it was not in the file yet: the
+    /// kept run then hangs off the summary, the summary off the boundary, and the boundary off
+    /// the run, a loop.
+    fn kept_messages(&self) -> bool {
+        self.subtype.as_deref() == Some("compact_boundary")
+            && self.compact_metadata.as_deref().is_some_and(|meta| {
+                !meta["preservedSegment"].is_null() || !meta["preservedMessages"].is_null()
+            })
     }
 
     fn block(value: &serde_json::Value) -> Content {
@@ -800,6 +1036,14 @@ impl Message for CcodeMessage {
         if let Some(feedback) = self.user_feedback() {
             content.push(Content::Text(feedback.to_owned()));
         }
+        // The diff an edit's record keeps, beside the result it is the record of.
+        let call = content.iter().find_map(|block| match block {
+            Content::ToolResult(result) => Some(&result.call),
+            _ => None,
+        });
+        if let Some(patch) = call.zip(self.tool_use_result.as_ref()).and_then(|(c, r)| r.patch(c)) {
+            content.push(Content::Patch(patch));
+        }
         content
     }
 
@@ -858,7 +1102,16 @@ impl Message for CcodeMessage {
     }
 
     fn parent_id(&self) -> Option<MessageId> {
-        self.parent_uuid.clone().or_else(|| self.logical_parent_uuid.clone()).map(MessageId::from)
+        // A `compact_boundary` that kept messages follows the line before it in the file, the
+        // last it did not keep or one of the kept already written, rather than its
+        // `logicalParentUuid` (see `kept_messages`).
+        let line_before = self.line_before.as_ref().filter(|_| self.kept_messages());
+        self.parent_uuid
+            .as_ref()
+            .or(line_before)
+            .or(self.logical_parent_uuid.as_ref())
+            .cloned()
+            .map(MessageId::from)
     }
 
     /// The session a fork was copied from (`forkedFrom`), else the subagent that spawned a nested
@@ -1518,6 +1771,84 @@ mod tests {
         assert_eq!(m.parent_id(), Some(MessageId::from("u41".to_owned())));
     }
 
+    /// A compaction that kept the conversation's last message, an attachment Claude Code had not
+    /// written yet, as in a real session (CC 2.1.291): the boundary names it as its logical parent
+    /// but it is written after the summary, hung off it. Lines `[0]` to `[3]` come before the
+    /// boundary, `[4]`.
+    fn kept_compaction() -> Vec<String> {
+        let segment = serde_json::json!({"headUuid": "k1", "anchorUuid": "s1", "tailUuid": "k1"});
+        [
+            serde_json::json!({"type": "user", "uuid": "u1", "parentUuid": null,
+                "message": {"role": "user", "content": "hi"}}),
+            serde_json::json!({"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "yo"}]}}),
+            serde_json::json!({"type": "custom-title", "customTitle": "t", "sessionId": "s"}),
+            serde_json::json!({"type": "ai-title", "aiTitle": "t", "sessionId": "s"}),
+            serde_json::json!({"type": "system", "subtype": "compact_boundary", "uuid": "b1",
+                "parentUuid": null, "logicalParentUuid": "k1",
+                "compactMetadata": {"trigger": "auto", "preservedSegment": segment}}),
+            serde_json::json!({"type": "attachment", "uuid": "x1", "parentUuid": "b1"}),
+            serde_json::json!({"type": "user", "uuid": "s1", "parentUuid": "x1",
+                "isCompactSummary": true, "message": {"role": "user", "content": "Summary"}}),
+            serde_json::json!({"type": "attachment", "uuid": "k1", "parentUuid": "s1"}),
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect()
+    }
+
+    fn parents(messages: &[CcodeMessage]) -> Vec<(String, Option<String>)> {
+        messages
+            .iter()
+            .filter_map(|m| Some((String::from(m.id()?), m.parent_id().map(String::from))))
+            .collect()
+    }
+
+    /// A compaction that kept messages follows the line before it, so the transcript stays one
+    /// line rather than a loop through the kept message, however far in reading began: from the
+    /// start, or resumed at the boundary past lines with no id.
+    #[rstest]
+    #[tokio::test]
+    async fn a_compaction_that_kept_messages_follows_the_line_before_it(
+        projects: Projects,
+        #[values(0, 2, 4)] resumed_after: usize,
+    ) {
+        let lines = kept_compaction();
+        let path = projects.project.join("s.jsonl");
+        std::fs::write(&path, lines.concat()).unwrap();
+        let session = CcodeSession::open(SessionId::from("s".to_owned()), path, pool());
+        let from = (resumed_after > 0).then(|| {
+            let at = lines[..resumed_after].concat().len();
+            let last = lines[resumed_after - 1].trim_end();
+            Checkpoint::new(u64::try_from(at).unwrap(), last.as_bytes())
+        });
+        let read: Vec<CcodeMessage> =
+            session.messages_from(from).map(|item| item.unwrap().1).collect().await;
+        assert_eq!(read.len(), lines.len() - resumed_after, "read from the checkpoint");
+        let boundary = parents(&read).into_iter().find(|(id, _)| id == "b1");
+        assert_eq!(boundary, Some(("b1".to_owned(), Some("a1".to_owned()))));
+    }
+
+    /// The whole transcript read at once: the boundary follows the line before it, the rest the
+    /// parents they name.
+    #[rstest]
+    #[tokio::test]
+    async fn a_compaction_that_kept_messages_reads_as_one_line(projects: Projects) {
+        let path = projects.project.join("s.jsonl");
+        std::fs::write(&path, kept_compaction().concat()).unwrap();
+        let session = CcodeSession::open(SessionId::from("s".to_owned()), path, pool());
+        let read: Vec<CcodeMessage> = session.read().map(Result::unwrap).collect().await;
+        let parent = |of: &str| Some(of.to_owned());
+        assert_eq!(parents(&read), vec![
+            ("u1".to_owned(), None),
+            ("a1".to_owned(), parent("u1")),
+            ("b1".to_owned(), parent("a1")),
+            ("x1".to_owned(), parent("b1")),
+            ("s1".to_owned(), parent("x1")),
+            ("k1".to_owned(), parent("s1")),
+        ]);
+    }
+
     /// The compaction summary is the only record of the conversation it replaced.
     #[rstest]
     #[case(serde_json::json!("Summary: fixed forks"))]
@@ -1841,6 +2172,53 @@ mod tests {
         let mut raw = serde_json::json!({"type": "user", "uuid": "t1"});
         raw.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         assert_eq!(parse(&raw).role(), Role::Tool);
+    }
+
+    /// An edit's or write's record of its result keeps the file it changed and the diff, beside
+    /// the result; the rest of the record (the file before and after) is not read.
+    #[rstest]
+    #[case::edit(
+        serde_json::json!({"filePath": "/w/a.rs", "oldString": "b", "newString": "c",
+            "originalFile": "a\nb\n", "structuredPatch": [{"oldStart": 1, "oldLines": 2,
+            "newStart": 1, "newLines": 2, "lines": [" a", "-b", "+c"]}],
+            "userModified": false, "replaceAll": false}),
+        Some((Change::Update, vec![Hunk { old_start: 1, old_lines: 2, new_start: 1,
+            new_lines: 2, lines: vec![" a".into(), "-b".into(), "+c".into()] }]))
+    )]
+    #[case::created(
+        serde_json::json!({"type": "create", "filePath": "/w/a.rs", "content": "x\n",
+            "structuredPatch": [], "originalFile": null}),
+        Some((Change::Add, vec![]))
+    )]
+    #[case::shell(serde_json::json!({"stdout": "ok", "stderr": ""}), None)]
+    #[case::text(serde_json::json!("Error: rejected"), None)]
+    #[case::unknown_patch_shape(
+        serde_json::json!({"filePath": "/w/a.rs", "structuredPatch": "@@ -1 +1 @@"}),
+        None
+    )]
+    #[case::path_not_text(serde_json::json!({"filePath": 1, "structuredPatch": []}), None)]
+    fn an_edits_record_keeps_its_patch(
+        #[case] record: serde_json::Value,
+        #[case] expected: Option<(Change, Vec<Hunk>)>,
+    ) {
+        let m = parse(&serde_json::json!({"type": "user", "uuid": "t1", "toolUseResult": record,
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}]}}));
+        let patch = m.content().into_iter().find_map(|c| match c {
+            Content::Patch(patch) => Some(patch),
+            _ => None,
+        });
+        let expected = expected.map(|(change, hunks)| Patch {
+            call: ToolCallId::from("toolu_1".to_owned()),
+            files: vec![FilePatch {
+                path: "/w/a.rs".into(),
+                change,
+                moved_to: None,
+                hunks,
+            }],
+        });
+        assert_eq!(patch, expected);
+        assert_eq!(m.role(), Role::Tool);
     }
 
     /// What the user typed when rejecting a tool call is their turn (`userFeedback`, CC
