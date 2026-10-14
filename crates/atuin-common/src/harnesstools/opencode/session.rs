@@ -70,10 +70,11 @@
 //!   this module does not model is delivered whole, as [`Content::Other`]: the schema
 //!   (`packages/schema/src/session-event.ts`) is still moving.
 //! - **What the event log does not hold**: a session's messages from before its log began --
-//!   opencode's log is younger than its sessions and one of its migrations empties it -- are read
-//!   by [`Session::read`] from opencode's `session`/`message`/`part` projection, and
-//!   [`Sessions::existing`] lists the sessions only the projection holds (see `Backlog`). The
-//!   live tail follows the log alone.
+//!   opencode's log is younger than its sessions, one of its migrations empties it, and its
+//!   `import` (which `atuin ai resume` writes a session with) writes none -- are read from
+//!   opencode's `session`/`message`/`part` projection, ahead of the log: by [`Session::read`], and
+//!   by the live tail when it takes a session up with no checkpoint in it. [`Sessions::existing`]
+//!   lists the sessions only the projection holds (see `Backlog`).
 //! - **opencode 2.0's sessions**, which it keeps in its `session_v2` and `session_message` tables
 //!   and no longer in the event log (see `v2`): polled for rather than tailed, each row delivered
 //!   once it is settled, and read in the same [`OpencodeSession`] as what opencode 1.x wrote of
@@ -87,6 +88,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -107,6 +109,8 @@ use crate::db::sqlite::observe::{
     TableSchema, Tailable,
 };
 use crate::db::{query_as, query_scalar};
+use crate::dirs::home_dir;
+use crate::env::var_nonempty;
 use crate::harnesstools::opencode::Opencode;
 use crate::harnesstools::session::model::{
     Content, MessageId, ParentKind, Role, StopReason, TitleChange, TitleSource, ToolCallId,
@@ -118,7 +122,6 @@ use crate::harnesstools::session::{
 };
 use crate::os::fs::FdIdentity;
 use crate::sync::BlockingPool;
-use crate::utils::{env_nonempty, home_dir};
 
 pub(crate) mod projection;
 mod v2;
@@ -138,7 +141,7 @@ pub struct OpencodeSessions {
 
 impl OpencodeSessions {
     fn data_dir() -> PathBuf {
-        env_nonempty("XDG_DATA_HOME")
+        var_nonempty("XDG_DATA_HOME")
             .map_or_else(|| home_dir().join(".local").join("share"), PathBuf::from)
             .join("opencode")
     }
@@ -181,7 +184,7 @@ impl OpencodeSessions {
         if let Some(db) = &self.db {
             return Ok(db.clone());
         }
-        if let Some(env) = env_nonempty("OPENCODE_DB") {
+        if let Some(env) = var_nonempty("OPENCODE_DB") {
             let path = PathBuf::from(env);
             if path.as_os_str() == OsStr::new(":memory:") {
                 return Err(RuntimeError::Io(io::Error::new(
@@ -197,7 +200,7 @@ impl OpencodeSessions {
             });
         }
         let data = Self::data_dir();
-        if env_nonempty("OPENCODE_DISABLE_CHANNEL_DB")
+        if var_nonempty("OPENCODE_DISABLE_CHANNEL_DB")
             .is_some_and(|v| matches!(v.to_str(), Some("1" | "true")))
         {
             return Ok(data.join("opencode.db"));
@@ -897,6 +900,37 @@ impl Reader {
         })
     }
 
+    /// What opencode's projection holds of the session from before its event log began (see
+    /// [`Backlog`]), ending with [`MessageError::Incomplete`] when any of it could not be read.
+    fn backlog(&mut self) -> impl Stream<Item = Result<OpencodeMessage, MessageError>> + Send + '_ {
+        async_stream::stream! {
+            let Some(backlog) = self.reads.backlog(&self.aggregate).await else {
+                yield Err(MessageError::Incomplete);
+                return;
+            };
+            if let Some(message) = backlog.session.and_then(|info| {
+                OpencodeMessage::session(serde_json::json!({"info": info}), false)
+            }) {
+                yield Ok(message);
+            }
+            let mut incomplete = false;
+            for id in backlog.messages {
+                match self.reads.projected_message(&id).await {
+                    Some(Some((data, parts))) => {
+                        for message in self.projected(&id, &data, parts) {
+                            yield message;
+                        }
+                    }
+                    Some(None) => {}
+                    None => incomplete = true,
+                }
+            }
+            if incomplete {
+                yield Err(MessageError::Incomplete);
+            }
+        }
+    }
+
     /// The messages one message of opencode's projection makes (see [`Backlog`]): its finished
     /// parts, as its `message.part.updated.1` rows would have delivered them, then its failure,
     /// if it reports one, as its last `message.updated.1` row would have.
@@ -1187,6 +1221,35 @@ struct Reads {
 }
 
 impl Reads {
+    /// When opencode last updated session `id` or anything of it, in milliseconds since the Unix
+    /// epoch, in whichever of its layouts it has; `None` when that can't be read.
+    async fn updated(self: &Arc<Self>, id: &str) -> Option<i64> {
+        const UPDATED: [&str; 5] = [
+            "SELECT MAX(time_updated) FROM session WHERE id = ?1",
+            "SELECT MAX(time_updated) FROM message WHERE session_id = ?1",
+            "SELECT MAX(time_updated) FROM part WHERE session_id = ?1",
+            "SELECT MAX(time_updated) FROM session_v2 WHERE id = ?1",
+            "SELECT MAX(time_updated) FROM session_message WHERE session_id = ?1",
+        ];
+        let id = id.to_owned();
+        self.read("update time read", move |conn| {
+            Box::pin(async move {
+                let mut updated = None;
+                for sql in UPDATED {
+                    // A table this opencode doesn't have says nothing.
+                    let at = query_scalar::<Sqlite, Option<i64>>(sql)
+                        .bind(&id)
+                        .fetch_one(&mut *conn)
+                        .await;
+                    updated = updated.max(at.ok().flatten());
+                }
+                Ok(updated)
+            })
+        })
+        .await
+        .flatten()
+    }
+
     fn new(db: PathBuf) -> Self {
         Self {
             db,
@@ -1525,6 +1588,20 @@ impl Session for OpencodeSession {
         SessionId::from(self.id.clone())
     }
 
+    /// Once opencode has updated the session since `since`, as each row the tail wakes it for may.
+    fn changed_after(mut self, since: SystemTime) -> impl Future<Output = Option<Self>> + Send {
+        let since = OffsetDateTime::from(since).unix_timestamp_nanos() / 1_000_000;
+        async move {
+            loop {
+                let updated = self.reads.updated(&self.id).await;
+                if updated.is_none_or(|at| i128::from(at) >= since) {
+                    return Some(self);
+                }
+                self.wake.changed().await.ok()?;
+            }
+        }
+    }
+
     /// The session as it stands, from the start, ending when it runs out of rows: what opencode's
     /// projection holds of it from before its event log began (see `Backlog`), then the
     /// aggregate's rows, then what opencode 2.0 wrote of it (see `v2`), its settled rows only.
@@ -1533,30 +1610,13 @@ impl Session for OpencodeSession {
     fn read(&self) -> impl Stream<Item = Result<OpencodeMessage, MessageError>> + Send + 'static {
         let reads = Arc::clone(&self.reads);
         let mut reader = Reader::from_start(self.aggregate.clone(), Arc::clone(&reads));
-        let mut next = v2::Reader::from_start(self.id.clone(), Arc::clone(&reads));
-        let aggregate = self.aggregate.clone();
+        let mut next = v2::Reader::from_start(self.id.clone(), reads);
         async_stream::stream! {
-            let mut incomplete = false;
-            match reads.backlog(&aggregate).await {
-                Some(backlog) => {
-                    if let Some(message) = backlog.session.and_then(|info| {
-                        OpencodeMessage::session(serde_json::json!({"info": info}), false)
-                    }) {
-                        yield Ok(message);
-                    }
-                    for id in backlog.messages {
-                        match reads.projected_message(&id).await {
-                            Some(Some((data, parts))) => {
-                                for message in reader.projected(&id, &data, parts) {
-                                    yield message;
-                                }
-                            }
-                            Some(None) => {}
-                            None => incomplete = true,
-                        }
-                    }
+            {
+                let mut backlog = std::pin::pin!(reader.backlog());
+                while let Some(message) = backlog.next().await {
+                    yield message;
                 }
-                None => incomplete = true,
             }
             let mut drain = reader.drain();
             while let Some((_, message)) = drain.next().await {
@@ -1568,7 +1628,7 @@ impl Session for OpencodeSession {
             }
             // A drain also ends on a failed read; a one-shot read says so rather than passing
             // for the whole session.
-            if incomplete || reader.failed() || next.failed() {
+            if reader.failed() || next.failed() {
                 yield Err(MessageError::Incomplete);
             }
         }
@@ -1590,10 +1650,15 @@ impl Session for OpencodeSession {
             // and nothing can wake the session again, so it reads out the rows already in the
             // table -- those a failed read did not reach among them -- rather than abandon them
             let mut last = false;
+            // whether what the projection holds from before the log began is still to deliver
+            // (see `Backlog`): a checkpoint past it names a place in either layout, and one taken
+            // in it names none, so a restart in it delivers it again
+            let mut backlog;
             {
                 let mut readers = reader.lock().await;
                 // a checkpoint resumes each layout past the row it names there
                 let (legacy, next) = from.map(v2::unpack).unwrap_or_default();
+                backlog = legacy.is_none() && next.is_none();
                 if let Some(legacy) = legacy {
                     readers.legacy.seek(legacy).await;
                 }
@@ -1606,21 +1671,36 @@ impl Session for OpencodeSession {
                     // before this one is dropped
                     let mut readers = reader.lock().await;
                     let Readers { legacy, next } = &mut *readers;
-                    // a fresh handle reads at once: the row it was offered on is already in the
-                    // table, and its wake was subscribed to after the tail sent it
-                    legacy.wake();
-                    let held = next.mark();
-                    let mut drain = legacy.drain();
-                    while let Some(((seq, id), message)) = drain.next().await {
-                        let at = v2::checkpoint(Some((seq, &id)), held);
-                        yield message.map(|message| (at, message));
+                    // the log follows the backlog: a backlog that failed to read is read again
+                    // first
+                    if backlog {
+                        backlog = false;
+                        let mut rows = std::pin::pin!(legacy.backlog());
+                        while let Some(message) = rows.next().await {
+                            if matches!(message, Err(MessageError::Incomplete)) {
+                                backlog = true;
+                                continue;
+                            }
+                            yield message.map(|message| (v2::checkpoint(None, None), message));
+                        }
                     }
-                    let mut pass = next.pass();
-                    while let Some((mark, message)) = pass.next().await {
-                        let at = v2::checkpoint(legacy.position(), mark);
-                        yield message.map(|message| (at, message));
+                    if !backlog {
+                        // a fresh handle reads at once: the row it was offered on is already in
+                        // the table, and its wake was subscribed to after the tail sent it
+                        legacy.wake();
+                        let held = next.mark();
+                        let mut drain = legacy.drain();
+                        while let Some(((seq, id), message)) = drain.next().await {
+                            let at = v2::checkpoint(Some((seq, &id)), held);
+                            yield message.map(|message| (at, message));
+                        }
+                        let mut pass = next.pass();
+                        while let Some((mark, message)) = pass.next().await {
+                            let at = v2::checkpoint(legacy.position(), mark);
+                            yield message.map(|message| (at, message));
+                        }
                     }
-                    readers.failed()
+                    backlog || readers.failed()
                 };
                 if last {
                     break;
@@ -2856,7 +2936,7 @@ mod tests {
             .build()
             .listener()
             .unwrap()
-            .events(|_| async { None })
+            .events(SystemTime::UNIX_EPOCH, |_| async { None })
             .boxed()
     }
 
@@ -4837,6 +4917,43 @@ mod tests {
             let messages = read_all(&path).await;
             assert!(!ids(&messages).contains(&"prt_0d148db2d001abandonedDraft1".to_owned()));
             assert_eq!(messages.len(), 11, "the title, nine parts and a failure");
+        }
+
+        /// The live tail delivers what the projection holds of a session ahead of its log, as a
+        /// one-shot read does: a session `opencode import` wrote (`atuin ai resume --in
+        /// opencode`) has no log of its history, nor of the marker naming its parent. A restart
+        /// from a checkpoint in the backlog delivers the backlog again, for the consumer to keep
+        /// the first of each id; one from a checkpoint in the log resumes in the log.
+        #[rstest]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_live_session_delivers_its_backlog_ahead_of_its_log() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("opencode.db");
+            let db = projection_db(&path).await;
+            load(&db, true).await;
+            let expected = ids(&read_all(&path).await);
+
+            // what a capture from `from` delivers of the session, as a restarted tail offers it
+            let live = |from: Option<Checkpoint>, n: usize| {
+                let mut offers = watch(&path);
+                async move {
+                    let session = offered(&mut offers).await;
+                    let mut messages = session.messages_from(from).boxed();
+                    next_n(&mut messages, n).await.into_iter().map(Result::unwrap).collect()
+                }
+            };
+            let got = |items: &[(Checkpoint, OpencodeMessage)]| -> Vec<String> {
+                items.iter().map(|(_, m)| m.id().unwrap().to_string()).collect()
+            };
+
+            let first: Vec<_> = live(None, expected.len()).await;
+            assert_eq!(got(&first), expected);
+            // in the backlog: all of it again, then the log
+            let again: Vec<_> = live(Some(first[3].0), expected.len()).await;
+            assert_eq!(got(&again), expected);
+            // past the log's first message: the rest of the log
+            let rest: Vec<_> = live(Some(first[6].0), expected.len() - 7).await;
+            assert_eq!(got(&rest), expected[7..]);
         }
     }
 

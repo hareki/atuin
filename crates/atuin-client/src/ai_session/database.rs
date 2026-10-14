@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,8 +33,8 @@ mod watermark;
 
 pub use heads::{Analysis, FastForward, Head};
 pub use watermark::{Generation, Watermark};
-pub use write::PreparedMessage;
 use write::{Interned, Writer};
+pub use write::{NewRow, PreparedMessage};
 
 const COMPRESS_THRESHOLD: usize = 256;
 const ZSTD_LEVEL: i32 = 3;
@@ -84,6 +85,15 @@ macro_rules! session_columns {
          lc WHERE lc.parent_harness = s.harness AND lc.parent_session_id = s.session_id) AS \
          child_atuin_ids"
     };
+}
+
+/// A session's conversation, as [`AiSessionDatabase::conversation`] reads it.
+#[derive(Debug, Clone, Default)]
+pub struct Conversation {
+    /// Each message read: its place among the session's messages, its role and its content.
+    pub messages: Vec<(u64, Role, Vec<Content>)>,
+    /// How many messages the session had, as [`Session::message_count`] counts them.
+    pub message_count: u64,
 }
 
 /// The `messages` columns [`MessageRow`] reads, from a table aliased `m`. A row's parent kind is
@@ -553,19 +563,20 @@ impl AiSessionDatabase {
     /// none. A reprojection replays a page of records at a time this way, as committing each row
     /// on its own (and flushing the full-text index with it) is most of what replaying costs.
     ///
-    /// Appends nothing, and returns false, if the sidecar was invalidated since `generation` (see
+    /// Returns the rows not projected before, in order. Appends nothing, and returns None, if
+    /// the sidecar was invalidated since `generation` (see
     /// [`Self::advance_reproject_watermark`]): a wipe may have deleted what the page builds on,
     /// and a write that outlives the replay waiting on it lands after whatever came next.
     pub async fn append_all(
         &self,
         msgs: Vec<PreparedMessage>,
         generation: Generation,
-    ) -> Result<bool, DbError> {
+    ) -> Result<Option<Vec<NewRow>>, DbError> {
         if msgs.is_empty() {
-            return Ok(true);
+            return Ok(Some(Vec::new()));
         }
         self.write_interning(move |conn, interned| {
-            Self::append_page(conn, interned, &msgs, generation)
+            Self::append_page(conn, interned, msgs, generation)
         })
         .await
     }
@@ -586,6 +597,24 @@ impl AiSessionDatabase {
         .await?;
 
         Ok(found.is_some())
+    }
+
+    /// Which of `source_ids` the session holds: [`Self::contains_message`] for many at once.
+    pub async fn stored_source_ids(
+        &self,
+        session: &HarnessSession,
+        source_ids: &[&SourceId],
+    ) -> Result<HashSet<SourceId>, DbError> {
+        let ids: Vec<String> = db::query_scalar(
+            "SELECT source_id FROM messages WHERE session = (SELECT id FROM sessions WHERE \
+             harness = ? AND session_id = ?) AND source_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(session.harness as i64)
+        .bind(session.session.as_ref())
+        .bind(serde_json::to_string(source_ids)?)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(ids.into_iter().map(SourceId::from).collect())
     }
 
     /// Every title the session's lines set or cleared, oldest first: replayed, they give each
@@ -703,9 +732,10 @@ impl AiSessionDatabase {
         self.recent_sessions(filter, 0).await
     }
 
-    /// Every session whose id or [atuin id](AtuinSessionId) starts with `prefix`, across
-    /// harnesses, newest first (to find a session by an abbreviated id). Wildcards mean nothing
-    /// here: the prefix is a byte range, not a pattern.
+    /// Every session whose id or [atuin id](AtuinSessionId) starts with `prefix`, or whose atuin
+    /// id ends with it (see [`AtuinSessionId::has_suffix`]), across harnesses, newest first (to
+    /// find a session by an abbreviated id). Wildcards mean nothing here: the prefix is a byte
+    /// range, and the suffix is only hex.
     pub async fn sessions_with_id_prefix(&self, prefix: &str) -> Result<Vec<Session>, DbError> {
         // Text compares by its UTF-8 bytes, which order as the code points do: the ids starting
         // with `prefix` are those at or past it and before its successor.
@@ -722,9 +752,18 @@ impl AiSessionDatabase {
             ""
         };
 
+        // Hex has no LIKE wildcards, and LIKE ignores ASCII case, as hex() is upper.
+        let suffix = AtuinSessionId::is_suffix(prefix).then(|| format!("%{prefix}"));
+        let suffix_clause = if suffix.is_some() {
+            " OR hex(s.atuin_id) LIKE ?"
+        } else {
+            ""
+        };
+
         let sql = format!(
-            "SELECT {}, {} FROM sessions s WHERE (s.session_id >= ?{upper_clause}){atuin_clause} \
-             ORDER BY s.updated_at DESC, s.session_id",
+            "SELECT {}, {} FROM sessions s WHERE (s.session_id >= \
+             ?{upper_clause}){atuin_clause}{suffix_clause} ORDER BY s.updated_at DESC, \
+             s.session_id",
             session_columns!(),
             no_group_columns!(),
         );
@@ -734,6 +773,9 @@ impl AiSessionDatabase {
         }
         if let Some((low, high)) = &atuin_ids {
             query = query.bind(low.as_bytes().as_slice()).bind(high.as_bytes().as_slice());
+        }
+        if let Some(suffix) = suffix {
+            query = query.bind(suffix);
         }
         let rows: Vec<SessionRow> = query.fetch_all(self.db.pool()).await?;
         rows.into_iter().map(Self::session_from_row).collect()
@@ -992,6 +1034,45 @@ impl AiSessionDatabase {
     fn path_repr(path: &Path) -> String {
         let path = path.to_string_lossy();
         path.trim_end_matches(['/', '\\']).to_owned()
+    }
+
+    /// A session's conversation for reading: each message's role and content, oldest first (in
+    /// the order [`SessionMatch::message_index`] counts), with its place in that order, and how
+    /// many messages it was as [`Session::message_count`] counts them. Only what reading needs is
+    /// read. A message that can't be decoded (written by a newer atuin, or damaged) is left out
+    /// with a warning rather than failing the rest; its place still counts.
+    pub async fn conversation(&self, session: &HarnessSession) -> Result<Conversation, DbError> {
+        let rows: Vec<(Option<String>, String, Option<Vec<u8>>)> = db::query_as(
+            "SELECT (SELECT value FROM interned WHERE id = m.role), m.content, m.content_z FROM \
+             messages m WHERE m.session = (SELECT id FROM sessions WHERE harness = ? AND \
+             session_id = ?) ORDER BY m.timestamp, m.id",
+        )
+        .bind(session.harness as i64)
+        .bind(session.session.as_ref())
+        .fetch_all(self.db.pool())
+        .await?;
+        let mut out = Conversation {
+            messages: Vec::with_capacity(rows.len()),
+            message_count: 0,
+        };
+        for (index, (role, content, content_z)) in (0u64..).zip(rows) {
+            let role = role.as_deref().map(serde_json::from_str::<Role>);
+            let content = Self::read_content(content, content_z);
+            // A message with nothing in it (a structural row) isn't counted, as on write; one
+            // that can't be read had something.
+            out.message_count += u64::from(!content.as_ref().is_ok_and(Vec::is_empty));
+            match (role, content) {
+                (Some(Ok(role)), Ok(content)) => out.messages.push((index, role, content)),
+                (role, content) => warn!(
+                    ?session,
+                    index,
+                    role_ok = matches!(role, Some(Ok(_))),
+                    content_ok = content.is_ok(),
+                    "failed to decode ai-session message; leaving it out of the conversation"
+                ),
+            }
+        }
+        Ok(out)
     }
 
     pub fn messages(
@@ -3126,12 +3207,12 @@ mod tests {
 
         let stale = db.projection_generation().await.unwrap();
         db.reset().await.unwrap();
-        assert!(!db.append_all(page(0..2), stale).await.unwrap());
+        assert!(db.append_all(page(0..2), stale).await.unwrap().is_none());
         let first = message_in(&session, 0, "text");
         assert!(!db.contains_message(&first.session, &first.source_id).await.unwrap());
 
         let current = db.projection_generation().await.unwrap();
-        assert!(db.append_all(page(0..2), current).await.unwrap());
+        assert!(db.append_all(page(0..2), current).await.unwrap().is_some());
         assert!(db.contains_message(&first.session, &first.source_id).await.unwrap());
     }
 
@@ -4585,6 +4666,30 @@ mod tests {
     }
 
     #[rstest]
+    #[case::short(8, 1)]
+    #[case::shortest(6, 1)]
+    #[case::too_short(4, 0)]
+    #[tokio::test]
+    async fn the_end_of_an_atuin_id_finds_a_session(#[case] len: usize, #[case] found: usize) {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let wanted = handle(HarnessKind::ClaudeCode, "wanted");
+        // The ids differ only in their last six digits, given in upper case.
+        let id = |n: u128| {
+            AtuinSessionId::from(Uuid::from_u128(0x0199_6dc4_0800_7000_8000_00ab_cd00_0000 | n))
+        };
+        for (session, n) in [(&wanted, 0x12_3456), (&handle(HarnessKind::Pi, "other"), 0x65_4321)] {
+            let mut msg = message_in(session, 1_790_000_000, "words");
+            msg.atuin_id = Some(id(n));
+            db.append(&msg).await.unwrap();
+        }
+
+        let hex = id(0x12_3456).to_string().to_uppercase();
+        let sessions = db.sessions_with_id_prefix(&hex[hex.len() - len..]).await.unwrap();
+        assert_eq!(sessions.len(), found);
+        assert!(sessions.iter().all(|s| s.handle == wanted));
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn rows_disagreeing_on_the_id_settle_on_the_smaller(
         #[values(false, true)] reversed: bool,
@@ -4742,6 +4847,32 @@ mod tests {
         .execute(db.db.pool())
         .await
         .unwrap();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn the_conversation_leaves_out_a_message_it_cant_decode_and_keeps_the_rest_in_place() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let s = sample_handle();
+        let messages = [
+            message_with(&s, 0, Role::User, vec![text("first prompt")]),
+            message_with(&s, 1, Role::Assistant, vec![text("a reply")]),
+            message_with(&s, 2, Role::User, vec![text("second prompt")]),
+        ];
+        for m in &messages {
+            db.append(m).await.unwrap();
+        }
+        corrupt(&db, &s, 1).await;
+        let conversation = db.conversation(&s).await.unwrap();
+        let read: Vec<(u64, Role)> =
+            conversation.messages.iter().map(|(i, r, _)| (*i, r.clone())).collect();
+        // The broken reply is left out; the prompt after it keeps its place, as the search counts.
+        assert_eq!(read, [(0, Role::User), (2, Role::User)]);
+        assert_eq!(conversation.messages[1].2, vec![text("second prompt")]);
+        // Counted as the session counts its messages: the broken one had something in it.
+        assert_eq!(conversation.message_count, 3);
+        let session = db.get_session(&s).await.unwrap().unwrap();
+        assert_eq!(conversation.message_count, session.message_count);
     }
 
     #[rstest]

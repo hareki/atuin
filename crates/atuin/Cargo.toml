@@ -79,7 +79,7 @@ atuin-ai = { workspace = true, optional = true }
 # TODO(taylordotfish): in Rust 1.99 we can change this to `workspace = true`
 # Keep inline tables on one line: i18n-embed-fl's `fl!` parses this manifest
 # with a TOML 1.0 parser (find-crate -> toml 0.5).
-atuin-client = { path = "../atuin-client", version = "18.23.0", optional = true, default-features = false }
+atuin-client = { path = "../atuin-client", version = "18.24.0-beta.1", optional = true, default-features = false }
 atuin-common = { workspace = true, features = ["ai", "db", "os", "unicode"] }
 atuin-daemon = { workspace = true, optional = true }
 atuin-domain = { workspace = true }
@@ -166,6 +166,7 @@ tree-sitter-powershell = { workspace = true }
 windows-sys = { workspace = true }
 
 [dev-dependencies]
+atuin-common = { workspace = true, features = ["test-utils"] }
 # An in-process sync server for the AI session e2e tests (tests/e2e_ai_sessions.rs).
 atuin-server = { workspace = true }
 divan = { workspace = true }

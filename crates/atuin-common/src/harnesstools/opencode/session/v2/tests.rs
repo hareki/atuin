@@ -340,7 +340,7 @@ fn events(path: &Path, replay: ReplayBehavior, stored: &Stored) -> Events {
         .build()
         .listener()
         .unwrap()
-        .events(move |id| {
+        .events(std::time::SystemTime::UNIX_EPOCH, move |id| {
             let from = stored.lock().get(id).copied();
             async move { from }
         })
@@ -819,6 +819,37 @@ async fn a_call_is_delivered_once_it_settles(#[future] db: Db) {
     db.bump("ses_1").await;
     db.append("ses_1", "msg_i", "idle", idle("succeeded")).await;
     quiet(&mut stream).await;
+}
+
+/// A session with nothing stored that opencode hasn't updated since capture started is history,
+/// left alone until opencode updates it, and then read whole.
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_untouched_session_is_left_alone_until_it_is_updated(#[future] db: Db) {
+    let db = db.await;
+    db.session("ses_1", None, None).await;
+    db.append("ses_1", "msg_u1", "user", user("one")).await;
+
+    let since = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    let stored = Stored::default();
+    let mut stream = OpencodeSessions::builder()
+        .db(&db.path)
+        .replay(ReplayBehavior::All)
+        .build()
+        .listener()
+        .unwrap()
+        .events(since, |_| async { None })
+        .boxed();
+    quiet(&mut stream).await;
+
+    let mut later = user("two");
+    later["time"]["created"] = json!(2_000_000);
+    db.append("ses_1", "msg_u2", "user", later).await;
+    assert_eq!(lines(&next_n(&mut stream, &stored, 3).await), [
+        "System ses_1:session: ",
+        "User msg_u1: one",
+        "User msg_u2: two",
+    ]);
 }
 
 /// A prompt steered in while a call runs settles before it: it is delivered at once, and the
@@ -1320,9 +1351,11 @@ async fn a_session_in_both_layouts_is_one_session(#[future] mixed: Db) {
     db.append("ses_m", "msg_new", "user", user("from two point oh")).await;
 
     let mut stream = events(&db.path, ReplayBehavior::All, &stored);
-    let mut got = lines(&next_n(&mut stream, &stored, 3).await);
+    let mut got = lines(&next_n(&mut stream, &stored, 4).await);
     got.sort();
+    // the title is the 1.x projection's, ahead of the log, and 2.0's: a title repeats
     assert_eq!(got, [
+        "System ses_m:title:Old: ",
         "System ses_m:title:Old: ",
         "User msg_new: from two point oh",
         "User prt_1: from one point x",

@@ -11,7 +11,8 @@
 //!   the picker, or named by id), in this process, before the command is run or handed to the
 //!   shell widget, so the command the widget puts on the command line works as it stands.
 //! - `--in <harness>` continues the session the id names in another harness instead: it is
-//!   written out there as a new session (its tool calls flattened into notes; see
+//!   written out there as a new session (its tool calls carried over as the target's own where
+//!   it has a like tool, notes where they weren't captured whole; see
 //!   [`atuin_common::harnesstools::continuation`]) and that is resumed, the same way. A session
 //!   that went on separately on several machines is continued along one branch, which `--branch`
 //!   must name: without it, it fails listing them (the picker takes the newest, saying so). In the
@@ -42,6 +43,7 @@
 //!   leave the command line alone.
 //! - Standalone on a terminal, resuming changes directory and execs the harness.
 //! - With `--print`, or when stdout is not a terminal, the command is printed instead.
+//! - The picker needs a terminal: without one, it fails saying to name the session instead.
 //!
 //! The picker reads the sidecar database directly and never waits for the daemon.
 
@@ -61,7 +63,7 @@ use crate::resume_tui::resumer::{HarnessResumer, NotResumable, Resume, quote, sh
 use crate::resume_tui::sidecar::SidecarSource;
 use crate::resume_tui::source::{Relation, harness_label};
 use crate::resume_tui::{
-    Outcome, Picker, ResumeContext, ResumePlan, Resumer, SessionRow, SessionSource,
+    Outcome, Picker, ResumeContext, ResumePlan, Resumer, SessionRow, SessionSource, startup,
 };
 
 const ACCEPT_PREFIX: &str = "__atuin_accept__:";
@@ -90,8 +92,9 @@ pub struct Cmd {
     print: bool,
 
     /// Continue the session QUERY names (by id, or a unique id prefix) in another agent: it is
-    /// written out as a new session there, tool calls flattened into notes, and resumed. One that
-    /// went on separately on several machines needs `--branch`.
+    /// written out as a new session there, tool calls carried over as its own where it has a like
+    /// tool (notes where they weren't captured whole), and resumed. One that went on separately on
+    /// several machines needs `--branch`.
     #[arg(long = "in", value_enum, value_name = "HARNESS")]
     continue_in: Option<ContinueIn>,
 
@@ -122,7 +125,7 @@ pub struct Cmd {
     #[arg(long, value_name = "BRANCH", conflicts_with = "as_is")]
     branch: Option<String>,
 
-    /// The filter the picker opens in (default: workspace, widening to global).
+    /// The filter the picker opens in (default: global).
     #[arg(long, value_enum)]
     filter_mode: Option<AiSessionFilterMode>,
 
@@ -171,6 +174,13 @@ enum Output {
 }
 
 impl Cmd {
+    /// Whether someone is there to answer a question first: the shell widget, or a terminal
+    /// picker, not a printed command.
+    #[must_use]
+    pub fn is_interactive(&self) -> bool {
+        self.output() != Output::Print
+    }
+
     fn output(&self) -> Output {
         if self.shell_widget {
             Output::Widget
@@ -193,18 +203,19 @@ impl Cmd {
 
     fn query(&self) -> String {
         if self.query.is_empty() {
-            std::env::var("ATUIN_QUERY").unwrap_or_default()
+            atuin_common::env::var("ATUIN_QUERY").unwrap_or_default()
         } else {
             self.query.join(" ")
         }
     }
 }
 
-/// A query that looks like a session id: one word of id characters, long enough.
+/// A query that looks like a session id: one word of id characters, long enough, with a digit
+/// unless it could be the end of an atuin id (which can be letters alone).
 fn looks_like_id(query: &str) -> bool {
     query.len() >= MIN_ID_PREFIX
         && query.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-        && query.chars().any(|c| c.is_ascii_digit())
+        && (query.chars().any(|c| c.is_ascii_digit()) || AtuinSessionId::is_suffix(query))
 }
 
 /// The single session `query` names, if it is an exact id or a unique prefix (an id several
@@ -241,9 +252,10 @@ fn resumable_first(mut found: Vec<SessionRow>) -> Vec<SessionRow> {
     found
 }
 
-/// Whether the picker has a terminal to run on: stdout, or `/dev/tty` when stdout is captured.
+/// Whether the picker has a terminal to run on: stdin and stdout, or `/dev/tty` for whichever of
+/// them isn't one (crossterm reads keys from stdin only when it is a terminal).
 fn picker_has_a_terminal() -> bool {
-    io::stdout().is_terminal()
+    (io::stdin().is_terminal() && io::stdout().is_terminal())
         || std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").is_ok()
 }
 
@@ -403,6 +415,7 @@ async fn direct_target(
 }
 
 pub async fn run(cmd: Cmd, settings: &Settings) -> Result<()> {
+    startup("started");
     let mut settings = settings.clone();
     if let Some(mode) = cmd.filter_mode {
         settings.ai.sessions.filter_mode = Some(mode);
@@ -413,11 +426,19 @@ pub async fn run(cmd: Cmd, settings: &Settings) -> Result<()> {
     let output = cmd.output();
     let query = cmd.query();
 
-    let context = ResumeContext::current().await?;
-    let path = Settings::ai_session_sidecar_path();
+    let context = ResumeContext::current(&settings).await?;
+    startup("context read");
+    let path = settings.ai_session_sidecar_path();
+    // The daemon makes it the first time it runs with sessions on.
+    if !path.exists() {
+        if settings.ai.capture_sessions {
+            bail!("no AI sessions here yet: the Atuin daemon hasn't recorded any");
+        }
+        bail!("no AI sessions here yet: turn them on with `atuin config enable ai-sessions`");
+    }
     let source: Arc<dyn SessionSource> = Arc::new(SidecarSource::open(&path, &context).await?);
-    let resumer: Arc<dyn Resumer> =
-        Arc::new(HarnessResumer::new(context.clone(), settings.ai.sessions.resume.clone()));
+    startup("session database open");
+    let resumer: Arc<dyn Resumer> = Arc::new(HarnessResumer::new(context.clone(), &settings));
 
     if cmd.fork || cmd.continue_in.is_some() {
         let (source, resumer, query) = (source.as_ref(), resumer.as_ref(), query.trim());
@@ -477,7 +498,14 @@ pub async fn run(cmd: Cmd, settings: &Settings) -> Result<()> {
         }
     }
 
-    let mut themes = ThemeManager::new(settings.theme.debug, None);
+    startup("query checked");
+    if !picker_has_a_terminal() {
+        bail!(
+            "the picker needs a terminal; to resume without one, name the session: `atuin ai \
+             resume <id>` (`atuin ai session list` lists them)"
+        );
+    }
+    let mut themes = ThemeManager::from_settings(&settings.theme);
     let theme = themes.load_theme(settings.theme.name.as_str(), settings.theme.max_depth);
     let (outcome, note) = Picker {
         settings: &settings,
@@ -819,6 +847,8 @@ mod tests {
     #[case("7f3c9", false)]
     #[case("fix flaky", false)]
     #[case("release", false)]
+    #[case::a_short_id_of_letters("deadbeef", true)]
+    #[case::too_short_for_one("beef", false)]
     fn id_like_queries(#[case] query: &str, #[case] want: bool) {
         assert_eq!(looks_like_id(query), want);
     }
@@ -1130,7 +1160,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan.program, "codex");
         assert_eq!(plan.args, ["resume", "continued-7f3c9a12-5be0-4d7e-9c41-0a8e2b6f4d10"]);
-        assert_eq!(status, "continuing in Codex: 42 tool calls become notes, reasoning dropped");
+        assert_eq!(status, "continuing in Codex: 42 tool calls become notes");
 
         let err =
             continue_plan(&source, &resumer, "fix flaky", ContinueIn::Pi, None, fake::THIS_HOST_ID)
