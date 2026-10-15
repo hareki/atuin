@@ -1,10 +1,12 @@
 use std::io::Read;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use atuin_client::history::{AuthorKind, HistoryId};
 use atuin_client::settings::Settings;
 use atuin_common::harnesstools::{AnyHarness, Harness, InstallHookError, codex};
+use atuin_common::path::PathBufExt as _;
 use clap::{Parser, Subcommand};
 use eyre::{Result, bail};
 use tracing::instrument;
@@ -39,7 +41,7 @@ pub struct Cmd {
 
 impl Cmd {
     #[instrument(level = "trace", skip_all, err)]
-    pub async fn run(self, settings: &Settings) -> Result<()> {
+    pub async fn run(self, settings: &Arc<Settings>) -> Result<()> {
         match (self.action, self.agent) {
             (Some(Action::Install { agent }), None) => install(&agent).await,
             (None, Some(agent)) => handle(&agent, settings).await,
@@ -54,7 +56,7 @@ impl Cmd {
 }
 
 fn id_file_path(tool_use_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("atuin-hook-{tool_use_id}"))
+    std::env::temp_dir().joined(format!("atuin-hook-{tool_use_id}"))
 }
 
 /// How the user makes an agent pick up a freshly installed extension. Only the
@@ -91,7 +93,7 @@ async fn install(agent_name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn handle(agent_name: &str, settings: &Settings) -> Result<()> {
+async fn handle(agent_name: &str, settings: &Arc<Settings>) -> Result<()> {
     let harness = AnyHarness::from_name(agent_name)?;
 
     let mut input = String::new();
