@@ -1643,8 +1643,22 @@ impl Settings {
             .set_default("octavo.enabled", false)?
             .set_default("octavo.upload_output", false)?;
 
-        Ok(builder
-            .add_source(Environment::with_prefix("atuin").prefix_separator("_").separator("__")))
+        Ok(builder.add_source(Self::environment()))
+    }
+
+    /// The `ATUIN_*` environment variables, as a config source.
+    fn environment() -> Environment {
+        Environment::with_prefix("atuin").prefix_separator("_").separator("__")
+    }
+
+    /// Layers a config file over `builder`, with `env` on top of it again so that environment
+    /// variables override the file.
+    fn add_config_file(
+        builder: ConfigBuilder<DefaultState>,
+        file: impl config::Source + Send + Sync + 'static,
+        env: Environment,
+    ) -> ConfigBuilder<DefaultState> {
+        builder.add_source(file).add_source(env)
     }
 
     pub fn get_config_path() -> Result<PathBuf> {
@@ -1678,7 +1692,7 @@ impl Settings {
 
             let partial_config = Config::builder()
                 .add_source(ConfigFile::new(config_file_str, FileFormat::Toml))
-                .add_source(Environment::with_prefix("atuin").prefix_separator("_").separator("__"))
+                .add_source(Self::environment())
                 .build()
                 .ok();
 
@@ -1706,7 +1720,11 @@ impl Settings {
         let config_builder = if config_file.exists() {
             let config_file_str =
                 config_file.to_str().ok_or_else(|| eyre!("config file path is not valid UTF-8"))?;
-            config_builder.add_source(ConfigFile::new(config_file_str, FileFormat::Toml))
+            Self::add_config_file(
+                config_builder,
+                ConfigFile::new(config_file_str, FileFormat::Toml),
+                Self::environment(),
+            )
         } else {
             // Use `create_new` to avoid overwriting the file if it just got created in between our
             // existence check and now.
@@ -2071,12 +2089,53 @@ mod tests {
         assert_eq!(settings.default_filter_mode(git_root), expected);
     }
 
+    /// The example config writes out the headers of tables whose keys are all commented out, so
+    /// that `atuin config set` can uncomment their keys beneath them. Those empty tables must
+    /// resolve the same as leaving them out.
+    #[rstest]
+    fn example_config_empty_tables_change_nothing() -> Result<()> {
+        let resolve = |toml: &str| -> Result<serde_json::Value> {
+            let settings: Settings =
+                Settings::builder_with_data_dir(&atuin_common::dirs::unconfigured_data_dir())?
+                    .add_source(ConfigFile::from_str(toml, FileFormat::Toml))
+                    .build()?
+                    .try_deserialize()?;
+            Ok(serde_json::to_value(settings)?)
+        };
+
+        let example = Settings::example_config();
+        let lines: Vec<&str> = example.lines().collect();
+        let is_header = |line: &str| line.starts_with('[');
+        let mut emptied = 0;
+        let without_empty_tables: String = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let empty = is_header(line)
+                    && lines[i + 1..]
+                        .iter()
+                        .take_while(|line| !is_header(line))
+                        .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#'));
+                if empty {
+                    emptied += 1;
+                    format!("# {line}\n")
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+
+        assert!(emptied >= 3, "expected the example config to have empty tables");
+        assert_eq!(resolve(example)?, resolve(&without_empty_tables)?);
+        Ok(())
+    }
+
     #[rstest]
     fn builder_with_data_dir_uses_custom_paths() -> Result<()> {
         use std::path::PathBuf;
 
         let custom_dir = PathBuf::from("/custom/data/dir");
-        let builder = super::Settings::builder_with_data_dir(&custom_dir)?;
+        let builder = Settings::builder_with_data_dir(&custom_dir)?;
         let config = builder.build()?;
 
         let data_dir: String = config.get("data_dir")?;
@@ -2144,6 +2203,28 @@ mod tests {
             .try_deserialize()
             .unwrap();
         assert_eq!(settings.data_dir, Path::new(expected));
+    }
+
+    #[rstest]
+    #[case::env_overrides_the_file(Some("true"), true)]
+    #[case::file_without_env(None, false)]
+    fn environment_overrides_the_config_file(#[case] env: Option<&str>, #[case] expected: bool) {
+        let env = Settings::environment().source(Some(
+            env.map(|value| ("ATUIN_ENTER_ACCEPT".to_string(), value.to_string()))
+                .into_iter()
+                .collect(),
+        ));
+        let builder = Settings::builder_with_data_dir(Path::new("/default/data")).unwrap();
+        let settings: Settings = Settings::add_config_file(
+            builder,
+            ConfigFile::from_str("enter_accept = false\n", FileFormat::Toml),
+            env,
+        )
+        .build()
+        .unwrap()
+        .try_deserialize()
+        .unwrap();
+        assert_eq!(settings.enter_accept, expected);
     }
 
     #[rstest]
