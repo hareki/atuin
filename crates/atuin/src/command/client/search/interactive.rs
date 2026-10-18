@@ -43,6 +43,7 @@ use super::history_list::{HistoryList, ListState};
 use super::inspector::Stats as InspectorStats;
 use super::inspector::bindings::Bindings;
 use super::inspector::browser::{Browser, View as InspectorView};
+use super::max_width;
 use crate::VERSION;
 use crate::command::client::search::engines;
 use crate::command::client::search::history_list::HistoryHighlighter;
@@ -939,7 +940,7 @@ impl State {
         theme: &Theme,
         popup_mode: bool,
     ) {
-        let area = f.area();
+        let area = max_width::clamp(f.area(), settings);
         if popup_mode {
             f.render_widget(Clear, area);
         }
@@ -1828,6 +1829,7 @@ pub async fn history(
                 let (term_cols, term_rows) = terminal::size().unwrap_or((s.cols, s.rows));
                 let (popup_rect, scroll) =
                     compute_popup_placement(s.cursor_row, term_rows, term_cols, inline_height);
+                let popup_rect = max_width::clamp(popup_rect, settings);
 
                 // Scroll terminal content up to make room if needed
                 if scroll > 0 {

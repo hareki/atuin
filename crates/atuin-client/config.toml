@@ -66,6 +66,11 @@
 ## the accepted values are identical to those of "inline_height"
 # inline_height_shell_up_key_binding = 0
 
+## the maximum number of columns the interface should take up, not counting
+## its 1-column margin on each side; it stays at the left edge
+## set it to 0 to always use the full width
+# max_width = 0
+
 ## Invert the UI - put the search bar at the top , Default to `false`
 # invert = false
 

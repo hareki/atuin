@@ -25,6 +25,7 @@ mod history_list;
 mod inspector;
 mod interactive;
 pub mod keybindings;
+mod max_width;
 mod selection_ext;
 mod syntax;
 
