@@ -1106,6 +1106,9 @@ pub struct Settings {
     pub inline_height: u16,
     /// The most lines search takes up when the up arrow opens it. If unset, `inline_height`.
     pub inline_height_shell_up_key_binding: Option<u16>,
+    /// The most columns search takes up, not counting its 1-column margin on each side. Search
+    /// stays at the left edge. `0` uses the full width.
+    pub max_width: u16,
     /// Put the search bar at the top, with the results below it.
     pub invert: bool,
     /// Show the selected command in full below the results.
@@ -1722,6 +1725,7 @@ impl Settings {
             .set_default("bind_ctrl_r", true)?
             .set_default("bind_up_arrow", true)?
             .set_default("inline_height", 40)?
+            .set_default("max_width", 0)?
             .set_default("show_preview", true)?
             .set_default("preview.strategy", "auto")?
             .set_default("max_preview_height", 4)?
