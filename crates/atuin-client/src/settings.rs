@@ -1140,6 +1140,7 @@ pub struct Settings {
     pub bind_up_arrow: bool,
     pub inline_height: u16,
     pub inline_height_shell_up_key_binding: Option<u16>,
+    pub max_width: u16,
     pub invert: bool,
     pub show_preview: bool,
     pub max_preview_height: u16,
@@ -1679,6 +1680,7 @@ impl Settings {
             .set_default("bind_ctrl_r", true)?
             .set_default("bind_up_arrow", true)?
             .set_default("inline_height", 40)?
+            .set_default("max_width", 0)?
             .set_default("show_preview", true)?
             .set_default("preview.strategy", "auto")?
             .set_default("max_preview_height", 4)?
