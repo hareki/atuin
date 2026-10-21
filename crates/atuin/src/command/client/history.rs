@@ -420,7 +420,7 @@ fn make_starting_history(
     let h: History = History::capture()
         .timestamp(OffsetDateTime::now_utc())
         .command(command)
-        .cwd(cwd)
+        .cwd(cwd.to_string_lossy().into_owned())
         .author_opt(author)
         .author_kind_opt(author_kind)
         .intent_opt(intent.map(String::from))
@@ -1398,6 +1398,7 @@ mod tests {
         #[case] rows_left: i64,
     ) {
         use atuin_client::record::sqlite_store::SqliteStore;
+        use atuin_common::path::AbsPathBuf;
         use atuin_common::utils::uuid_v7;
         use atuin_domain::record::HostId;
 
@@ -1405,15 +1406,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = SqliteStore::in_memory(Duration::from_secs(2)).await.unwrap();
         let history_store = HistoryStore::new(store, HostId(uuid_v7()), paseto_v4::Key::generate());
-        let settings = Settings {
-            daemon: atuin_client::settings::Daemon {
-                enabled: daemon_enabled,
-                autostart: false,
-                socket_path: Some(tmp.path().join("no-daemon-here.sock")),
-                ..Default::default()
-            },
-            ..Settings::utc()
-        };
+        let mut settings = Settings::utc();
+        settings.daemon.enabled = daemon_enabled;
+        settings.daemon.autostart = false;
+        settings.daemon.socket_path = AbsPathBuf::new(tmp.path().join("no-daemon-here.sock")).ok();
         let entries: Vec<History> = ["echo one", "echo two"]
             .into_iter()
             .map(|cmd| {

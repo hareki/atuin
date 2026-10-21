@@ -2230,11 +2230,16 @@ pub async fn history(
         InputAction::ReturnOriginal => Ok(String::new()),
         InputAction::Copy(index) => {
             let cmd = if app.tab_index == 1 {
-                inspecting.map(|entry| entry.command).unwrap_or_default()
+                inspecting.map(|entry| entry.command)
+            } else if index < results.len() {
+                Some(results.swap_remove(index).command)
             } else {
-                results.swap_remove(index).command
+                // No results, e.g. the query matches nothing.
+                None
             };
-            if let Err(e) = set_clipboard(cmd) {
+            if let Some(cmd) = cmd
+                && let Err(e) = set_clipboard(cmd)
+            {
                 tracing::warn!(?e, "failed to copy to clipboard");
             }
             Ok(String::new())
@@ -2361,6 +2366,7 @@ mod tests {
     use atuin_client::settings::{
         ExitMode, FilterMode, KeymapMode, Preview, PreviewStrategy, SearchMode, Settings, Shells,
     };
+    use atuin_common::path::AbsPathBuf;
     use atuin_common::shell::Shell;
     use rstest::{fixture, rstest};
     use time::OffsetDateTime;
@@ -2935,7 +2941,7 @@ mod tests {
                 continue;
             };
             writeln!(script, "{cd}\n{print_cwd}").unwrap();
-            expected.push(dir.canonicalize().unwrap());
+            expected.push(AbsPathBuf::canonicalize(&dir).unwrap());
         }
         let skipped = NAMES.iter().filter(|n| shell == Shell::Powershell && n.contains('\\'));
         assert_eq!(expected.len(), NAMES.len() - skipped.count(), "unexpected skips");
@@ -2961,7 +2967,7 @@ mod tests {
             "{program} failed:\n{script}\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let landed: Vec<_> = stdout.lines().map(|l| std::fs::canonicalize(l).unwrap()).collect();
+        let landed: Vec<_> = stdout.lines().map(|l| AbsPathBuf::canonicalize(l).unwrap()).collect();
         assert_eq!(landed, expected, "{program} script:\n{script}");
     }
 
@@ -3401,7 +3407,7 @@ mod tests {
         settings.daemon.enabled = true;
         settings.daemon.autostart = true;
         settings.daemon.systemd_socket = true;
-        settings.daemon.socket_path = Some(temp.path().join("missing.sock"));
+        settings.daemon.socket_path = AbsPathBuf::new(temp.path().join("missing.sock")).ok();
         let settings = Arc::new(settings);
 
         let mut state = state(KeymapMode::Emacs, 0, 0, FilterMode::Global, "query");
