@@ -93,6 +93,14 @@ sync-status-last-sync = Last sync: { $time }
 sync-status-remote = [Remote]
 sync-status-address = Address: { $address }
 sync-status-username = Username: { $username }
+cli-category-ai = AI:
+cli-category-sync = Sync & account:
+cli-category-sync-description = *Keep your history in sync across machines*
+cli-category-data = Data:
+cli-category-data-description = *Synced data beyond your shell history*
+cli-category-setup = Setup:
+cli-category-setup-description = *Install, configure, and troubleshoot Atuin*
+cli-category-advanced = Advanced:
 cmd-search = Interactive history search
 cmd-stats = Calculate statistics for your history
 cmd-account = Manage your sync account
@@ -108,7 +116,7 @@ cmd-wrapped = Show a fun, year-in-review recap of your shell history
 arg-wrapped-year = Year to recap (defaults to last year, or this year in December)
 cmd-default-config = Print the default atuin configuration (config.toml)
 cmd-info = Information about Atuin data locations and ENV vars
-cmd-daemon = {"*"}Experimental* Manage the background daemon
+cmd-daemon = Manage the background daemon
 cmd-__internal_ = We want to exclude the `__internal` subcommand from Clap's `infer_subcommands`; otherwise, a user could access it simply by typing `atuin _`. However, Clap has no way to disable `infer_subcommands` for a single command. As a workaround, we define a dummy command with the same name but with an extra understore, which forces `__internal` to be typed out in entirety, since any prefix of the name would be ambiguous
 cmd-account-register = Register a new account
 cmd-account-delete = Delete your account, and all synced data
@@ -352,9 +360,9 @@ cmd-store-purge = Delete all records in the store that cannot be decrypted with 
 cmd-store-verify = Verify that all records in the store can be decrypted with the current key
 cmd-store-push = Push all records to the remote sync server (one way sync)
 cmd-store-pull = Pull records from the remote sync server (one way sync)
-arg-store-pull-force = Force push records
+arg-store-pull-force = Force pull records
     .long = 
-        Force push records
+        Force pull records
 
         This will first wipe the local store, and then download all records from the remote
 arg-store-pull-page = Page Size
