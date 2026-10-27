@@ -632,6 +632,7 @@ mod tests {
             results_len: 1,
             original_input_empty: false,
             has_context: false,
+            shell_up_key_binding: false,
         })
     }
 
