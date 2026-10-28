@@ -111,14 +111,13 @@ cmd-doctor = Run the doctor to check for common issues
 cmd-update = Update atuin to the latest version on your release channel
 cmd-hook = Manage AI-agent shell hooks
 cmd-mcp = Start an MCP server exposing history search to AI tools (stdio)
-cmd-mcp-install = Connect an AI agent to atuin's MCP server
-arg-mcp-install-agent = Agent to connect (claude-code, codex, opencode or pi)
+cmd-mcp-install = Connect AI agents to atuin's MCP server
+arg-mcp-install-agent = Agent to connect (claude-code, codex, opencode, pi or omp); omit to connect all agents with existing config files
 cmd-wrapped = Show a fun, year-in-review recap of your shell history
 arg-wrapped-year = Year to recap (defaults to last year, or this year in December)
 cmd-default-config = Print the default atuin configuration (config.toml)
 cmd-info = Information about Atuin data locations and ENV vars
 cmd-daemon = Manage the background daemon
-cmd-__internal_ = We want to exclude the `__internal` subcommand from Clap's `infer_subcommands`; otherwise, a user could access it simply by typing `atuin _`. However, Clap has no way to disable `infer_subcommands` for a single command. As a workaround, we define a dummy command with the same name but with an extra understore, which forces `__internal` to be typed out in entirety, since any prefix of the name would be ambiguous
 cmd-account-register = Register a new account
 cmd-account-delete = Delete your account, and all synced data
 cmd-account-change-password = Change your password
@@ -251,11 +250,6 @@ value-init-shell-fish = Fish setup
 value-init-shell-nu = Nu setup
 value-init-shell-xonsh = Xonsh setup
 value-init-shell-powershell = PowerShell setup
-cmd-__internal-pty-proxy-active = Check whether the current terminal belongs to a live PTY proxy
-    .long = 
-        Check whether the current terminal belongs to a live PTY proxy.
-
-        Prints `0` or `1` to stdout. This command is used by shell hooks to determine whether the PTY proxy is in use.
 cmd-kv-set = Set a key-value pair
 arg-kv-set-key = Key to set
 arg-kv-set-value = Value to store (reads from stdin if not provided)

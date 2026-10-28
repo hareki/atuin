@@ -337,7 +337,7 @@ fn caps_http(extra_headers: &HashMap<String, SecretString>) -> Result<reqwest::C
 /// A pending records download for one series, produced by [`Client::records`].
 ///
 /// Owns a cheap [`Client`] clone and the [`RecordSeriesKey`] so the streams it produces are
-/// `'static` (spawnable). Choose [`Self::one`] to fetch just the first record, or [`Self::stream`]
+/// `'static` (spawnable). Choose [`Self::first_from`] to fetch just one record, or [`Self::stream`]
 /// to stream the pages a plan covers.
 #[must_use]
 pub struct RecordsRequest {
@@ -346,9 +346,9 @@ pub struct RecordsRequest {
 }
 
 impl RecordsRequest {
-    /// Fetch the first record of the series, if it has any.
-    pub async fn one(self) -> Result<Option<Record<EncryptedData>>> {
-        let pages = self.stream((0..1).chunks(1));
+    /// Fetch the series' first record at or after `start`, if it has any.
+    pub async fn first_from(self, start: RecordIdx) -> Result<Option<Record<EncryptedData>>> {
+        let pages = self.stream((start..start + 1).chunks(1));
         futures::pin_mut!(pages);
         match pages.next().await {
             Some(page) => Ok(page?.into_iter().next()),
@@ -667,21 +667,6 @@ impl Client {
         debug!("got remote index {index:?}");
 
         Ok(index)
-    }
-
-    #[instrument(level = "trace", skip_all, err)]
-    pub async fn delete(&self) -> Result<()> {
-        let url = self.sync_addr.append(["account"])?;
-
-        let resp = self.client.delete(url).send().await?;
-
-        if resp.status() == 403 {
-            bail!("invalid login details");
-        } else if resp.status() == 200 {
-            Ok(())
-        } else {
-            bail!("Unknown error");
-        }
     }
 
     #[instrument(level = "trace", skip_all, err)]
