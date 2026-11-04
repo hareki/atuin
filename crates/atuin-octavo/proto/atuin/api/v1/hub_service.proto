@@ -4,6 +4,7 @@ package atuin.api.v1;
 
 import "atuin/api/v1/common.proto";
 import "atuin/api/v1/history.proto";
+import "atuin/api/v1/share.proto";
 import "atuin/api/v1/threads.proto";
 import "buf/validate/validate.proto";
 
@@ -65,23 +66,62 @@ service HubService {
   // included, is over 10 MiB.
   rpc InsertThreadMessages(InsertThreadMessagesRequest) returns (InsertThreadMessagesResponse);
 
-  // Return one page of the calling user's threads that match the filter, the most recently active
-  // first.
+  // Return one page of the threads that match the filter, the calling user's own or those a share
+  // holds, the most recently active first.
   //
-  // Pass `next_page_token` back as `page_token`, with the same filter and within a day, for the
-  // next page; any other token fails with `INVALID_ARGUMENT` (`INVALID_PAGE_TOKEN`). An empty
-  // `next_page_token` means there are no more pages.
+  // Pass `next_page_token` back as `page_token`, with the same filter and share and within a day,
+  // for the next page; any other token fails with `INVALID_ARGUMENT` (`INVALID_PAGE_TOKEN`). An
+  // empty `next_page_token` means there are no more pages. Takes a call without a token when it
+  // names a share.
   rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
 
-  // Return one page of the messages of the calling user's thread, in transcript order: by
-  // timestamp, then by id.
+  // Return one page of the calling user's threads that match the query, best match or most
+  // recently active first as `order` says.
+  //
+  // Without the filter's `include_subagents`, a subagent's match is credited to its nearest stored
+  // ancestor that isn't a subagent, or the topmost stored one when there is none. A query without
+  // words lists by its filter alone, most recently active first, whatever the order. `THREAD_ORDER_RECENT` orders as `ListThreads` does. Pages as
+  // `ListThreads` does, with the same query and order. Fails with `INVALID_ARGUMENT`
+  // (`INVALID_THREAD_QUERY`) for a query the hub can't use or an unspecified `order`, and with
+  // `DEADLINE_EXCEEDED` (`THREAD_SEARCH_TIMEOUT`) when the search takes too long: add a word or a
+  // filter.
+  rpc SearchThreads(SearchThreadsRequest) returns (SearchThreadsResponse);
+
+  // Count the calling user's threads that match the query, after crediting subagents' matches as
+  // `SearchThreads` does, and their most common harnesses, working directories, git branches and
+  // models.
+  //
+  // Each list holds the top five values, most common first, ties broken by value, and ignores the
+  // query filter's own field for it: under `harness: "codex"`, `harnesses` still names the other
+  // harnesses. Fails with `INVALID_ARGUMENT` (`INVALID_THREAD_QUERY`) for a query the hub can't
+  // use, and with `DEADLINE_EXCEEDED` (`THREAD_SEARCH_TIMEOUT`) when the count takes too long: add
+  // a word or a filter.
+  rpc TallyThreads(TallyThreadsRequest) returns (TallyThreadsResponse);
+
+  // Return the ids of the messages of the calling user's thread that match the query's terms and
+  // roles, in transcript order.
+  //
+  // The query's filter and time range don't apply: the thread is already chosen. Fails with
+  // `NOT_FOUND` (`THREAD_NOT_FOUND`) when the user has no such thread, and with `INVALID_ARGUMENT`
+  // (`INVALID_THREAD_QUERY`) for a query the hub can't use.
+  rpc ListThreadMatches(ListThreadMatchesRequest) returns (ListThreadMatchesResponse);
+
+  // Return the thread with this id, the calling user's own or one a share holds.
+  //
+  // Fails with `NOT_FOUND` (`THREAD_NOT_FOUND`) when the user, or the share, has no such thread.
+  // Takes a call without a token when it names a share.
+  rpc GetThread(GetThreadRequest) returns (GetThreadResponse);
+
+  // Return one page of the messages of a thread, the calling user's own or one a share holds, in
+  // transcript order: by timestamp, then by id.
   //
   // A page may hold fewer than `page_size` messages when their content is large. Pages as
   // `ListThreads` does, with the same thread. Fails with `NOT_FOUND` (`THREAD_NOT_FOUND`) when the
-  // user has no such thread.
+  // user, or the share, has no such thread. Takes a call without a token when it names a share.
   rpc ListThreadMessages(ListThreadMessagesRequest) returns (ListThreadMessagesResponse);
 
-  // Stream the calling user's thread: what is stored of it, then each change as it is stored.
+  // Stream a thread, the calling user's own or one a share holds: what is stored of it, then each
+  // change as it is stored.
   //
   // Sends the thread's `Thread`, a `child` for each stored thread naming it as their parent, and
   // its messages in transcript order, then `caught_up`. From then on, sends each of its messages as
@@ -89,9 +129,28 @@ service HubService {
   // thread first stored naming it as their parent. A message stored during the catch-up is sent
   // once, in the catch-up or after it, so one stored with an earlier timestamp can come after
   // `caught_up`: place each by timestamp, then by id. Sends a heartbeat after every 25 seconds
-  // without a message. Fails with `NOT_FOUND` (`THREAD_NOT_FOUND`) when the user has no such
-  // thread, or once the thread is deleted.
+  // without a message. Fails with `NOT_FOUND` (`THREAD_NOT_FOUND`) when the user, or the share,
+  // has no such thread, or once the thread is deleted. Of the user's own thread, fails with
+  // `FAILED_PRECONDITION` (`OCTAVO_NOT_ENABLED`) within a heartbeat of the user losing Octavo.
+  // Through a share, sends a `child` only for a thread the share holds, and fails with `NOT_FOUND`
+  // (`SHARE_NOT_FOUND`) once the share no longer opens: within a heartbeat of its owner losing
+  // Octavo, or of the caller or its owner leaving the organization it opens through, and at once
+  // when it is deleted or its audience changes so it no longer opens to the caller. Takes a call
+  // without a token when it names a share.
   rpc WatchThread(WatchThreadRequest) returns (stream WatchThreadResponse);
+
+  // Stream the calling user's threads that match the filter: the most recently active of them, then
+  // each change as it is stored.
+  //
+  // Sends the first page `ListThreads` would return, a `thread` each, then `caught_up`. From then
+  // on, sends a matching thread's `Thread` after a store changes it or a thread naming it as its
+  // parent is first stored or deleted, past the first page too, at most once a second for each
+  // thread. Sends a `removed` for each of the user's threads deleted, and for each changed so it no
+  // longer matches, whether or not it was sent. A thread changed while the page is read may come
+  // again after `caught_up`, so keep each thread's newest `Thread`, by id.
+  // Sends a heartbeat after every 25 seconds without a message, and fails with
+  // `FAILED_PRECONDITION` (`OCTAVO_NOT_ENABLED`) within a heartbeat of the user losing Octavo.
+  rpc WatchThreads(WatchThreadsRequest) returns (stream WatchThreadsResponse);
 
   // Delete the calling user's thread with this handle and every thread descended from it, with
   // their messages, and keep them from being stored again, along with any thread later naming one
@@ -103,6 +162,48 @@ service HubService {
 
   // Identify the user the call's token logs in.
   rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
+
+  // Share the request's target, which the calling user owns, with the request's audience, under
+  // the request's id.
+  //
+  // Fails with `ALREADY_EXISTS` (`SHARE_ALREADY_EXISTS`) when a share has this id, so a client can
+  // repeat a creation it did not hear back from, with `NOT_FOUND` (`SHARE_TARGET_NOT_FOUND`) when
+  // the user owns nothing the target names, and with `NOT_FOUND` (`SHARE_ORG_NOT_FOUND`) when the
+  // user belongs to no organization with one of the audience's slugs.
+  rpc CreateShare(CreateShareRequest) returns (CreateShareResponse);
+
+  // The share the request names, if the caller may open it: with its link token, as a signed-in
+  // member of one of its organizations, or as its owner.
+  //
+  // Fails with `NOT_FOUND` (`SHARE_NOT_FOUND`) when there is no such share, the caller may not
+  // open it, or its owner no longer has Octavo. Takes a call without a token.
+  rpc GetShare(GetShareRequest) returns (GetShareResponse);
+
+  // Return one page of the calling user's shares, newest first.
+  //
+  // Pass `next_page_token` back as `page_token`, with the same request and within a day, for the
+  // next page; any other token fails with `INVALID_ARGUMENT` (`INVALID_PAGE_TOKEN`). An empty
+  // `next_page_token` means there are no more pages.
+  rpc ListShares(ListSharesRequest) returns (ListSharesResponse);
+
+  // Give the link of one of the calling user's shares a new token. The old token stops opening it.
+  //
+  // Fails with `NOT_FOUND` (`SHARE_NOT_FOUND`) when the user has no share with this id, and with
+  // `NOT_FOUND` (`SHARE_LINK_NOT_FOUND`) when it has no link.
+  rpc RotateShareLink(RotateShareLinkRequest) returns (RotateShareLinkResponse);
+
+  // Change who one of the calling user's shares opens to. A link it keeps keeps its token, and a
+  // link it gains gets a new one.
+  //
+  // Fails with `NOT_FOUND` (`SHARE_NOT_FOUND`) when the user has no share with this id, and with
+  // `NOT_FOUND` (`SHARE_ORG_NOT_FOUND`) when the user belongs to no organization with one of the
+  // audience's slugs.
+  rpc SetShareAudience(SetShareAudienceRequest) returns (SetShareAudienceResponse);
+
+  // Delete one of the calling user's shares. Its link stops opening it.
+  //
+  // Fails with `NOT_FOUND` (`SHARE_NOT_FOUND`) when the user has no share with this id.
+  rpc DeleteShare(DeleteShareRequest) returns (DeleteShareResponse);
 }
 
 message InsertHistoryRequest {
@@ -220,6 +321,9 @@ message ListThreadsRequest {
   uint32 page_size = 2 [(buf.validate.field).uint32.lte = 200];
   // Opaque. Copy the `next_page_token` of the previous page, or leave empty for the first page.
   string page_token = 3;
+  // A share to list the threads of, as `GetThreadRequest.share`. `filter` then narrows what the
+  // share holds.
+  ShareRef share = 4;
 }
 
 message ListThreadsResponse {
@@ -229,13 +333,92 @@ message ListThreadsResponse {
   string next_page_token = 2;
 }
 
+message SearchThreadsRequest {
+  // Which threads to return.
+  ThreadQuery query = 1;
+  // How to sort them. Logically required.
+  ThreadOrder order = 2 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).enum = {
+      defined_only: true
+      not_in: [0]
+    }
+  ];
+  // The most threads to return in one page. At most 50; larger values are rejected. 0 means 20.
+  uint32 page_size = 3 [(buf.validate.field).uint32.lte = 50];
+  // Opaque. Copy the `next_page_token` of the previous page, or leave empty for the first page.
+  string page_token = 4;
+}
+
+message SearchThreadsResponse {
+  // The threads on this page, in `order`.
+  repeated ThreadHit hits = 1;
+  // Opaque. Empty on the last page.
+  string next_page_token = 2;
+}
+
+message TallyThreadsRequest {
+  // Which threads to count.
+  ThreadQuery query = 1;
+}
+
+message TallyThreadsResponse {
+  // How many threads match the query.
+  uint64 total = 1;
+  // The top five harnesses among the threads the query matches without its `harness`, most common
+  // first, ties broken by value.
+  repeated ThreadTally harnesses = 2;
+  // The top five starting working directories among the threads the query matches without its
+  // `cwd`, most common first, ties broken by value.
+  repeated ThreadTally cwds = 3;
+  // The top five starting git branches among the threads the query matches without its
+  // `git_branch`, most common first, ties broken by value.
+  repeated ThreadTally git_branches = 4;
+  // The top five starting models among the threads the query matches without its `model`, most
+  // common first, ties broken by value.
+  repeated ThreadTally models = 5;
+}
+
+message ListThreadMatchesRequest {
+  // The thread's `Thread.id`. Logically required.
+  UuidV7 thread_id = 1 [(buf.validate.field).required = true];
+  // What to match: only its `terms`, `prefix_last_term` and `roles` apply.
+  ThreadQuery query = 2;
+}
+
+message ListThreadMatchesResponse {
+  // The `ThreadMessage.id` of each matching message, in transcript order. At most 1,000.
+  repeated UuidV7 message_ids = 1;
+  // Whether more messages matched than `message_ids` holds.
+  bool truncated = 2;
+}
+
+message GetThreadRequest {
+  // The thread's `Thread.id`. Logically required.
+  UuidV7 thread_id = 1 [(buf.validate.field).required = true];
+  // A share to read through instead of the calling user's own threads, failing with `NOT_FOUND`
+  // (`SHARE_NOT_FOUND`) unless the caller may open it, as `GetShare` does. Through a share, a
+  // thread's parent is unset unless the share holds it, and `child_count` counts only the threads
+  // it holds.
+  ShareRef share = 2;
+}
+
+message GetThreadResponse {
+  Thread thread = 1;
+}
+
 message ListThreadMessagesRequest {
-  // Logically required.
-  HarnessSession thread = 1 [(buf.validate.field).required = true];
+  reserved 1;
+  reserved "thread";
+
+  // The thread's `Thread.id`. Logically required.
+  UuidV7 thread_id = 4 [(buf.validate.field).required = true];
   // The most messages to return in one page. At most 200; larger values are rejected. 0 means 50.
   uint32 page_size = 2 [(buf.validate.field).uint32.lte = 200];
   // Opaque. Copy the `next_page_token` of the previous page, or leave empty for the first page.
   string page_token = 3;
+  // A share to read the thread through, as `GetThreadRequest.share`.
+  ShareRef share = 5;
 }
 
 message ListThreadMessagesResponse {
@@ -246,8 +429,13 @@ message ListThreadMessagesResponse {
 }
 
 message WatchThreadRequest {
-  // Logically required.
-  HarnessSession thread = 1 [(buf.validate.field).required = true];
+  reserved 1;
+  reserved "thread";
+
+  // The thread's `Thread.id`. Logically required.
+  UuidV7 thread_id = 2 [(buf.validate.field).required = true];
+  // A share to watch the thread through, as `GetThreadRequest.share`.
+  ShareRef share = 3;
 }
 
 // One message on a `WatchThread` stream.
@@ -270,6 +458,8 @@ message WatchThreadResponse {
 
 // A thread naming the watched thread as its parent.
 message WatchThreadChild {
+  // The child's `Thread.id`.
+  UuidV7 id = 3;
   // The harness session the child is.
   HarnessSession session = 1;
   // How the child relates to the watched thread; `THREAD_PARENT_KIND_UNSPECIFIED` when no message
@@ -282,6 +472,47 @@ message WatchThreadCaughtUp {}
 
 // Sent to show a `WatchThread` stream is still open.
 message WatchThreadHeartbeat {}
+
+message WatchThreadsRequest {
+  // Which threads to stream.
+  ThreadFilter filter = 1;
+  // The most threads to send before `caught_up`. At most 200; larger values are rejected. 0 means
+  // 50.
+  uint32 page_size = 2 [(buf.validate.field).uint32.lte = 200];
+}
+
+// One message on a `WatchThreads` stream.
+message WatchThreadsResponse {
+  oneof event {
+    option (buf.validate.oneof).required = true;
+
+    // A thread that matches the filter, as it stands.
+    Thread thread = 1;
+    // A thread to leave out from now on.
+    WatchThreadsRemoved removed = 2;
+    // The first page has been sent.
+    WatchThreadsCaughtUp caught_up = 3;
+    // Shows the stream is still open.
+    WatchThreadsHeartbeat heartbeat = 4;
+  }
+}
+
+// A thread of the user's that was deleted, or that changed so it no longer matches the filter.
+// Neither is ever undone.
+message WatchThreadsRemoved {
+  // The thread's `Thread.id`.
+  UuidV7 id = 1;
+}
+
+// Sent once the first page of a `WatchThreads` call has been.
+message WatchThreadsCaughtUp {
+  // The `page_token` for `ListThreads` to read the threads after the first page, or empty if there
+  // are none.
+  string next_page_token = 1;
+}
+
+// Sent to show a `WatchThreads` stream is still open.
+message WatchThreadsHeartbeat {}
 
 message DeleteThreadRequest {
   // Logically required.
@@ -296,3 +527,75 @@ message WhoAmIResponse {
   // The calling user's id. Opaque, and stable for the life of the account.
   string user_id = 1 [(buf.validate.field).string.min_len = 1];
 }
+
+message CreateShareRequest {
+  // Client-generated; becomes `Share.id`.
+  UuidV7 id = 1 [(buf.validate.field).required = true];
+  // Logically required.
+  ShareTarget target = 2 [(buf.validate.field).required = true];
+  // Logically required.
+  ShareAudience audience = 3 [(buf.validate.field).required = true];
+}
+
+message CreateShareResponse {
+  // Logically required.
+  Share share = 1 [(buf.validate.field).required = true];
+}
+
+message GetShareRequest {
+  // Logically required.
+  ShareRef share = 1 [(buf.validate.field).required = true];
+}
+
+message GetShareResponse {
+  // Logically required.
+  Share share = 1 [(buf.validate.field).required = true];
+}
+
+message ListSharesRequest {
+  reserved 1;
+  reserved "thread";
+
+  // Only the shares of this target; unset lists every share.
+  ShareTarget target = 4;
+  // The most shares to return in one page. At most 200; larger values are rejected. 0 means 50.
+  uint32 page_size = 2 [(buf.validate.field).uint32.lte = 200];
+  // Opaque. Copy the `next_page_token` of the previous page, or leave empty for the first page.
+  string page_token = 3;
+}
+
+message ListSharesResponse {
+  // The shares on this page.
+  repeated Share shares = 1;
+  // Opaque. Empty on the last page.
+  string next_page_token = 2;
+}
+
+message RotateShareLinkRequest {
+  // The share, as `Share.id` gives it.
+  UuidV7 id = 1 [(buf.validate.field).required = true];
+}
+
+message RotateShareLinkResponse {
+  // The share, with its new link token. Logically required.
+  Share share = 1 [(buf.validate.field).required = true];
+}
+
+message SetShareAudienceRequest {
+  // The share, as `Share.id` gives it.
+  UuidV7 id = 1 [(buf.validate.field).required = true];
+  // Logically required.
+  ShareAudience audience = 2 [(buf.validate.field).required = true];
+}
+
+message SetShareAudienceResponse {
+  // The share, with its new audience. Logically required.
+  Share share = 1 [(buf.validate.field).required = true];
+}
+
+message DeleteShareRequest {
+  // The share, as `Share.id` gives it.
+  UuidV7 id = 1 [(buf.validate.field).required = true];
+}
+
+message DeleteShareResponse {}

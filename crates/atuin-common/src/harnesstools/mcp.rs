@@ -7,7 +7,7 @@ use std::process::Stdio;
 use serde_json::{Value, json};
 
 use super::pi::Flavour;
-use super::{AnyHarness, codex, copilot, opencode};
+use super::{AnyHarness, codex, copilot, grok, opencode};
 use crate::dirs::home_dir;
 use crate::env::var_nonempty;
 use crate::path::{AbsPathBuf, PathBufExt as _};
@@ -55,12 +55,14 @@ pub fn config_exists(harness: AnyHarness) -> bool {
 /// The user config written by the agent's `mcp add` command, or by us directly.
 fn config_path(harness: AnyHarness) -> PathBuf {
     match harness {
+        AnyHarness::Amp(_) => home_dir().joined(".config").joined("amp").joined("settings.json"),
         AnyHarness::ClaudeCode(_) => var_nonempty("CLAUDE_CONFIG_DIR").map_or_else(
             || home_dir().joined(".claude.json"),
             |dir| PathBuf::from(dir).joined(".claude.json"),
         ),
         AnyHarness::Codex(_) => codex::home().joined("config.toml"),
         AnyHarness::Copilot(_) => copilot::copilot_home().joined("mcp-config.json"),
+        AnyHarness::Grok(_) => grok::home().joined("config.toml"),
         AnyHarness::Opencode(_) => opencode::config_dir().joined("opencode.json"),
         AnyHarness::Pi(pi) => pi.flavour().agent_dir().joined("mcp.json"),
     }
@@ -72,16 +74,13 @@ pub async fn install(harness: AnyHarness) -> Result<(), InstallMcpError> {
     let atuin = executable()?;
     let atuin = atuin.as_str();
     match harness {
+        // `amp mcp add` and `claude mcp add` refuse a name that's taken.
+        AnyHarness::Amp(_) => {
+            remove("amp", &["mcp", "remove", "atuin"]).await;
+            run("amp", &["mcp", "add", "atuin", "--", atuin, "mcp"]).await
+        }
         AnyHarness::ClaudeCode(_) => {
-            // `claude mcp add` refuses a name that's taken.
-            let remove = ["mcp", "remove", "--scope", "user", "atuin"];
-            let _ = tokio::process::Command::new("claude")
-                .args(remove)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
+            remove("claude", &["mcp", "remove", "--scope", "user", "atuin"]).await;
             run("claude", &["mcp", "add", "--scope", "user", "atuin", "--", atuin, "mcp"]).await
         }
         AnyHarness::Codex(_) => run("codex", &["mcp", "add", "atuin", "--", atuin, "mcp"]).await,
@@ -89,6 +88,7 @@ pub async fn install(harness: AnyHarness) -> Result<(), InstallMcpError> {
         AnyHarness::Copilot(_) => {
             run("copilot", &["mcp", "add", "atuin", "--", atuin, "mcp"]).await
         }
+        AnyHarness::Grok(_) => run("grok", &["mcp", "add", "atuin", "--", atuin, "mcp"]).await,
         // Not `opencode mcp add`: 1.x's only prompts, and 2.0's writes `mcp.servers`, which 2.0
         // doesn't load. Both load `mcp.<name>`.
         AnyHarness::Opencode(_) => install_opencode(&config_path(harness), atuin).await,
@@ -102,6 +102,17 @@ pub async fn install(harness: AnyHarness) -> Result<(), InstallMcpError> {
             }
         },
     }
+}
+
+/// Run `program` with `args` to remove a server, whether or not there is one to remove.
+async fn remove(program: &str, args: &[&str]) {
+    let _ = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
 }
 
 /// The atuin for a harness to launch. Harnesses don't necessarily have the user's `PATH`, so it's
@@ -223,6 +234,7 @@ mod tests {
     #[case("claude-code", ".claude.json")]
     #[case("codex", ".codex/config.toml")]
     #[case("copilot", ".copilot/mcp-config.json")]
+    #[case("grok", ".grok/config.toml")]
     #[case("opencode", ".config/opencode/opencode.json")]
     #[case("pi", ".pi/agent/mcp.json")]
     #[case("omp", ".omp/agent/mcp.json")]
@@ -247,6 +259,7 @@ mod tests {
     #[case("claude-code", "CLAUDE_CONFIG_DIR", ".claude.json")]
     #[case("codex", "CODEX_HOME", "config.toml")]
     #[case("copilot", "COPILOT_HOME", "mcp-config.json")]
+    #[case("grok", "GROK_HOME", "config.toml")]
     #[case("opencode", "XDG_CONFIG_HOME", "opencode/opencode.json")]
     #[case("pi", "PI_CODING_AGENT_DIR", "mcp.json")]
     #[case("omp", "PI_CODING_AGENT_DIR", "mcp.json")]

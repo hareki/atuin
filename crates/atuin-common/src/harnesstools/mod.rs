@@ -1,15 +1,17 @@
 //! Tools for interacting and operating on different AI harnesses.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use enum_dispatch::enum_dispatch;
 
 pub mod access;
+pub mod amp;
 pub mod ccode;
 pub mod codex;
 pub mod continuation;
 pub mod copilot;
 pub mod fork;
+pub mod grok;
 mod json_hooks;
 pub mod mcp;
 pub mod note;
@@ -20,15 +22,19 @@ pub mod resume;
 pub mod session;
 pub mod sync;
 
+use amp::Amp;
 use ccode::Ccode;
 use codex::Codex;
 use copilot::Copilot;
+use grok::Grok;
 use opencode::Opencode;
 use pi::Pi;
-use rehydrate::{RehydrateError, RehydrateSession};
+use rehydrate::{RehydrateError, RehydrateMessage, RehydrateSession};
 use resume::{ResumeError, ResumePlan, ResumeTarget};
-use session::Observable;
-use session::any::AnySessions;
+use session::any::{AnySessions, ObservableExt};
+use sync::{
+    AppendOptions, AppendOutcome, Liveness, LocalTip, ReplaceOutcome, SessionSync, SyncError,
+};
 
 use crate::sync::BlockingPool;
 
@@ -82,12 +88,14 @@ pub trait Harness: std::fmt::Debug {
     async fn rehydrate(&self, session: &RehydrateSession) -> Result<PathBuf, RehydrateError>;
 }
 
-#[enum_dispatch(Harness)]
+#[enum_dispatch(Harness, SessionSync, ObservableExt)]
 #[derive(Debug, Clone, Copy)]
 pub enum AnyHarness {
+    Amp(Amp),
     ClaudeCode(Ccode),
     Codex(Codex),
     Copilot(Copilot),
+    Grok(Grok),
     Opencode(Opencode),
     Pi(Pi),
 }
@@ -152,24 +160,14 @@ impl AnyHarness {
     #[must_use]
     pub fn all() -> &'static [Self] {
         &[
+            Self::Amp(Amp),
             Self::ClaudeCode(Ccode),
             Self::Codex(Codex),
             Self::Copilot(Copilot),
+            Self::Grok(Grok),
             Self::Opencode(Opencode),
             Self::Pi(Pi::PI),
             Self::Pi(Pi::OMP),
         ]
-    }
-
-    /// The harness's sessions, whose file reads all run in `pool`.
-    #[must_use]
-    pub fn sessions(&self, pool: &BlockingPool) -> Option<AnySessions> {
-        match self {
-            Self::ClaudeCode(h) => Some(h.sessions(pool.clone()).into()),
-            Self::Codex(h) => Some(h.sessions(pool.clone()).into()),
-            Self::Copilot(h) => Some(h.sessions(pool.clone()).into()),
-            Self::Opencode(h) => Some(h.sessions(pool.clone()).into()),
-            Self::Pi(h) => Some(h.sessions(pool.clone()).into()),
-        }
     }
 }
