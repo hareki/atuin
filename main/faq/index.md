@@ -33,12 +33,6 @@ atuin setup --only --no-up-arrow
 
 Setup writes `bind_up_arrow = false` to your config, and new shells pick it up.
 
-You can also add `--disable-up-arrow` to the line containing `atuin init` in your shell config file. For example:
-
-```
-eval "$(atuin init zsh --disable-up-arrow)"
-```
-
 See [key binding](https://docs.atuin.sh/configuration/key-binding/index.md) for more
 
 ## How do I edit a command instead of running it immediately?
@@ -76,7 +70,7 @@ With the [update check](https://docs.atuin.sh/configuration/config/#update_check
 If you'd rather the code wasn't in the binary at all, build from source without the default features:
 
 ```
-cargo build --release --no-default-features --features client,daemon,clipboard
+cargo build --release --no-default-features --features client,daemon
 ```
 
 This compiles out the update checker, the sync commands, and AI.
